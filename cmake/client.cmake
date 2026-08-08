@@ -86,6 +86,10 @@ target_link_options(            ${CLIENT_BINARY} PRIVATE ${CLIENT_LINK_OPTIONS})
 
 set_output_dirs(${CLIENT_BINARY})
 
+if(BUILD_RENDERER_VRHI)
+    add_dependencies(${CLIENT_BINARY} ${RENDERER_VRHI_BINARY})
+endif()
+
 if(NOT USE_RENDERER_DLOPEN)
     target_sources(${CLIENT_BINARY} PRIVATE
         # These are never simultaneously populated
