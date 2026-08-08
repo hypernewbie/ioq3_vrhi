@@ -207,9 +207,9 @@ def find_engine(requested: str | None) -> Path:
 
 
 def run_engine(args: argparse.Namespace, extra_args: list[str]) -> int:
-    asset_dir = ensure_assets(args.asset_dir)
+    asset_dir = ensure_assets(args.asset_dir.expanduser().resolve())
     engine = find_engine(args.engine)
-    home_dir = args.home_dir
+    home_dir = args.home_dir.expanduser().resolve()
     home_dir.mkdir(parents=True, exist_ok=True)
 
     command = [
