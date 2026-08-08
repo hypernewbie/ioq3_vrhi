@@ -87,9 +87,30 @@ light modulation. Inline registration is refreshed after each world load so
 handles registered before a load cannot retain stale model indices; ModelBounds
 works for both MD3 and inline BSP models, while LerpTag remains false for inline.
 Inline geometry has strict per-model and aggregate caps and malformed surfaces
-are skipped safely. MD3 normal decoding/lighting and full skin/material/shader
+are skipped safely. MD3 normal decoding/lighting and full material/shader
 parity remain unsupported, as do rail, lightning, portal, and video-capture
-resources (safe no-ops).
+resources (safe no-ops); bounded surface-name `.skin` overrides are supported
+(next paragraph).
+
+`RegisterSkin` parses bounded Quake `.skin` text into per-surface shader
+overrides used by RT_MODEL MD3 draws, with the GL renderers' precedence:
+`entity.customShader` wins for every surface, then the `customSkin`
+surface-name override, then the surface's embedded shader (`skinNum` remains
+unsupported). Tokenization mirrors the GL CommaParse skin loop: whitespace (any
+char <= ' '), commas, and `//` line comments separate tokens, CRLF is plain
+whitespace, bare `tag_` surface lines are skipped without consuming a shader
+token, overlong tokens drop the whole malformed entry so the surface/shader
+alternation stays aligned, and a surface whose shader is missing at end-of-text
+is dropped. Surface names are lowercased for case-insensitive MD3 matching
+while shader qpaths keep their case, and every shader path is re-validated as a
+safe qpath before it reuses the bounded direct-image registration path
+(unsupported scripts/materials keep the safe solid fallback). File text,
+per-token, per-skin entry, aggregate entry, and skin count are strictly bounded
+(1 MiB file cap, 64-char token cap, 256 entries per skin, 8192 aggregate
+entries, 1024 skins; handle 0 stays reserved as "default skin"), and
+missing/empty/malformed `.skin` files return qhandle 0 with a bounded failure
+cache, exactly like the GL renderers. The dependency-free parser lives in
+`vrhi_skin.h` and is exercised standalone by `tests/vrhi_skin_test.cpp`.
 
 `RegisterFont` is a documented fixed-cell fallback, NOT proportional/FreeType
 parity: it registers the classic `gfx/2d/bigchars` atlas (256x256, 16x16 grid
@@ -118,8 +139,8 @@ the same UI state/program and UV/color semantics as `DrawStretchPic`. Slots are
 destroyed on `Shutdown(qfalse)` restart, `Shutdown(qtrue)` final teardown, and
 reset on no-device failures. `TakeVideoFrame` remains an explicit, documented
 no-op (no AVI capture). Every refexport callback is populated so the client, cgame,
-and UI cannot dereference a null renderer callback. Model, skin, and unsupported
-material registrations retain stable name-to-handle mappings; eligible UI image
+and UI cannot dereference a null renderer callback. Model, skin, shader, and
+unsupported material registrations retain stable name-to-handle mappings; eligible UI image
 pixels are retained under bounded caps for video restart while their VRHI
 textures are destroyed and re-uploaded at the next registration, and final
 shutdown destroys both GPU and CPU resources. The renderer-owned `screenshot`
@@ -129,6 +150,7 @@ BGR TGA when VRHI supports the readback. The dependency-free TGA decoder lives i
 are exposed by the focused `vrhi_image_decode.h` API and use puff/libjpeg
 target-locally. The TGA decoder is exercised standalone by
 `tests/vrhi_tga_decode_test.cpp` (any C++17 compiler; no engine or third-party
-dependencies), and the fixed-cell font UV/scale helpers are exercised
-standalone by `tests/vrhi_font_test.cpp`. Resize/minimize failures are reported as warnings and are not
+dependencies), the fixed-cell font UV/scale helpers are exercised
+standalone by `tests/vrhi_font_test.cpp`, and the bounded `.skin` text parser
+is exercised standalone by `tests/vrhi_skin_test.cpp`. Resize/minimize failures are reported as warnings and are not
 treated as fatal initialization errors.

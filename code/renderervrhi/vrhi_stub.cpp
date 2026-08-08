@@ -39,6 +39,7 @@
 #include <limits>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "q_shared.h"
@@ -49,6 +50,7 @@
 #include "renderervrhi/vrhi_image_decode.h"
 #include "renderervrhi/vrhi_dlight.h"
 #include "renderervrhi/vrhi_font.h"
+#include "renderervrhi/vrhi_skin.h"
 
 // vrhi.h is the public header for the copied prebuilt VRHI library.  The
 // implementation deliberately uses only its device, swapchain, state,
@@ -236,6 +238,7 @@ struct VRHI_MD3Tag {
 	glm::vec3 axis[3] = { glm::vec3(0.0f), glm::vec3(0.0f), glm::vec3(0.0f) };
 };
 struct VRHI_MD3Surface {
+	std::string name; // lowercased surface name for customSkin overrides
 	int numFrames = 0;
 	int numVerts = 0;
 	std::vector<glm::vec2> st;
@@ -257,6 +260,32 @@ struct VRHI_MD3Model {
 static std::vector<VRHI_MD3Model> g_md3Models;
 static std::unordered_map<qhandle_t, size_t> g_md3ModelByHandle;
 static size_t g_md3MemoryBytes = 0;
+// Quake .skin support is a bounded surface-name -> shader-handle map parsed
+// from bounded text (see vrhi_skin.h). Per-skin caps mirror the GL renderers'
+// skin limits; the file/text caps and the aggregate entry cap are strict VRHI
+// bounds so malformed or hostile files cannot exhaust the renderer's
+// image/texture budget. The skin CPU maps are retained across Shutdown(qfalse)
+// video restarts exactly like the MD3 models and are cleaned only on final
+// Shutdown(qtrue) teardown.
+static const int VRHI_MAX_SKINS = 1024;            // GL renderer MAX_SKINS
+static const size_t VRHI_MAX_SKIN_ENTRIES_TOTAL = 8192;
+struct VRHI_SkinSurface {
+	std::string surface;  // lowercased MD3 surface name
+	qhandle_t shader = 0; // registered shader/direct-image handle
+};
+struct VRHI_Skin {
+	std::string name;
+	std::vector<VRHI_SkinSurface> surfaces;
+};
+// Index 0 is unused so a skin handle maps 1:1 to a vector index; handle 0
+// means "use the default skin", exactly like the GL renderers.
+static std::vector<VRHI_Skin> g_skins(1);
+// Lowercased name -> handle cache for already-registered skins, plus a bounded
+// cache of names that failed to parse so a missing/empty skin keeps returning
+// qhandle 0 without re-reading the file on every registration call.
+static std::unordered_map<std::string, qhandle_t> g_skinHandles;
+static std::unordered_set<std::string> g_skinFailures;
+static size_t g_skinTotalEntries = 0;
 static const size_t VRHI_MD3_HEADER_BYTES = 108u;
 static const size_t VRHI_MD3_FRAME_BYTES = 56u;
 static const size_t VRHI_MD3_TAG_BYTES = 112u;
@@ -292,6 +321,7 @@ static void VRHI_UploadUITextures(void);
 static void VRHI_DestroyCinematicTextures(void);
 static bool VRHI_FiniteVec3(const float *v);
 static bool VRHI_FiniteEntity(const refEntity_t &entity);
+static std::string VRHI_LowerASCII(const std::string &text);
 static void VRHI_DestroySceneResources(bool clearSubmissions);
 static void VRHI_ResetSceneSubmissions(void);
 static int32_t g_worldDrawErrorBaseline = 0;
@@ -1446,6 +1476,15 @@ static void VRHI_DestroyMD3Resources(bool clearData) {
 	g_md3MemoryBytes = 0;
 }
 
+static void VRHI_DestroySkinResources(bool clearData) {
+	if (!clearData) return;
+	g_skins.clear();
+	g_skins.emplace_back(); // keep index 0 reserved (handle 0 = default skin)
+	g_skinHandles.clear();
+	g_skinFailures.clear();
+	g_skinTotalEntries = 0;
+}
+
 static void VRHI_DestroyUI(void) {
 	VRHI_DestroyUITextures(true);
 	if (g_uiVertexShader != VRHI_INVALID_HANDLE) {
@@ -1659,6 +1698,7 @@ static void VRHI_Shutdown(qboolean destroyWindow) {
 	VRHI_DestroyWorldResources(true);
 	VRHI_DestroyUI();
 	VRHI_DestroyMD3Resources(true);
+	VRHI_DestroySkinResources(true);
 	VRHI_DestroyCinematicTextures();
 	if (g_deviceInitialized) {
 		vhFinish();
@@ -1802,18 +1842,23 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 // bounded direct image UI textures and retains a solid-color fallback for
 // missing/unsupported handles, while the first BSP model and its bounded image
 // diffuse batches are rendered by the static world path above. RT_MODEL covers
-// bounded MD3 and inline BSP submodels; complex effect/material stages remain
-// explicit safe no-ops. Every callback is
-// nevertheless populated so the client, cgame, and UI can safely exercise the
-// renderer without NULL dereferences.
+// bounded MD3 and inline BSP submodels: MD3 surfaces select entity.customShader
+// first, then the customSkin surface-name override, then the embedded surface
+// shader. Complex effect/material stages remain explicit safe no-ops. Every
+// callback is nevertheless populated so the client, cgame, and UI can safely
+// exercise the renderer without NULL dereferences.
 //
 // The four registration callbacks return stable engine-local qhandles so the
 // client, cgame, and UI see successful registrations (qhandle_t 0 means
 // failure). The handle policy mirrors the GL renderers: each handle space is
 // independent, the first handle is 1, the same name always resolves to the
-// same handle, and NULL/empty names fail with 0. Model/skin/general
-// shader-script/PK3 material semantics remain unsupported; bounded direct image
-// data is the sole uploaded UI material.
+// same handle, and NULL/empty names fail with 0. RegisterSkin parses bounded
+// Quake .skin text (line/comment/whitespace handling, surface,shader entries,
+// safe qpaths, and file/text/entry/path caps) into surface-name shader
+// overrides that reuse the shared bounded direct-image handle path; unsupported
+// shader scripts/materials keep the safe solid fallback, skinNum remains
+// unsupported, and general shader-script/PK3 material semantics stay out of
+// scope; bounded direct image data is the sole uploaded UI material.
 static qhandle_t VRHI_RegisterName(
 	std::unordered_map<std::string, qhandle_t> &handles, const char *name,
 	const char *kind) {
@@ -1838,7 +1883,6 @@ static qhandle_t VRHI_RegisterName(
 }
 
 static std::unordered_map<std::string, qhandle_t> g_modelHandles;
-static std::unordered_map<std::string, qhandle_t> g_skinHandles;
 static std::unordered_map<std::string, qhandle_t> g_shaderHandles;
 
 static bool VRHI_RegisterDirectUITexture(qhandle_t handle, const char *name);
@@ -2024,6 +2068,10 @@ static bool VRHI_ParseMD3(const byte *file, size_t fileSize, const char *name,
 				!VRHI_MD3Range(surfaceOffset + static_cast<size_t>(ofsSt), static_cast<size_t>(numVerts) * VRHI_MD3_ST_BYTES, surfaceEnd) ||
 				!VRHI_MD3Range(surfaceOffset + static_cast<size_t>(ofsXYZ), static_cast<size_t>(numFrames) * static_cast<size_t>(numVerts) * VRHI_MD3_XYZ_BYTES, surfaceEnd)) return false;
 			VRHI_MD3Surface surface;
+			// Retain the surface name (lowercased, like the GL renderers) so a
+			// customSkin can override this surface by name during RT_MODEL draws.
+			if (!VRHI_MD3String(p + 4, MAX_QPATH, &surface.name)) return false;
+			surface.name = VRHI_LowerASCII(surface.name);
 			surface.numFrames = numFrames;
 			surface.numVerts = numVerts;
 			surface.st.reserve(static_cast<size_t>(numVerts));
@@ -2117,8 +2165,110 @@ static qhandle_t VRHI_RegisterModel(const char *name) {
 	VRHI_Printf(PRINT_ALL, "renderer_vrhi: registered MD3 '%s' handle=%d frames=%d surfaces=%zu bytes=%zu\n", name, static_cast<int>(handle), g_md3Models.back().numFrames, g_md3Models.back().surfaces.size(), g_md3Models.back().cpuBytes);
 	return handle;
 }
+static bool VRHI_SkinExtension(const char *name) {
+	// GL parity: a name ending in ".skin" is parsed as a skin text file;
+	// anything else registers the name itself as one inert surface shader.
+	size_t length = 0;
+	while (length < MAX_QPATH && name[length] != '\0') ++length;
+	if (length < 5) return false;
+	return std::strcmp(name + length - 5, ".skin") == 0;
+}
+
 static qhandle_t VRHI_RegisterSkin(const char *name) {
-	return VRHI_RegisterName(g_skinHandles, name, "RegisterSkin");
+	// Preserve qhandle 0 semantics for invalid names exactly like the GL
+	// renderers: NULL/empty/overlong and traversal-style names fail with 0.
+	if (!VRHI_MD3SafeName(name, nullptr)) {
+		VRHI_Printf(PRINT_DEVELOPER, "renderer_vrhi: RegisterSkin('%s') rejected; qhandle 0\n",
+			name != nullptr ? name : "(null)");
+		return 0;
+	}
+	// GL resolves skin names case-insensitively, so the handle/failure caches
+	// are keyed by the lowercased name.
+	const std::string key = VRHI_LowerASCII(name);
+	const std::unordered_map<std::string, qhandle_t>::const_iterator cached =
+		g_skinHandles.find(key);
+	if (cached != g_skinHandles.end()) return cached->second;
+	if (g_skinFailures.find(key) != g_skinFailures.end()) return 0;
+	if (g_skins.size() >= static_cast<size_t>(VRHI_MAX_SKINS)) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: RegisterSkin('%s') skipped; skin count cap reached\n",
+			name);
+		return 0;
+	}
+
+	VRHI_Skin skin;
+	skin.name = name;
+	if (!VRHI_SkinExtension(name)) {
+		// GL parity: a non-.skin name becomes a one-surface skin whose shader
+		// is the name itself. The empty surface name never matches an MD3
+		// surface, so the override is inert; the direct-image handle is still
+		// warmed through the bounded shared registration path.
+		VRHI_SkinSurface surf;
+		surf.shader = VRHI_RegisterModelShader(name);
+		skin.surfaces.push_back(surf);
+	} else {
+		// Parse bounded .skin text through FS_ReadFile/FS_FreeFile. No pointer
+		// into the FS buffer is retained: every value is copied into bounded
+		// strings before the file data is freed below.
+		void *fileData = nullptr;
+		const long fileSizeLong = g_ri.FS_ReadFile != nullptr
+			? g_ri.FS_ReadFile(name, &fileData) : 0;
+		if (fileData != nullptr && fileSizeLong > 0 &&
+			static_cast<unsigned long>(fileSizeLong) <= VRHI_SKIN_MAX_FILE_BYTES) {
+			std::vector<VRHI_SkinEntry> entries;
+			if (VRHI_ParseSkinText(static_cast<const char *>(fileData),
+				static_cast<size_t>(fileSizeLong), entries)) {
+				for (const VRHI_SkinEntry &entry : entries) {
+					// The parser already guaranteed non-empty, < MAX_QPATH,
+					// lowercased surface names; re-validate the shader qpath so
+					// hostile entries can never reach the image resolver. Each
+					// valid shader path reuses the bounded direct image
+					// registration/handle path; unsupported shader scripts or
+					// materials keep the safe solid fallback via the same no-op
+					// handle semantics as model shaders.
+					if (!VRHI_MD3SafeName(entry.shader.c_str(), nullptr)) continue;
+					if (skin.surfaces.size() >= VRHI_SKIN_MAX_SURFACES ||
+						g_skinTotalEntries >= VRHI_MAX_SKIN_ENTRIES_TOTAL) break;
+					VRHI_SkinSurface surf;
+					surf.surface = entry.surface;
+					surf.shader = VRHI_RegisterModelShader(entry.shader);
+					skin.surfaces.push_back(std::move(surf));
+					++g_skinTotalEntries;
+				}
+			}
+		}
+		if (fileData != nullptr && g_ri.FS_FreeFile != nullptr) g_ri.FS_FreeFile(fileData);
+		if (skin.surfaces.empty()) {
+			// GL returns 0 ("use the default skin") for a missing, empty, or
+			// malformed .skin file; cache the failure for this session so
+			// repeated registrations stay a bounded no-op.
+			if (g_skinFailures.size() < static_cast<size_t>(VRHI_MAX_SKINS))
+				g_skinFailures.emplace(key);
+			VRHI_Printf(PRINT_DEVELOPER,
+				"renderer_vrhi: RegisterSkin('%s') has no usable surfaces; default skin (qhandle 0)\n",
+				name);
+			return 0;
+		}
+	}
+
+	const qhandle_t handle = static_cast<qhandle_t>(g_skins.size());
+	g_skins.push_back(std::move(skin));
+	g_skinHandles.emplace(key, handle);
+	VRHI_Printf(PRINT_ALL, "renderer_vrhi: registered skin '%s' handle=%d surfaces=%zu\n",
+		name, static_cast<int>(handle), g_skins.back().surfaces.size());
+	return handle;
+}
+
+// Case-insensitive customSkin lookup: returns the registered shader handle for
+// the surface named `surfaceName`, or 0 when the skin or surface is absent so
+// the caller falls back to the embedded surface shader.
+static qhandle_t VRHI_SkinSurfaceShader(qhandle_t hSkin,
+	const std::string &surfaceName) {
+	if (hSkin <= 0 || static_cast<size_t>(hSkin) >= g_skins.size()) return 0;
+	const VRHI_Skin &skin = g_skins[static_cast<size_t>(hSkin)];
+	for (const VRHI_SkinSurface &entry : skin.surfaces) {
+		if (entry.surface == surfaceName) return entry.shader;
+	}
+	return 0;
 }
 static qhandle_t VRHI_RegisterShader(const char *name) {
 	const qhandle_t handle = VRHI_RegisterName(g_shaderHandles, name,
@@ -3814,10 +3964,20 @@ static bool VRHI_AppendMD3Model(const refEntity_t &entity, const glm::vec4 &colo
 		const uint32_t firstIndex = static_cast<uint32_t>(g_sceneIndexes.size());
 		g_sceneVertices.insert(g_sceneVertices.end(), scratchVertices.begin(), scratchVertices.end());
 		for (uint32_t index : scratchIndexes) g_sceneIndexes.push_back(baseVertex + index);
+		// Shader precedence mirrors the GL MD3 path: entity.customShader wins
+		// for every surface, then the customSkin's surface-name override, then
+		// the surface's embedded shader. skinNum is unsupported (VRHI retains
+		// only the first embedded shader per surface) and is documented as such;
+		// a skin entry whose shader could not resolve to a bounded direct image
+		// keeps the safe solid fallback through the shared scene texture path.
+		qhandle_t shader = entity.customShader;
+		if (shader == 0 && entity.customSkin > 0) {
+			shader = VRHI_SkinSurfaceShader(entity.customSkin, surface.name);
+		}
+		if (shader == 0) shader = surface.shader;
 		// Every failure mode of AppendSceneDraw was pre-checked above; roll
 		// back anyway so the surface stays atomic even if it ever changes.
-		if (!VRHI_AppendSceneDraw(entity.customShader != 0 ? entity.customShader : surface.shader,
-			firstIndex, indexCount)) {
+		if (!VRHI_AppendSceneDraw(shader, firstIndex, indexCount)) {
 			g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
 			g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
 			continue;
@@ -4800,6 +4960,6 @@ extern "C" Q_EXPORT refexport_t *QDECL GetRefAPI(int apiVersion,
 	exports.TakeVideoFrame = VRHI_TakeVideoFrame;
 
 	VRHI_Printf(PRINT_ALL,
-		"renderer_vrhi: loaded (clear/present + bounded sprite/beam/poly scenes + direct-image UI + fixed-cell bigchars fonts + bounded RGBA cinematics + lightmapped/image PVS-culled BSP world)\n");
+		"renderer_vrhi: loaded (clear/present + bounded sprite/beam/poly scenes + direct-image UI + fixed-cell bigchars fonts + bounded RGBA cinematics + lightmapped/image PVS-culled BSP world + bounded .skin MD3 skins)\n");
 	return &exports;
 }
