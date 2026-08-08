@@ -134,8 +134,31 @@ set_property(TARGET VRHI::prebuilt PROPERTY INTERFACE_LINK_LIBRARIES
     VRHI::SPIRV_Tools)
 
 set(RENDERER_VRHI_BINARY renderer_vrhi)
+# The VRHI DLL is a separate renderer target, so it cannot inherit the
+# common renderer's JPEG/puff object sources. Reuse the already-discovered
+# JPEG variables when a GL renderer configured them, and discover the same
+# dependency locally when VRHI is built by itself.
+set(_VRHI_JPEG_SOURCES ${RENDERER_LIBRARY_SOURCES})
+set(_VRHI_JPEG_INCLUDE_DIRS ${JPEG_INCLUDE_DIRS})
+set(_VRHI_JPEG_DEFINITIONS ${JPEG_DEFINITIONS})
+set(_VRHI_JPEG_LIBRARIES ${JPEG_LIBRARIES})
+if(USE_INTERNAL_JPEG AND NOT _VRHI_JPEG_SOURCES)
+    set(_VRHI_INTERNAL_JPEG_DIR ${SOURCE_DIR}/thirdparty/jpeg-${JPEG_VERSION})
+    file(GLOB_RECURSE _VRHI_JPEG_SOURCES ${_VRHI_INTERNAL_JPEG_DIR}/j*.c)
+    include(utils/find_include_dirs)
+    find_include_dirs(_VRHI_JPEG_INCLUDE_DIRS ${_VRHI_INTERNAL_JPEG_DIR})
+    list(APPEND _VRHI_JPEG_DEFINITIONS USE_INTERNAL_JPEG)
+elseif(NOT USE_INTERNAL_JPEG AND NOT _VRHI_JPEG_LIBRARIES)
+    find_package(JPEG REQUIRED)
+    set(_VRHI_JPEG_INCLUDE_DIRS ${JPEG_INCLUDE_DIRS})
+    set(_VRHI_JPEG_LIBRARIES ${JPEG_LIBRARIES})
+endif()
+
 add_library(${RENDERER_VRHI_BINARY} SHARED
-    ${SOURCE_DIR}/renderervrhi/vrhi_stub.cpp)
+    ${SOURCE_DIR}/renderervrhi/vrhi_stub.cpp
+    ${SOURCE_DIR}/renderervrhi/vrhi_image_decode.cpp
+    ${SOURCE_DIR}/renderercommon/puff.c
+    ${_VRHI_JPEG_SOURCES})
 
 if(NOT IS_DIRECTORY "${VRHI_INCLUDE_DIR}")
     message(FATAL_ERROR
@@ -155,10 +178,12 @@ target_include_directories(${RENDERER_VRHI_BINARY} PRIVATE
     "${VRHI_SLANG_INCLUDE_DIR}"
     ${SDL2_INCLUDE_DIRS}
     ${Vulkan_INCLUDE_DIRS}
-    "${Vulkan_INCLUDE_DIR}")
+    "${Vulkan_INCLUDE_DIR}"
+    ${_VRHI_JPEG_INCLUDE_DIRS})
 target_compile_definitions(${RENDERER_VRHI_BINARY} PRIVATE
     USE_RENDERER_DLOPEN
-    ${RENDERER_DEFINITIONS})
+    ${RENDERER_DEFINITIONS}
+    ${_VRHI_JPEG_DEFINITIONS})
 if(RENDERER_COMPILE_OPTIONS)
     target_compile_options(${RENDERER_VRHI_BINARY} PRIVATE
         ${RENDERER_COMPILE_OPTIONS})
@@ -170,6 +195,7 @@ target_link_libraries(${RENDERER_VRHI_BINARY} PRIVATE
     VRHI::prebuilt
     Vulkan::Vulkan
     "${VRHI_SLANG_LIBRARY}"
+    ${_VRHI_JPEG_LIBRARIES}
     ${SDL2_LIBRARIES}
     dxgi
     shlwapi)

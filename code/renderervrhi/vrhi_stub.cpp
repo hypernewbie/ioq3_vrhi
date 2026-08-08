@@ -45,6 +45,7 @@
 #include "qcommon/surfaceflags.h"
 #include "renderercommon/tr_public.h"
 #include "renderervrhi/vrhi_tga_decode.h"
+#include "renderervrhi/vrhi_image_decode.h"
 
 // vrhi.h is the public header for the copied prebuilt VRHI library.  The
 // implementation deliberately uses only its device, swapchain, state,
@@ -185,8 +186,9 @@ static const float VRHI_WORLD_FAR = 131072.0f;
 // Keep malformed or hostile BSP lumps from forcing an unbounded CPU/GPU
 // allocation. Normal Quake 3 maps use far fewer layers.
 static const int VRHI_MAX_WORLD_LIGHTMAP_LAYERS = 1024;
-// Diffuse loading is intentionally a small, direct-TGA subset. Keep both the
-// per-image and aggregate caps bounded when map shader names are malformed.
+// Keep per-image and aggregate decoded image caps bounded when map shader
+// names or image files are malformed. JPG/PNG are decoded to the same RGBA
+// upload format as TGA.
 static const int VRHI_MAX_WORLD_DIFFUSE_IMAGES = 256;
 static const int VRHI_MAX_WORLD_DIFFUSE_DIMENSION = 2048;
 static const size_t VRHI_MAX_WORLD_DIFFUSE_BYTES = 64u * 1024u * 1024u;
@@ -208,8 +210,8 @@ static const int VRHI_MAX_WORLD_LEAFS = 65536;
 static const int VRHI_MAX_WORLD_LEAFSURFACES = 262144;
 static const int VRHI_MAX_WORLD_CLUSTERS = 65536;
 static const size_t VRHI_MAX_WORLD_VIS_BYTES = 16u * 1024u * 1024u;
-// UI registrations retain decoded direct-TGA pixels so a video restart can
-// destroy and safely re-upload GPU textures without rereading untrusted data.
+// UI registrations retain decoded image pixels so a video restart can destroy
+// and safely re-upload GPU textures without rereading untrusted data.
 static const int VRHI_MAX_UI_TEXTURES = 1024;
 static const int VRHI_MAX_UI_TEXTURE_DIMENSION = 2048;
 static const size_t VRHI_MAX_UI_TEXTURE_BYTES = 64u * 1024u * 1024u;
@@ -1104,7 +1106,7 @@ static bool VRHI_UploadWorldDiffuse(void) {
 		if (image.width <= 0 || image.height <= 0 || image.pixels.empty()) continue;
 		vhTexture texture = vhAllocTexture();
 		if (texture == VRHI_INVALID_HANDLE) {
-			VRHI_Printf(PRINT_WARNING, "renderer_vrhi: diffuse TGA '%s' allocation failed; using lightmap/solid fallback\n", image.path.c_str());
+			VRHI_Printf(PRINT_WARNING, "renderer_vrhi: diffuse image '%s' allocation failed; using lightmap/solid fallback\n", image.path.c_str());
 			continue;
 		}
 		vhMem *data = new vhMem(image.pixels.size());
@@ -1114,7 +1116,7 @@ static bool VRHI_UploadWorldDiffuse(void) {
 			nvrhi::Format::RGBA8_UNORM, VRHI_TEXTURE_NONE | VRHI_SAMPLER_NONE, data);
 		vhFinish();
 		if (g_vhErrorCounter.load(std::memory_order_relaxed) != errorsBefore) {
-			VRHI_Printf(PRINT_WARNING, "renderer_vrhi: diffuse TGA '%s' upload failed; using lightmap/solid fallback\n", image.path.c_str());
+			VRHI_Printf(PRINT_WARNING, "renderer_vrhi: diffuse image '%s' upload failed; using lightmap/solid fallback\n", image.path.c_str());
 			vhDestroyTexture(texture);
 			vhFinish();
 			continue;
@@ -1244,7 +1246,7 @@ static bool VRHI_InitializeUI(void) {
 		{}, {}, &texturedError);
 	if (!texturedCompiled) {
 		VRHI_Printf(PRINT_WARNING,
-			"renderer_vrhi: textured UI pixel shader unavailable; direct TGAs use solid fallback: %s\n",
+			"renderer_vrhi: textured UI pixel shader unavailable; direct images use solid fallback: %s\n",
 			texturedError.c_str());
 	}
 
@@ -1285,7 +1287,7 @@ static bool VRHI_InitializeUI(void) {
 	}
 	g_uiInitialized = true;
 	VRHI_Printf(PRINT_ALL,
-		"renderer_vrhi: UI ready (direct-TGA textures=%s, solid fallback=yes)\n",
+		"renderer_vrhi: UI ready (direct image textures=%s, solid fallback=yes)\n",
 		!g_uiTexturedProgram.empty() ? "yes" : "no");
 	return true;
 }
@@ -1538,9 +1540,9 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 }
 
 // Entity, patch, and non-direct material resources remain outside this slice.
-// DrawStretchPic supports bounded direct-TGA UI textures and retains a
+// DrawStretchPic supports bounded direct image UI textures and retains a
 // solid-color fallback for missing/unsupported handles, while the first BSP
-// model and its bounded direct-TGA diffuse batches are rendered by the static
+// model and its bounded image diffuse batches are rendered by the static
 // world path above. Every callback is
 // nevertheless populated so the client, cgame, and UI can safely exercise the
 // renderer without NULL dereferences.
@@ -1550,8 +1552,8 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 // failure). The handle policy mirrors the GL renderers: each handle space is
 // independent, the first handle is 1, the same name always resolves to the
 // same handle, and NULL/empty names fail with 0. Model/skin/general
-// shader-script/JPG/PNG/PK3 material semantics remain unsupported; direct type
-// 2/10 24/32-bit TGA data is the sole uploaded UI material.
+// shader-script/PK3 material semantics remain unsupported; bounded direct image
+// data is the sole uploaded UI material.
 static qhandle_t VRHI_RegisterName(
 	std::unordered_map<std::string, qhandle_t> &handles, const char *name,
 	const char *kind) {
@@ -1770,7 +1772,7 @@ static int VRHI_ReadLeafSurface(const byte *lumpData, int index) {
 	return LittleLong(disk);
 }
 
-static bool VRHI_ResolveDirectTGAPath(const char *name, std::string *resolved) {
+static bool VRHI_ResolveDirectImagePath(const char *name, std::string *resolved) {
 	if (resolved != nullptr) resolved->clear();
 	if (name == nullptr || resolved == nullptr) return false;
 	size_t length = 0;
@@ -1782,18 +1784,13 @@ static bool VRHI_ResolveDirectTGAPath(const char *name, std::string *resolved) {
 	const size_t dot = path.find_last_of('.');
 	const bool hasExtension = dot != std::string::npos &&
 		(slash == std::string::npos || dot > slash) && dot + 1 < path.size();
-	const bool isTGA = path.size() >= 4 &&
-		(path[path.size() - 4] == '.') &&
-		(path[path.size() - 3] == 't' || path[path.size() - 3] == 'T') &&
-		(path[path.size() - 2] == 'g' || path[path.size() - 2] == 'G') &&
-		(path[path.size() - 1] == 'a' || path[path.size() - 1] == 'A');
-	// Explicit JPG/PNG (and shader-script-like extensions) are never rewritten
-	// to "*.jpg.tga"; only a bare shader name or an explicit .tga is eligible.
-	if (hasExtension && !isTGA) return false;
-	if (!isTGA) {
-		if (path.size() + 4 >= MAX_QPATH) return false;
-		path += ".tga";
+	if (hasExtension) {
+		std::string ext = path.substr(dot + 1);
+		for (char &ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+		if (ext != "tga" && ext != "jpg" && ext != "jpeg" && ext != "png") return false;
 	}
+	// A bare name is intentionally retained as-is. The bounded loader below
+	// probes the four supported suffixes; explicit extensions are never rewritten.
 	*resolved = std::move(path);
 	return true;
 }
@@ -1946,7 +1943,7 @@ static bool VRHI_ParseShaderBlock(const std::vector<VRHI_ShaderScriptToken> &tok
 			if (!VRHI_ShaderPathIsSafe(texture) ||
 				texture.find('\\') != std::string::npos) return false;
 			std::string path;
-			if (found || !VRHI_ResolveDirectTGAPath(texture.c_str(), &path)) return false;
+			if (found || !VRHI_ResolveDirectImagePath(texture.c_str(), &path)) return false;
 			*candidate = std::move(path);
 			found = true;
 		}
@@ -2064,41 +2061,67 @@ static void VRHI_ScanShaderScripts(const std::vector<std::string> &shaderNames) 
 	}
 }
 
-static bool VRHI_DecodeDirectTGA(const char *name, int maxDimension,
-	size_t maxBytes, std::string *pathOut, vrhi_tga::DecodeResult *decodedOut) {
+static bool VRHI_DecodeDirectImage(const char *name, int maxDimension,
+	size_t maxBytes, std::string *pathOut, vrhi_image::DecodeResult *decodedOut) {
 	if (pathOut != nullptr) pathOut->clear();
-	if (decodedOut != nullptr) *decodedOut = vrhi_tga::DecodeResult();
-	std::string path;
-	if (!VRHI_ResolveDirectTGAPath(name, &path) ||
+	if (decodedOut != nullptr) *decodedOut = vrhi_image::DecodeResult();
+	std::string base;
+	if (!VRHI_ResolveDirectImagePath(name, &base) ||
 		g_ri.FS_ReadFile == nullptr || g_ri.FS_FreeFile == nullptr ||
 		decodedOut == nullptr) return false;
-	void *fileData = nullptr;
-	const long fileSizeLong = g_ri.FS_ReadFile(path.c_str(), &fileData);
-	if (fileData == nullptr || fileSizeLong < vrhi_tga::TGA_HEADER_BYTES) {
-		if (fileData != nullptr) g_ri.FS_FreeFile(fileData);
-		return false;
+	const size_t slash = base.find_last_of("/\\");
+	const size_t dot = base.find_last_of('.');
+	const bool explicitExtension = dot != std::string::npos &&
+		(slash == std::string::npos || dot > slash) && dot + 1 < base.size();
+	std::vector<std::string> candidates;
+	if (explicitExtension) {
+		candidates.push_back(base);
+	} else {
+		static const char *extensions[] = { ".tga", ".jpg", ".jpeg", ".png" };
+		for (const char *extension : extensions) {
+			if (base.size() + std::strlen(extension) >= MAX_QPATH) continue;
+			candidates.emplace_back(base + extension);
+		}
 	}
-	bool ok = false;
-	try {
-		ok = vrhi_tga::Decode(static_cast<const byte *>(fileData),
-			static_cast<size_t>(fileSizeLong), maxDimension, maxBytes, decodedOut);
-	} catch (...) {
-		// A bounded input can still fail allocation; preserve the renderer's
-		// solid/lightmap fallback instead of allowing a hostile TGA to escape.
-		ok = false;
+	for (const std::string &path : candidates) {
+		void *fileData = nullptr;
+		const long fileSizeLong = g_ri.FS_ReadFile(path.c_str(), &fileData);
+		if (fileData == nullptr || fileSizeLong <= 0) {
+			if (fileData != nullptr) g_ri.FS_FreeFile(fileData);
+			continue;
+		}
+		bool ok = false;
+		try {
+			const std::uint8_t *bytes = static_cast<const std::uint8_t *>(fileData);
+			const size_t size = static_cast<size_t>(fileSizeLong);
+			const size_t pathDot = path.find_last_of('.');
+			std::string ext = pathDot == std::string::npos ? std::string() : path.substr(pathDot + 1);
+			for (char &ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+			if (ext == "tga") {
+				vrhi_tga::DecodeResult tga;
+				ok = vrhi_tga::Decode(bytes, size, maxDimension, maxBytes, &tga);
+				if (ok) { decodedOut->ok = tga.ok; decodedOut->width = tga.width; decodedOut->height = tga.height; decodedOut->rgba = std::move(tga.rgba); }
+			} else if (ext == "jpg" || ext == "jpeg") {
+				ok = vrhi_image::DecodeJPEG(bytes, size, maxDimension, maxBytes, decodedOut);
+			} else if (ext == "png") {
+				ok = vrhi_image::DecodePNG(bytes, size, maxDimension, maxBytes, decodedOut);
+			}
+		} catch (...) { ok = false; }
+		g_ri.FS_FreeFile(fileData);
+		if (ok) {
+			if (pathOut != nullptr) *pathOut = path;
+			return true;
+		}
 	}
-	g_ri.FS_FreeFile(fileData);
-	if (!ok) return false;
-	if (pathOut != nullptr) *pathOut = std::move(path);
-	return true;
+	return false;
 }
 
 static bool VRHI_LoadDiffuseTGA(const char *shaderName, int *imageIndex) {
 	if (imageIndex != nullptr) *imageIndex = -1;
 	std::string path;
-	vrhi_tga::DecodeResult decoded;
+	vrhi_image::DecodeResult decoded;
 	bool scriptResolved = false;
-	if (!VRHI_DecodeDirectTGA(shaderName, VRHI_MAX_WORLD_DIFFUSE_DIMENSION,
+	if (!VRHI_DecodeDirectImage(shaderName, VRHI_MAX_WORLD_DIFFUSE_DIMENSION,
 		VRHI_MAX_WORLD_DIFFUSE_BYTES, &path, &decoded)) {
 		std::string shaderKey;
 		if (shaderName != nullptr) {
@@ -2109,7 +2132,7 @@ static bool VRHI_LoadDiffuseTGA(const char *shaderName, int *imageIndex) {
 		}
 		const auto found = g_worldShaderScriptPaths.find(shaderKey);
 		if (!g_worldShaderScriptsScanned || found == g_worldShaderScriptPaths.end() ||
-			found->second.empty() || !VRHI_DecodeDirectTGA(found->second.c_str(),
+			found->second.empty() || !VRHI_DecodeDirectImage(found->second.c_str(),
 				VRHI_MAX_WORLD_DIFFUSE_DIMENSION, VRHI_MAX_WORLD_DIFFUSE_BYTES,
 				&path, &decoded)) return false;
 		scriptResolved = true;
@@ -2148,7 +2171,7 @@ static void VRHI_UploadUITextures(void) {
 		if (image.texture != VRHI_INVALID_HANDLE || image.pixels.empty()) continue;
 		vhTexture texture = vhAllocTexture();
 		if (texture == VRHI_INVALID_HANDLE) {
-			VRHI_Printf(PRINT_WARNING, "renderer_vrhi: UI TGA '%s' allocation failed; solid fallback\n", image.path.c_str());
+			VRHI_Printf(PRINT_WARNING, "renderer_vrhi: UI image '%s' allocation failed; solid fallback\n", image.path.c_str());
 			continue;
 		}
 		vhMem *data = new vhMem(image.pixels.size());
@@ -2158,13 +2181,13 @@ static void VRHI_UploadUITextures(void) {
 			nvrhi::Format::RGBA8_UNORM, VRHI_TEXTURE_NONE | VRHI_SAMPLER_NONE, data);
 		vhFinish();
 		if (g_vhErrorCounter.load(std::memory_order_relaxed) != errorsBefore) {
-			VRHI_Printf(PRINT_WARNING, "renderer_vrhi: UI TGA '%s' upload failed; solid fallback\n", image.path.c_str());
+			VRHI_Printf(PRINT_WARNING, "renderer_vrhi: UI image '%s' upload failed; solid fallback\n", image.path.c_str());
 			vhDestroyTexture(texture);
 			vhFinish();
 			continue;
 		}
 		image.texture = texture;
-		VRHI_Printf(PRINT_ALL, "renderer_vrhi: uploaded UI TGA '%s' (%dx%d, %zu bytes)\n",
+		VRHI_Printf(PRINT_ALL, "renderer_vrhi: uploaded UI image '%s' (%dx%d, %zu bytes)\n",
 			image.path.c_str(), image.width, image.height, image.pixels.size());
 	}
 }
@@ -2178,11 +2201,11 @@ static bool VRHI_RegisterDirectUITexture(qhandle_t handle, const char *name) {
 		return false;
 	}
 	std::string path;
-	vrhi_tga::DecodeResult decoded;
-	if (!VRHI_DecodeDirectTGA(name, VRHI_MAX_UI_TEXTURE_DIMENSION,
+	vrhi_image::DecodeResult decoded;
+	if (!VRHI_DecodeDirectImage(name, VRHI_MAX_UI_TEXTURE_DIMENSION,
 		VRHI_MAX_UI_TEXTURE_BYTES, &path, &decoded)) {
 		VRHI_Printf(PRINT_DEVELOPER,
-			"renderer_vrhi: UI shader '%s' uses solid-color fallback (only direct type 2/10 24/32-bit TGA is supported)\n",
+			"renderer_vrhi: UI shader '%s' uses solid-color fallback (only bounded TGA/JPG/PNG images are supported)\n",
 			name != nullptr ? name : "(null)");
 		return false;
 	}
@@ -2190,7 +2213,7 @@ static bool VRHI_RegisterDirectUITexture(qhandle_t handle, const char *name) {
 	for (const VRHI_UITexture &image : g_uiTextures) existingBytes += image.pixels.size();
 	if (decoded.rgba.size() > VRHI_MAX_UI_TEXTURE_BYTES ||
 		existingBytes > VRHI_MAX_UI_TEXTURE_BYTES - decoded.rgba.size()) {
-		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: UI TGA '%s' skipped; aggregate memory cap reached; solid fallback\n",
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: UI image '%s' skipped; aggregate memory cap reached; solid fallback\n",
 			path.c_str());
 		return false;
 	}
@@ -2201,7 +2224,7 @@ static bool VRHI_RegisterDirectUITexture(qhandle_t handle, const char *name) {
 	image.pixels = std::move(decoded.rgba);
 	g_uiTextures.push_back(std::move(image));
 	g_uiTextureByHandle.emplace(handle, g_uiTextures.size() - 1);
-	VRHI_Printf(PRINT_ALL, "renderer_vrhi: registered UI TGA '%s' for shader handle %d\n",
+	VRHI_Printf(PRINT_ALL, "renderer_vrhi: registered UI image '%s' for shader handle %d\n",
 		g_uiTextures.back().path.c_str(), static_cast<int>(handle));
 	VRHI_UploadUITextures();
 	return true;
@@ -2443,8 +2466,8 @@ static void VRHI_LoadWorld(const char *name) {
 			surface.lightmapNum >= 0 && surface.lightmapNum < g_worldLightmapLayers
 			? surface.lightmapNum : -1;
 		int diffuseImage = -1;
-		// Direct TGA remains first. If it misses, this map-scoped cache contains
-		// only a first-stage script map/clampmap TGA candidate; all other shader
+		// Direct image probing remains first. If it misses, this map-scoped cache contains
+		// only a first-stage script map/clampmap image candidate; all other shader
 		// semantics retain the lightmap/solid fallback.
 		VRHI_LoadDiffuseTGA(shader.shader, &diffuseImage);
 		const uint32_t surfaceFirstIndex = static_cast<uint32_t>(g_worldIndexes.size());
@@ -3083,6 +3106,6 @@ extern "C" Q_EXPORT refexport_t *QDECL GetRefAPI(int apiVersion,
 	exports.TakeVideoFrame = VRHI_TakeVideoFrame;
 
 	VRHI_Printf(PRINT_ALL,
-		"renderer_vrhi: loaded (clear/present + direct-TGA/solid-fallback UI + lightmapped/TGA PVS-culled BSP world)\n");
+		"renderer_vrhi: loaded (clear/present + direct-image/solid-fallback UI + lightmapped/image PVS-culled BSP world)\n");
 	return &exports;
 }
