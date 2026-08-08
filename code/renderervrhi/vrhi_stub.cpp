@@ -106,6 +106,9 @@ static const vhStateId g_frameStateId = 1;
 
 static const float VRHI_WORLD_NEAR = 4.0f;
 static const float VRHI_WORLD_FAR = 131072.0f;
+// Keep malformed or hostile BSP lumps from forcing an unbounded CPU/GPU
+// allocation. Normal Quake 3 maps use far fewer layers.
+static const int VRHI_MAX_WORLD_LIGHTMAP_LAYERS = 4096;
 
 // Keep the generated qpath within MAX_QPATH while allowing the command to
 // accept only a basename.  The prefix and suffix are fixed and never come
@@ -1461,7 +1464,7 @@ static void VRHI_LoadWorld(const char *name) {
 	const bool lightmapLumpValid = lightmapsLump.filelen > 0 &&
 		static_cast<size_t>(lightmapsLump.filelen) % lightmapLayerBytes == 0 &&
 		static_cast<size_t>(lightmapsLump.filelen) / lightmapLayerBytes <=
-		static_cast<size_t>(std::numeric_limits<int>::max());
+		static_cast<size_t>(VRHI_MAX_WORLD_LIGHTMAP_LAYERS);
 	if (lightmapsLump.filelen > 0 && !lightmapLumpValid) {
 		VRHI_Printf(PRINT_WARNING,
 			"renderer_vrhi: BSP world '%s' has malformed lightmap lump; surfaces use solid fallback\n",
@@ -1511,6 +1514,7 @@ static void VRHI_LoadWorld(const char *name) {
 		}
 		std::unordered_map<int, uint32_t> localVertices;
 		const int surfaceLightmapLayer = lightmapLumpValid &&
+			(shader.surfaceFlags & SURF_NOLIGHTMAP) == 0 &&
 			surface.lightmapNum >= 0 && surface.lightmapNum < g_worldLightmapLayers
 			? surface.lightmapNum : -1;
 		int surfaceTriangles = 0;
