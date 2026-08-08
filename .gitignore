@@ -4,6 +4,7 @@ build*
 *~
 /.vscode/
 /baseq3
+/temp/
 
 # OS X
 ####################
