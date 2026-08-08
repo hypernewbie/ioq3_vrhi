@@ -60,7 +60,11 @@ static const std::size_t VRHI_SHADER_MAX_STAGES = 4;
 enum VRHI_ShaderBlendMode {
 	VRHI_SHADER_BLEND_OPAQUE = 0,
 	VRHI_SHADER_BLEND_ALPHA = 1,
-	VRHI_SHADER_BLEND_ADDITIVE = 2
+	VRHI_SHADER_BLEND_ADDITIVE = 2,
+	// Quake3 `blendFunc filter`: destination-colour modulation. This is
+	// intentionally separate from source-alpha so water/filter materials do
+	// not silently become additive.
+	VRHI_SHADER_BLEND_FILTER = 3
 };
 struct VRHI_ShaderStage {
 	std::string path;
@@ -352,9 +356,13 @@ inline bool VRHI_ParseShaderScript(const unsigned char *data, std::size_t size,
 }
 
 // Parses one bounded shader body for the deliberately small multi-stage
-// material slice. Every stage has exactly one real map and no stage may use
-// unsupported shader semantics. Stage zero is opaque; subsequent stages may
-// use only source-alpha or additive blending. This remains separate from the
+// material slice. Every stage has exactly one bounded direct-image map (or
+// the first frame of an animMap), and only the blend mode affects output. The
+// parser ignores bounded stage/top-level directives whose geometry/UV/time
+// semantics are not implemented, preserving a visible static-material fallback
+// instead of returning the green solid placeholder. Stage zero may be opaque,
+// source-alpha, additive, or filter; later stages without an explicit blendFunc
+// become static source-alpha overlays. This remains separate from the
 // conservative first-stage helper above.
 inline bool VRHI_ParseSimpleShaderBlock(
 	const std::vector<VRHI_ShaderScriptToken> &tokens, std::size_t begin,
@@ -362,7 +370,16 @@ inline bool VRHI_ParseSimpleShaderBlock(
 	if (stages != nullptr) stages->clear();
 	if (stages == nullptr || begin >= end || end > tokens.size()) return false;
 	for (std::size_t i = begin; i < end;) {
-		if (tokens[i].text != "{" || stages->size() >= VRHI_SHADER_MAX_STAGES) return false;
+		// Shader-level directives (surfaceparm, cull, fogparms, q3map_* and
+		// similar) are bounded metadata. The renderer does not implement their
+		// full semantics, but rejecting the whole material would turn otherwise
+		// usable transparent stages into a green placeholder. Stage directives
+		// are handled below; only their supported map/blend subset affects draw.
+		if (tokens[i].text != "{") {
+			++i;
+			continue;
+		}
+		if (stages->size() >= VRHI_SHADER_MAX_STAGES) return false;
 		const std::size_t stageBegin = ++i;
 		int depth = 1;
 		while (i < end && depth > 0) {
@@ -375,17 +392,47 @@ inline bool VRHI_ParseSimpleShaderBlock(
 		VRHI_ShaderStage stage;
 		bool foundMap = false;
 		bool blendSpecified = false;
+		bool discardStage = false;
 		for (std::size_t j = stageBegin; j < stageEnd;) {
 			if (tokens[j].text == "{" || tokens[j].text == "}") return false;
 			const std::string keyword = VRHI_ShaderLowerASCII(tokens[j].text);
 			if (keyword == "map" || keyword == "clampmap") {
 				if (foundMap || j + 1 >= stageEnd) return false;
 				const std::string &texture = tokens[j + 1].text;
+				// Engine-owned maps such as $lightmap cannot be uploaded through
+				// the direct-image path. Skip that stage only; earlier real image
+				// stages remain useful static transparent material output.
+				if (!texture.empty() && texture[0] == '$') {
+					j += 2;
+					continue;
+				}
+				if (texture.empty() || !VRHI_ShaderPathIsSafe(texture) ||
+					texture.find('\\') != std::string::npos ||
+					!VRHI_ResolveDirectImagePath(texture.c_str(), &stage.path)) return false;
+				foundMap = true;
+				j += 2;
+				continue;
+			}
+			if (keyword == "animmap") {
+				// Bounded static fallback: use the first frame and ignore the
+				// animation rate/remaining frame paths. Full time-varying animMap
+				// remains outside this renderer slice.
+				if (foundMap || j + 2 >= stageEnd) return false;
+				const std::string &texture = tokens[j + 2].text;
 				if (texture.empty() || texture[0] == '$' ||
 					!VRHI_ShaderPathIsSafe(texture) ||
 					texture.find('\\') != std::string::npos ||
 					!VRHI_ResolveDirectImagePath(texture.c_str(), &stage.path)) return false;
 				foundMap = true;
+				j += 3;
+				continue;
+			}
+			if (keyword == "rgbgen" || keyword == "alphagen") {
+				// Static fallback for dynamic colour/alpha generators. Require
+				// the keyword's first argument so a truncated statement still
+				// rejects safely; remaining generator parameters are bounded
+				// tokens and are ignored below.
+				if (j + 1 >= stageEnd) return false;
 				j += 2;
 				continue;
 			}
@@ -396,6 +443,12 @@ inline bool VRHI_ParseSimpleShaderBlock(
 				if (arg == "blend") {
 					stage.blendMode = VRHI_SHADER_BLEND_ALPHA;
 					consumed = 2;
+				} else if (arg == "add") {
+					stage.blendMode = VRHI_SHADER_BLEND_ADDITIVE;
+					consumed = 2;
+				} else if (arg == "filter") {
+					stage.blendMode = VRHI_SHADER_BLEND_FILTER;
+					consumed = 2;
 				} else {
 					if (j + 2 >= stageEnd) return false;
 					const std::string dst = VRHI_ShaderLowerASCII(tokens[j + 2].text);
@@ -403,9 +456,17 @@ inline bool VRHI_ParseSimpleShaderBlock(
 						stage.blendMode = VRHI_SHADER_BLEND_ALPHA;
 					else if (arg == "gl_one" && dst == "gl_one")
 						stage.blendMode = VRHI_SHADER_BLEND_ADDITIVE;
+					else if (arg == "gl_dst_color" && dst == "gl_zero")
+						stage.blendMode = VRHI_SHADER_BLEND_FILTER;
+					else if (arg == "gl_src_alpha" && dst == "gl_one")
+						stage.blendMode = VRHI_SHADER_BLEND_ADDITIVE;
 					else if (arg == "gl_one" && dst == "gl_zero")
 						stage.blendMode = VRHI_SHADER_BLEND_OPAQUE;
-					else return false;
+					else
+						// A syntactically complete but unsupported blend pair drops
+						// only this stage. Earlier/later supported stages remain a
+						// bounded static fallback instead of turning the material green.
+						discardStage = true;
 					consumed = 3;
 				}
 				blendSpecified = true;
@@ -413,11 +474,20 @@ inline bool VRHI_ParseSimpleShaderBlock(
 				continue;
 			}
 			const std::size_t consumed = VRHI_ShaderAllowlistedStatement(tokens, j, stageEnd);
-			if (consumed == std::numeric_limits<std::size_t>::max() || consumed == 0) return false;
-			j += consumed;
+			if (consumed == std::numeric_limits<std::size_t>::max()) return false;
+			// Unsupported stage modifiers (tcMod, tcGen, rgbGen, alphaGen,
+			// deform-like tokens nested in a stage) are deliberately ignored as
+			// static fallbacks. Their tokens are still bounded by stageEnd.
+			j += consumed > 0 ? consumed : 1;
 		}
-		if (!foundMap || (stages->empty() && stage.blendMode != VRHI_SHADER_BLEND_OPAQUE) ||
-			(!stages->empty() && (!blendSpecified || stage.blendMode == VRHI_SHADER_BLEND_OPAQUE))) return false;
+		// A stage containing only an engine-owned map (for example
+		// `$lightmap`) or an unsupported but syntactically valid blend is
+		// intentionally omitted from this direct-image slice.
+		if (!foundMap || discardStage) continue;
+		if (!stages->empty()) {
+			if (blendSpecified && stage.blendMode == VRHI_SHADER_BLEND_OPAQUE) return false;
+			if (!blendSpecified) stage.blendMode = VRHI_SHADER_BLEND_ALPHA;
+		}
 		stages->push_back(std::move(stage));
 	}
 	return !stages->empty();

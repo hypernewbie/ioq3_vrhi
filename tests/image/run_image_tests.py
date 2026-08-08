@@ -30,7 +30,10 @@ try:
         CLASS_CLEAR_ONLY,
         CLASS_CONTENT,
         VRHI_CLEAR_COLOR_RGB8,
+        VRHI_SOLID_FALLBACK_RGB8,
         classify_frame,
+        count_exact_color,
+        largest_exact_color_component,
         parse_expected_clear_color,
     )
 except ImportError:  # pragma: no cover - module import fallback
@@ -38,7 +41,10 @@ except ImportError:  # pragma: no cover - module import fallback
         CLASS_CLEAR_ONLY,
         CLASS_CONTENT,
         VRHI_CLEAR_COLOR_RGB8,
+        VRHI_SOLID_FALLBACK_RGB8,
         classify_frame,
+        count_exact_color,
+        largest_exact_color_component,
         parse_expected_clear_color,
     )
 
@@ -49,6 +55,9 @@ DEFAULT_MANIFEST = SCRIPT_DIR / "scenes.json"
 DEFAULT_RUN_ROOT = ROOT / "temp" / "image-tests"
 DEFAULT_TIMEOUT = 90.0
 PROVISION_LOCK_TIMEOUT = 600.0
+# A real scene can contain isolated RGB8 matches by chance. An 8x8 contiguous
+# solid-fallback region is visibly wrong and is a hard test failure.
+VRHI_SOLID_FALLBACK_MAX_COMPONENT_PIXELS = 63
 
 SCREENSHOT_RELATIVE = Path("baseoa") / "screenshots"
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -384,6 +393,34 @@ def apply_frame_classification(result: dict[str, object], scene: Scene) -> None:
     result["frame_classification"] = classification.as_dict()
 
 
+def apply_vrhi_fallback_gate(
+    result: dict[str, object], renderer: str
+) -> None:
+    """Fail VRHI captures that visibly contain the renderer solid sentinel."""
+    if renderer != "vrhi":
+        return
+    normalized = result.get("_normalized_rgb")
+    width = result.get("width")
+    height = result.get("height")
+    if not isinstance(normalized, bytes) or not isinstance(width, int) or not isinstance(height, int):
+        return
+    pixel_count = width * height
+    fallback_pixels = count_exact_color(normalized, VRHI_SOLID_FALLBACK_RGB8)
+    fallback_fraction = fallback_pixels / pixel_count if pixel_count else 0.0
+    largest_component = largest_exact_color_component(
+        normalized, width, height, VRHI_SOLID_FALLBACK_RGB8
+    )
+    result["vrhi_solid_fallback_pixels"] = fallback_pixels
+    result["vrhi_solid_fallback_fraction"] = fallback_fraction
+    result["vrhi_solid_fallback_largest_component"] = largest_component
+    if largest_component > VRHI_SOLID_FALLBACK_MAX_COMPONENT_PIXELS:
+        result["error"] = (
+            "VRHI solid green fallback detected: "
+            f"largest contiguous region={largest_component} pixels "
+            f"(total {fallback_pixels}/{pixel_count}, {fallback_fraction:.3%})"
+        )
+
+
 def run_one(
     engine: Path,
     run_dir: Path,
@@ -485,6 +522,7 @@ def run_one(
         }
     )
     apply_frame_classification(result, scene)
+    apply_vrhi_fallback_gate(result, renderer)
     return result
 
 

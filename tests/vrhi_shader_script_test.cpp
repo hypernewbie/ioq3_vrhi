@@ -3,11 +3,10 @@
 // filesystem, no third-party libraries: the test feeds shader script text in
 // memory and asserts tokenization, comment handling, caps, the safe opaque
 // allowlist (blendFunc GL_ONE GL_ZERO, rgbGen/alphaGen identity, depthWrite,
-// depthFunc lequal/less), the continued rejection of alpha/additive blends,
-// tcGen/tcMod variants, deform/fog/animMap/videoMap/normal/specular/portal/
-// sky, malformed statements, and multi-map shaders, plus the bounded
-// multi-stage slice (VRHI_ParseShaderScriptStages: at most four direct-image
-// stages, stage 0 opaque, later stages source-alpha or additive).
+// depthFunc lequal/less), malformed statements, and multi-map shaders, plus
+// the bounded multi-stage slice (VRHI_ParseShaderScriptStages: at most four
+// direct-image/static-first-frame stages, common transparent blend modes, and
+// ignored-but-bounded UV/time modifiers).
 //
 // Build and run (any C++11-or-later compiler):
 //   clang++ -std=c++17 -O1 -Wall -Wextra -Werror tests/vrhi_shader_script_test.cpp -o vrhi_shader_script_test && ./vrhi_shader_script_test
@@ -323,6 +322,7 @@ void testSimpleMultiStageExtraction() {
 	std::unordered_map<std::string, bool> wanted;
 	wanted.emplace("textures/foo/bar", true);
 	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > rejected;
 	CHECK(VRHI_ParseShaderScriptStages(asBytes(text), text.size(), wanted, &results));
 	CHECK_EQ_INT(results.size(), 1u);
 	const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
@@ -334,13 +334,60 @@ void testSimpleMultiStageExtraction() {
 		CHECK_EQ_INT(stages[1].blendMode, VRHI_SHADER_BLEND_ALPHA);
 		CHECK_EQ_INT(stages[2].blendMode, VRHI_SHADER_BLEND_ADDITIVE);
 	}
-	const std::string badStage0 = script("{ map textures/base.tga blendFunc blend }\n{ map textures/a.png blendFunc blend }");
-	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > rejected;
-	CHECK(VRHI_ParseShaderScriptStages(asBytes(badStage0), badStage0.size(), wanted, &rejected));
-	CHECK_EQ_INT(rejected.size(), 0u);
-	const std::string badUnsupported = script("{ map textures/base.tga }\n{ map textures/a.png blendFunc blend tcMod scroll 1 1 }");
+	const std::string alphaStage0 = script("{ map textures/base.tga blendFunc blend }\n{ map textures/a.png blendFunc blend }");
 	rejected.clear();
-	CHECK(VRHI_ParseShaderScriptStages(asBytes(badUnsupported), badUnsupported.size(), wanted, &rejected));
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(alphaStage0), alphaStage0.size(), wanted, &rejected));
+	CHECK_EQ_INT(rejected.size(), 1u);
+	if (rejected.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &alphaStages = rejected["textures/foo/bar"];
+		CHECK_EQ_INT(alphaStages.size(), 2u);
+		if (alphaStages.size() == 2) {
+			CHECK_EQ_INT(alphaStages[0].blendMode, VRHI_SHADER_BLEND_ALPHA);
+			CHECK_EQ_INT(alphaStages[1].blendMode, VRHI_SHADER_BLEND_ALPHA);
+		}
+	}
+	const std::string boundedModifiers = script(
+		"surfaceparm trans cull disable fogparms ( 0 0 0 ) 1024\n"
+		"{ map textures/base.tga tcMod scroll 1 1 rgbGen wave sin 0.5 0.5 0 1 }\n"
+		"{ map textures/a.png blendFunc filter tcMod turb 0 1 0 0.2 alphaGen const 0.5 }\n"
+		"{ animMap 15 textures/frame0.tga textures/frame1.tga blendFunc add }");
+	rejected.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(boundedModifiers), boundedModifiers.size(), wanted, &rejected));
+	CHECK_EQ_INT(rejected.size(), 1u);
+	if (rejected.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &modifierStages = rejected["textures/foo/bar"];
+		CHECK_EQ_INT(modifierStages.size(), 3u);
+		if (modifierStages.size() == 3) {
+			CHECK_EQ_INT(modifierStages[0].blendMode, VRHI_SHADER_BLEND_OPAQUE);
+			CHECK_EQ_INT(modifierStages[1].blendMode, VRHI_SHADER_BLEND_FILTER);
+			CHECK_EQ_INT(modifierStages[2].blendMode, VRHI_SHADER_BLEND_ADDITIVE);
+			CHECK_EQ_STR(modifierStages[2].path, "textures/frame0.tga");
+		}
+	}
+	const std::string compatibilityStages = script(
+		"{ map textures/glow.tga blendFunc GL_SRC_ALPHA GL_ONE }\n"
+		"{ map $lightmap rgbGen identity }\n"
+		"{ map textures/overlay.tga }\n"
+		"{ map textures/unsupported-detail.tga blendFunc GL_DST_COLOR GL_SRC_COLOR }");
+	rejected.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(compatibilityStages), compatibilityStages.size(), wanted, &rejected));
+	CHECK_EQ_INT(rejected.size(), 1u);
+	if (rejected.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &compatStages = rejected["textures/foo/bar"];
+		CHECK_EQ_INT(compatStages.size(), 2u);
+		if (compatStages.size() == 2) {
+			CHECK_EQ_INT(compatStages[0].blendMode, VRHI_SHADER_BLEND_ADDITIVE);
+			CHECK_EQ_INT(compatStages[1].blendMode, VRHI_SHADER_BLEND_ALPHA);
+		}
+	}
+	const std::string explicitOpaqueOverlay = script(
+		"{ map textures/base.tga } { map textures/opaque.tga blendFunc GL_ONE GL_ZERO }");
+	rejected.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(explicitOpaqueOverlay), explicitOpaqueOverlay.size(), wanted, &rejected));
+	CHECK_EQ_INT(rejected.size(), 0u);
+	const std::string truncatedAnimMap = script("{ animMap 15 }");
+	rejected.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncatedAnimMap), truncatedAnimMap.size(), wanted, &rejected));
 	CHECK_EQ_INT(rejected.size(), 0u);
 	const std::string tooMany = script(
 		"{ map textures/0.tga } { map textures/1.tga blendFunc blend } "

@@ -28,6 +28,7 @@
 #undef VRHI_RESTORE_INLINE_MACRO
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cctype>
@@ -113,6 +114,8 @@ struct VRHI_SceneDraw {
 	uint32_t firstIndex = 0;
 	uint32_t indexCount = 0;
 	qhandle_t shader = 0;
+	uint8_t blendMode = VRHI_SHADER_BLEND_OPAQUE;
+	bool translucent = false;
 	// Inline BSP batches already resolved their map shader to a shared diffuse
 	// image.  Keep that image index on the draw instead of manufacturing a
 	// second scene-local texture table.
@@ -144,6 +147,7 @@ struct VRHI_WorldDiffuseImage {
 	int height = 0;
 	bool scriptResolved = false;
 	std::vector<byte> pixels;
+	bool hasTransparency = false;
 	vhTexture texture = VRHI_INVALID_HANDLE;
 };
 struct VRHI_WorldBatch {
@@ -154,6 +158,9 @@ struct VRHI_WorldBatch {
 	int stageImages[VRHI_SHADER_MAX_STAGES] = { -1, -1, -1, -1 };
 	uint8_t stageBlend[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_BLEND_OPAQUE,
 		VRHI_SHADER_BLEND_OPAQUE, VRHI_SHADER_BLEND_OPAQUE, VRHI_SHADER_BLEND_OPAQUE };
+	// A non-opaque stage zero is a translucent world batch. It is rendered
+	// after opaque batches in back-to-front order with depth writes disabled.
+	bool translucent = false;
 };
 struct VRHI_InlineBSPModel {
 	bool valid = false;
@@ -168,7 +175,12 @@ struct VRHI_UITexture {
 	int width = 0;
 	int height = 0;
 	std::vector<byte> pixels;
+	bool hasTransparency = false;
 	vhTexture texture = VRHI_INVALID_HANDLE;
+};
+struct VRHI_SceneShaderMaterial {
+	int diffuseImage = -1;
+	uint8_t blendMode = VRHI_SHADER_BLEND_OPAQUE;
 };
 // Minimal, decoded copies of the BSP PVS traversal state. Values are
 // byte-swapped out of the on-disk little-endian form at load time and copied
@@ -205,9 +217,15 @@ static std::unordered_map<qhandle_t, size_t> g_inlineBSPModelByHandle;
 // Script results are map-scoped. Stage paths are copied qpaths, never pointers
 // into FS_ListFiles/FS_ReadFile storage; missing or rejected scripts are absent.
 static std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > g_worldShaderScriptStages;
+static std::vector<std::string> g_worldShaderNames;
+static std::unordered_set<std::string> g_unresolvedMaterialReports;
 static bool g_worldShaderScriptsScanned = false;
 static std::vector<VRHI_UITexture> g_uiTextures;
 static std::unordered_map<qhandle_t, size_t> g_uiTextureByHandle;
+// Model/entity shader handles can be registered before BSP shader scripts are
+// scanned. Cache their later bounded direct-image/script resolution separately
+// from UI textures so scene draws do not fall back to the green solid shader.
+static std::unordered_map<qhandle_t, VRHI_SceneShaderMaterial> g_sceneShaderDiffuseByHandle;
 static std::unordered_map<qhandle_t, bool> g_uiTextureAttempts;
 static std::vector<byte> g_worldLightmapPixels;
 
@@ -1154,11 +1172,11 @@ struct PSInput {
 [shader("pixel")]
 float4 main(PSInput input) : SV_Target
 {
-    float3 color = u_diffuse.Sample(u_diffuseSampler, input.diffuse).rgb;
+    float4 sample = u_diffuse.Sample(u_diffuseSampler, input.diffuse);
     if (input.lightmapLayer >= -0.5)
-        color *= u_lightmap.Sample(u_lightmapSampler,
+        sample.rgb *= u_lightmap.Sample(u_lightmapSampler,
             float3(saturate(input.lightmap), input.lightmapLayer)).rgb;
-    return float4(color, 1.0) * input.color;
+    return sample * input.color;
 }
 )";
 
@@ -1309,9 +1327,12 @@ static void VRHI_DestroyWorldResources(bool clearGeometry) {
 		g_worldIndexes.clear();
 		g_worldBatches.clear();
 		g_worldDiffuseImages.clear();
+		g_sceneShaderDiffuseByHandle.clear();
 		g_inlineBSPModels.clear();
 		g_inlineBSPModelByHandle.clear();
 		g_worldShaderScriptStages.clear();
+		g_worldShaderNames.clear();
+		g_unresolvedMaterialReports.clear();
 		g_worldShaderScriptsScanned = false;
 		g_worldLoaded = false;
 	}
@@ -2646,6 +2667,14 @@ static std::string VRHI_LowerASCII(const std::string &text) {
 	return lower;
 }
 
+static bool VRHI_IsPortalMaterial(const char *shaderName) {
+	if (shaderName == nullptr) return false;
+	size_t length = 0;
+	while (length < MAX_QPATH && shaderName[length] != '\0') ++length;
+	return length == 22 &&
+		VRHI_LowerASCII(std::string(shaderName, length)) == "textures/common/portal";
+}
+
 static bool VRHI_ResolveShaderScriptFile(const char *fileName,
 	std::string *resolved) {
 	if (resolved != nullptr) resolved->clear();
@@ -2663,6 +2692,7 @@ static bool VRHI_ResolveShaderScriptFile(const char *fileName,
 }
 
 static void VRHI_ScanShaderScripts(const std::vector<std::string> &shaderNames) {
+	g_worldShaderNames = shaderNames;
 	g_worldShaderScriptStages.clear();
 	g_worldShaderScriptsScanned = true;
 	std::unordered_map<std::string, bool> wanted;
@@ -2671,6 +2701,8 @@ static void VRHI_ScanShaderScripts(const std::vector<std::string> &shaderNames) 
 	try {
 		for (const std::string &name : shaderNames)
 			if (!name.empty()) wanted.emplace(VRHI_LowerASCII(name), true);
+		for (const auto &entry : g_shaderHandles)
+			if (!entry.first.empty()) wanted.emplace(VRHI_LowerASCII(entry.first), true);
 		if (g_ri.FS_ListFiles == nullptr || g_ri.FS_FreeFileList == nullptr ||
 			g_ri.FS_ReadFile == nullptr || g_ri.FS_FreeFile == nullptr) return;
 		int fileCount = 0;
@@ -2731,10 +2763,24 @@ static bool VRHI_DecodeDirectImage(const char *name, int maxDimension,
 	const bool explicitExtension = dot != std::string::npos &&
 		(slash == std::string::npos || dot > slash) && dot + 1 < base.size();
 	std::vector<std::string> candidates;
+	static const char *extensions[] = { ".tga", ".jpg", ".jpeg", ".png" };
 	if (explicitExtension) {
 		candidates.push_back(base);
+		// Quake's image lookup treats a shader path extension as a hint and
+		// probes the other supported encodings when that exact file is absent.
+		// OpenArena relies on this (for example envmapblue2.tga is shipped as
+		// envmapblue2.jpg). Preserve the requested path first, then try bounded
+		// sibling extensions without changing unsafe path handling.
+		const std::string stem = base.substr(0, dot);
+		std::string requested = base.substr(dot);
+		for (char &ch : requested)
+			ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+		for (const char *extension : extensions) {
+			if (requested == extension || stem.size() + std::strlen(extension) >= MAX_QPATH)
+				continue;
+			candidates.emplace_back(stem + extension);
+		}
 	} else {
-		static const char *extensions[] = { ".tga", ".jpg", ".jpeg", ".png" };
 		for (const char *extension : extensions) {
 			if (base.size() + std::strlen(extension) >= MAX_QPATH) continue;
 			candidates.emplace_back(base + extension);
@@ -2773,6 +2819,12 @@ static bool VRHI_DecodeDirectImage(const char *name, int maxDimension,
 	return false;
 }
 
+static bool VRHI_RGBAHasTransparency(const std::vector<byte> &pixels) {
+	for (size_t offset = 3; offset < pixels.size(); offset += 4)
+		if (pixels[offset] < 255) return true;
+	return false;
+}
+
 static bool VRHI_StoreDiffuseImage(const std::string &path,
 	const vrhi_image::DecodeResult &decoded, bool scriptResolved, int *imageIndex) {
 	if (imageIndex != nullptr) *imageIndex = -1;
@@ -2793,6 +2845,7 @@ static bool VRHI_StoreDiffuseImage(const std::string &path,
 	image.width = decoded.width;
 	image.height = decoded.height;
 	image.scriptResolved = scriptResolved;
+	image.hasTransparency = VRHI_RGBAHasTransparency(decoded.rgba);
 	image.pixels = decoded.rgba;
 	g_worldDiffuseImages.push_back(std::move(image));
 	const int index = static_cast<int>(g_worldDiffuseImages.size() - 1);
@@ -2800,6 +2853,16 @@ static bool VRHI_StoreDiffuseImage(const std::string &path,
 	VRHI_Printf(PRINT_ALL, "renderer_vrhi: decoded %sBSP diffuse '%s' (%dx%d, %zu bytes)\n",
 		scriptResolved ? "script-resolved " : "", path.c_str(), decoded.width, decoded.height, pixelBytes);
 	return true;
+}
+
+static void VRHI_ReportUnresolvedMaterial(const char *shaderName, const char *reason) {
+	if (shaderName == nullptr || shaderName[0] == '\0' ||
+		g_unresolvedMaterialReports.size() >= 256) return;
+	const std::string key(shaderName);
+	if (!g_unresolvedMaterialReports.emplace(key).second) return;
+	VRHI_Printf(PRINT_DEVELOPER,
+		"renderer_vrhi: unresolved material '%s' (%s); solid fallback\n",
+		shaderName, reason != nullptr ? reason : "unknown");
 }
 
 static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
@@ -2824,7 +2887,10 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 			if (length > 0 && length < MAX_QPATH) key = VRHI_LowerASCII(std::string(shaderName, length));
 		}
 		const auto found = g_worldShaderScriptStages.find(key);
-		if (!g_worldShaderScriptsScanned || found == g_worldShaderScriptStages.end() || found->second.empty()) return false;
+		if (!g_worldShaderScriptsScanned || found == g_worldShaderScriptStages.end() || found->second.empty()) {
+			VRHI_ReportUnresolvedMaterial(shaderName, "no direct image or accepted script stages");
+			return false;
+		}
 		stages = found->second;
 		scriptResolved = true;
 	}
@@ -2833,8 +2899,14 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 		std::string path;
 		if (i == 0 && !scriptResolved) { path = directPath; decoded = std::move(directDecoded); }
 		else if (!VRHI_DecodeDirectImage(stages[i].path.c_str(), VRHI_MAX_WORLD_DIFFUSE_DIMENSION,
-			VRHI_MAX_WORLD_DIFFUSE_BYTES, &path, &decoded)) return false;
-		if (!VRHI_StoreDiffuseImage(path, decoded, scriptResolved, &images[i])) return false;
+			VRHI_MAX_WORLD_DIFFUSE_BYTES, &path, &decoded)) {
+			VRHI_ReportUnresolvedMaterial(shaderName, "accepted stage image decode failed");
+			return false;
+		}
+		if (!VRHI_StoreDiffuseImage(path, decoded, scriptResolved, &images[i])) {
+			VRHI_ReportUnresolvedMaterial(shaderName, "diffuse image storage cap/failure");
+			return false;
+		}
 		blends[i] = static_cast<uint8_t>(stages[i].blendMode);
 	}
 	*stageCount = static_cast<int>(stages.size());
@@ -2910,6 +2982,7 @@ static bool VRHI_RegisterDirectUITexture(qhandle_t handle, const char *name) {
 	image.path = std::move(path);
 	image.width = decoded.width;
 	image.height = decoded.height;
+	image.hasTransparency = VRHI_RGBAHasTransparency(decoded.rgba);
 	image.pixels = std::move(decoded.rgba);
 	g_uiTextures.push_back(std::move(image));
 	g_uiTextureByHandle.emplace(handle, g_uiTextures.size() - 1);
@@ -3374,7 +3447,8 @@ static void VRHI_LoadWorld(const char *name) {
 			? VRHI_ReadShader(shadersData, surface.shaderNum) : dshader_t();
 		if ((surface.surfaceType != MST_PLANAR && surface.surfaceType != MST_PATCH &&
 			surface.surfaceType != MST_TRIANGLE_SOUP) || surface.shaderNum < 0 ||
-			surface.shaderNum >= shaderCount || (shader.surfaceFlags & (SURF_SKY | SURF_NODRAW)) ||
+			surface.shaderNum >= shaderCount || VRHI_IsPortalMaterial(shader.shader) ||
+			(shader.surfaceFlags & (SURF_SKY | SURF_NODRAW)) ||
 			surface.firstVert < 0 || surface.numVerts < 3 || surface.firstVert > vertCount ||
 			surface.numVerts > vertCount - surface.firstVert ||
 			surface.numVerts > VRHI_MAX_WORLD_SURFACE_VERTICES) {
@@ -3420,6 +3494,7 @@ static void VRHI_LoadWorld(const char *name) {
 			batch.indexCount = static_cast<uint32_t>(patch.indexes.size());
 			batch.diffuseImage = diffuseImage;
 			batch.stageCount = static_cast<uint8_t>(stageCount);
+			batch.translucent = stageCount > 0 && stageBlend[0] != VRHI_SHADER_BLEND_OPAQUE;
 			for (int stage = 0; stage < stageCount; ++stage) {
 				batch.stageImages[stage] = stageImages[stage];
 				batch.stageBlend[stage] = stageBlend[stage];
@@ -3510,6 +3585,7 @@ static void VRHI_LoadWorld(const char *name) {
 			batch.indexCount = static_cast<uint32_t>(g_worldIndexes.size()) - surfaceFirstIndex;
 			batch.diffuseImage = diffuseImage;
 			batch.stageCount = static_cast<uint8_t>(stageCount);
+			batch.translucent = stageCount > 0 && stageBlend[0] != VRHI_SHADER_BLEND_OPAQUE;
 			for (int stage = 0; stage < stageCount; ++stage) {
 				batch.stageImages[stage] = stageImages[stage];
 				batch.stageBlend[stage] = stageBlend[stage];
@@ -3553,7 +3629,8 @@ static void VRHI_LoadWorld(const char *name) {
 				? VRHI_ReadShader(shadersData, surface.shaderNum) : dshader_t();
 			if ((surface.surfaceType != MST_PLANAR && surface.surfaceType != MST_PATCH &&
 				surface.surfaceType != MST_TRIANGLE_SOUP) || surface.shaderNum < 0 ||
-				surface.shaderNum >= shaderCount || (shader.surfaceFlags & (SURF_SKY | SURF_NODRAW)) ||
+				surface.shaderNum >= shaderCount || VRHI_IsPortalMaterial(shader.shader) ||
+				(shader.surfaceFlags & (SURF_SKY | SURF_NODRAW)) ||
 				surface.firstVert < 0 || surface.numVerts < 3 || surface.firstVert > vertCount ||
 				surface.numVerts > vertCount - surface.firstVert ||
 				surface.numVerts > VRHI_MAX_WORLD_SURFACE_VERTICES) {
@@ -3895,7 +3972,8 @@ static VRHI_WorldVertex VRHI_SceneVertex(const glm::vec3 &position,
 }
 
 static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
-	size_t indexCount, int diffuseImage = -1, bool lightmapped = false) {
+	size_t indexCount, int diffuseImage = -1, bool lightmapped = false,
+	bool translucent = false, uint8_t blendMode = VRHI_SHADER_BLEND_OPAQUE) {
 	if (indexCount == 0 || firstIndex > UINT32_MAX || indexCount > UINT32_MAX ||
 		g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) return false;
 	VRHI_SceneDraw draw;
@@ -3904,18 +3982,95 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	draw.shader = shader;
 	draw.diffuseImage = diffuseImage;
 	draw.lightmapped = lightmapped;
+	draw.blendMode = blendMode;
+	draw.translucent = translucent || blendMode != VRHI_SHADER_BLEND_OPAQUE;
 	g_sceneDraws.push_back(draw);
 	return true;
 }
 
-static vhTexture VRHI_SceneTexture(const VRHI_SceneDraw &draw) {
-	if (draw.diffuseImage >= 0 && static_cast<size_t>(draw.diffuseImage) < g_worldDiffuseImages.size())
-		return g_worldDiffuseImages[static_cast<size_t>(draw.diffuseImage)].texture;
-	const std::unordered_map<qhandle_t, size_t>::const_iterator found =
-		g_uiTextureByHandle.find(draw.shader);
-	if (found == g_uiTextureByHandle.end() || found->second >= g_uiTextures.size())
+// Model and effect shaders are often registered after map loading. Expand the
+// bounded script cache once during scene preparation, before any draw is
+// enqueued; never rescan files or recreate textures from the render loop.
+static void VRHI_RefreshSceneShaderScripts(void) {
+	if (!g_worldShaderScriptsScanned) return;
+	std::vector<std::string> expandedNames = g_worldShaderNames;
+	std::unordered_set<std::string> known;
+	known.reserve(expandedNames.size() + g_shaderHandles.size());
+	for (const std::string &name : expandedNames) known.emplace(VRHI_LowerASCII(name));
+	bool changed = false;
+	for (const auto &entry : g_shaderHandles) {
+		if (entry.first.empty()) continue;
+		if (known.emplace(VRHI_LowerASCII(entry.first)).second) {
+			expandedNames.push_back(entry.first);
+			changed = true;
+		}
+	}
+	if (changed) {
+		VRHI_ScanShaderScripts(expandedNames);
+		// A handle that failed before its script name entered the wanted set
+		// must be retried after this refresh. Keep successful texture indices.
+		for (auto it = g_sceneShaderDiffuseByHandle.begin();
+			it != g_sceneShaderDiffuseByHandle.end();) {
+			if (it->second.diffuseImage < 0) it = g_sceneShaderDiffuseByHandle.erase(it);
+			else ++it;
+		}
+	}
+}
+
+static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
+	if (draw == nullptr) return VRHI_INVALID_HANDLE;
+	const auto applyMaterial = [&](uint8_t blendMode, bool hasTransparency) {
+		if (draw->blendMode == VRHI_SHADER_BLEND_OPAQUE && hasTransparency)
+			draw->blendMode = VRHI_SHADER_BLEND_ALPHA;
+		else if (blendMode != VRHI_SHADER_BLEND_OPAQUE)
+			draw->blendMode = blendMode;
+		if (draw->blendMode != VRHI_SHADER_BLEND_OPAQUE) draw->translucent = true;
+	};
+	if (draw->diffuseImage >= 0 && static_cast<size_t>(draw->diffuseImage) < g_worldDiffuseImages.size()) {
+		const VRHI_WorldDiffuseImage &image =
+			g_worldDiffuseImages[static_cast<size_t>(draw->diffuseImage)];
+		applyMaterial(draw->blendMode, image.hasTransparency);
+		return image.texture;
+	}
+	const std::unordered_map<qhandle_t, size_t>::const_iterator uiFound =
+		g_uiTextureByHandle.find(draw->shader);
+	if (uiFound != g_uiTextureByHandle.end() && uiFound->second < g_uiTextures.size()) {
+		const VRHI_UITexture &image = g_uiTextures[uiFound->second];
+		applyMaterial(draw->blendMode, image.hasTransparency);
+		return image.texture;
+	}
+	if (draw->shader == 0 || !g_worldShaderScriptsScanned) return VRHI_INVALID_HANDLE;
+	VRHI_SceneShaderMaterial material;
+	const auto cached = g_sceneShaderDiffuseByHandle.find(draw->shader);
+	if (cached != g_sceneShaderDiffuseByHandle.end()) {
+		material = cached->second;
+	} else {
+		std::string shaderName;
+		for (const auto &entry : g_shaderHandles) {
+			if (entry.second == draw->shader) {
+				shaderName = entry.first;
+				break;
+			}
+		}
+		int images[VRHI_SHADER_MAX_STAGES];
+		uint8_t blends[VRHI_SHADER_MAX_STAGES];
+		int stageCount = 0;
+		if (!shaderName.empty())
+			VRHI_LoadDiffuseStages(shaderName.c_str(), images, blends, &stageCount);
+		if (stageCount > 0) {
+			material.diffuseImage = images[0];
+			material.blendMode = blends[0];
+		}
+		g_sceneShaderDiffuseByHandle.emplace(draw->shader, material);
+		if (material.diffuseImage >= 0) VRHI_UploadWorldDiffuse();
+	}
+	if (material.diffuseImage < 0 ||
+		static_cast<size_t>(material.diffuseImage) >= g_worldDiffuseImages.size())
 		return VRHI_INVALID_HANDLE;
-	return g_uiTextures[found->second].texture;
+	const VRHI_WorldDiffuseImage &image =
+		g_worldDiffuseImages[static_cast<size_t>(material.diffuseImage)];
+	applyMaterial(material.blendMode, image.hasTransparency);
+	return image.texture;
 }
 
 static bool VRHI_AppendSceneQuad(const glm::vec3 corners[4],
@@ -3930,7 +4085,8 @@ static bool VRHI_AppendSceneQuad(const glm::vec3 corners[4],
 	for (int i = 0; i < 4; ++i) g_sceneVertices.push_back(VRHI_SceneVertex(corners[i], uv[i], color));
 	const uint32_t indexes[6] = { 0, 1, 2, 0, 2, 3 };
 	for (uint32_t index : indexes) g_sceneIndexes.push_back(firstVertex + index);
-	return VRHI_AppendSceneDraw(shader, firstIndex, 6);
+	return VRHI_AppendSceneDraw(shader, firstIndex, 6, -1, false,
+		color.a < 0.999f);
 }
 
 static int VRHI_MD3Frame(const VRHI_MD3Model &model, int frame,
@@ -4017,7 +4173,8 @@ static bool VRHI_AppendMD3Model(const refEntity_t &entity, const glm::vec4 &colo
 		if (shader == 0) shader = surface.shader;
 		// Every failure mode of AppendSceneDraw was pre-checked above; roll
 		// back anyway so the surface stays atomic even if it ever changes.
-		if (!VRHI_AppendSceneDraw(shader, firstIndex, indexCount)) {
+		if (!VRHI_AppendSceneDraw(shader, firstIndex, indexCount, -1, false,
+			color.a < 0.999f)) {
 			g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
 			g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
 			continue;
@@ -4085,8 +4242,10 @@ static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4
 			const uint32_t firstIndex = static_cast<uint32_t>(g_sceneIndexes.size());
 			g_sceneVertices.insert(g_sceneVertices.end(), scratchVertices.begin(), scratchVertices.end());
 			for (uint32_t index : scratchIndexes) g_sceneIndexes.push_back(baseVertex + index);
+			const uint8_t blendMode = batch.stageCount > 0
+				? batch.stageBlend[0] : VRHI_SHADER_BLEND_OPAQUE;
 			if (!VRHI_AppendSceneDraw(entity.customShader, firstIndex, scratchIndexes.size(),
-				batch.diffuseImage, lightmapped)) {
+				batch.diffuseImage, lightmapped, color.a < 0.999f, blendMode)) {
 				g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
 				g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
 				continue;
@@ -4109,6 +4268,9 @@ static bool VRHI_BuildSceneGeometry(const refdef_t *fd) {
 	if (fd == nullptr || !VRHI_FiniteVec3(fd->vieworg) ||
 		!VRHI_FiniteVec3(fd->viewaxis[0]) || !VRHI_FiniteVec3(fd->viewaxis[1]) ||
 		!VRHI_FiniteVec3(fd->viewaxis[2])) return false;
+	// Registrations made by the cgame since map load are resolved once here,
+	// before scene texture preparation/draw submission.
+	VRHI_RefreshSceneShaderScripts();
 	const glm::vec3 viewForward(fd->viewaxis[0][0], fd->viewaxis[0][1], fd->viewaxis[0][2]);
 	const glm::vec3 viewRight(fd->viewaxis[1][0], fd->viewaxis[1][1], fd->viewaxis[1][2]);
 	const glm::vec3 viewUp(fd->viewaxis[2][0], fd->viewaxis[2][1], fd->viewaxis[2][2]);
@@ -4181,8 +4343,23 @@ static bool VRHI_BuildSceneGeometry(const refdef_t *fd) {
 			g_sceneIndexes.push_back(firstVertex + i);
 			g_sceneIndexes.push_back(firstVertex + i + 1);
 		}
-		VRHI_AppendSceneDraw(poly.shader, firstIndex, (poly.numVerts - 2) * 3);
+		bool translucent = false;
+		for (uint32_t i = 0; i < poly.numVerts; ++i) {
+			if (g_sceneVertices[firstVertex + i].color.a < 0.999f) {
+				translucent = true;
+				break;
+			}
+		}
+		VRHI_AppendSceneDraw(poly.shader, firstIndex, (poly.numVerts - 2) * 3,
+			-1, false, translucent);
 	}
+	// MD3/skin collection can register new handles while the scene is built.
+	// Refresh once more before texture preparation; the draw loop only reads
+	// cached resources and never touches the filesystem.
+	VRHI_RefreshSceneShaderScripts();
+	// Resolve/upload any newly registered model/effect textures while scene
+	// preparation is still in progress. RenderScene only reads cached handles.
+	for (VRHI_SceneDraw &draw : g_sceneDraws) (void)VRHI_SceneTexture(&draw);
 	return !g_sceneIndexes.empty();
 }
 
@@ -4467,11 +4644,42 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 	if (!g_sceneLights.empty() && g_worldVertexBuffer != VRHI_INVALID_HANDLE) {
 		VRHI_UpdateWorldVertexLighting();
 	}
-	bool submitted = false;
+	std::vector<size_t> opaqueBatches;
+	std::vector<size_t> translucentBatches;
+	opaqueBatches.reserve(g_worldBatches.size());
+	translucentBatches.reserve(g_worldBatches.size());
 	for (size_t batchIndex = 0; batchIndex < g_worldBatches.size(); ++batchIndex) {
 		const VRHI_WorldBatch &batch = g_worldBatches[batchIndex];
-		if (batch.indexCount == 0) continue;
-		if (cullActive && g_worldBatchMarked[batchIndex] != g_worldVisEpoch) continue;
+		if (batch.indexCount == 0 ||
+			(cullActive && (batchIndex >= g_worldBatchMarked.size() ||
+				g_worldBatchMarked[batchIndex] != g_worldVisEpoch))) continue;
+		(batch.translucent ? translucentBatches : opaqueBatches).push_back(batchIndex);
+	}
+	const auto batchDistanceSquared = [&](size_t batchIndex) {
+		const VRHI_WorldBatch &batch = g_worldBatches[batchIndex];
+		glm::vec3 center(0.0f);
+		size_t count = 0;
+		if (batch.firstIndex <= g_worldIndexes.size() &&
+			batch.indexCount <= g_worldIndexes.size() - batch.firstIndex) {
+			for (size_t i = 0; i < batch.indexCount; ++i) {
+				const uint32_t vertexIndex = g_worldIndexes[batch.firstIndex + i];
+				if (vertexIndex >= g_worldVertices.size()) continue;
+				center += g_worldVertices[vertexIndex].position;
+				++count;
+			}
+		}
+		if (count == 0) return 0.0f;
+		center /= static_cast<float>(count);
+		const glm::vec3 delta = center - vieworg;
+		return glm::dot(delta, delta);
+	};
+	std::stable_sort(translucentBatches.begin(), translucentBatches.end(),
+		[&](size_t left, size_t right) {
+			return batchDistanceSquared(left) > batchDistanceSquared(right);
+		});
+	bool submitted = false;
+	const auto drawWorldBatch = [&](size_t batchIndex) {
+		const VRHI_WorldBatch &batch = g_worldBatches[batchIndex];
 		const int declaredCount = batch.stageCount > VRHI_SHADER_MAX_STAGES ? 0 : batch.stageCount;
 		const bool baseImageValid = declaredCount > 0 && batch.stageImages[0] >= 0 &&
 			static_cast<size_t>(batch.stageImages[0]) < g_worldDiffuseImages.size() &&
@@ -4489,20 +4697,25 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 			if (materialStage && !textured) break;
 			if (!materialStage && count > 0) continue;
 			const bool overlay = materialStage && stage > 0;
+			const bool blended = materialStage &&
+				batch.stageBlend[stage] != VRHI_SHADER_BLEND_OPAQUE;
 			const bool useDiffuse = textured && g_worldDiffusePixelShader != VRHI_INVALID_HANDLE;
 			if (overlay && g_worldOverlayPixelShader == VRHI_INVALID_HANDLE) continue;
 			g_worldState = worldBaseState;
-			if (overlay) {
+			if (overlay || blended) {
 				const uint64_t blend = batch.stageBlend[stage] == VRHI_SHADER_BLEND_ADDITIVE
-					? VRHI_STATE_BLEND_ADD : VRHI_STATE_BLEND_ALPHA;
-				// Overlay stages redraw the batch's own triangles, so their depth
-				// equals the base pass depth just written for the same geometry.
-				// A strict LESS test would discard every overlay fragment; LEQUAL
-				// keeps same-surface overlays visible while nearer geometry still
-				// occludes them. Depth writes stay off for the overlay pass.
-				g_worldState.SetProgram(g_worldOverlayProgram)
+					? VRHI_STATE_BLEND_ADD
+					: batch.stageBlend[stage] == VRHI_SHADER_BLEND_FILTER
+						? VRHI_STATE_BLEND_FUNC(VRHI_STATE_BLEND_DST_COLOUR, VRHI_STATE_BLEND_ZERO)
+						: VRHI_STATE_BLEND_ALPHA;
+				// Translucent base stages are rendered after opaque geometry in
+				// back-to-front order. They test depth but never write it. Overlay
+				// stages redraw the same surface, so LEQUAL keeps them visible.
+				g_worldState.SetProgram(overlay ? g_worldOverlayProgram :
+					(useDiffuse ? g_worldDiffuseProgram : g_worldSolidProgram))
 					.SetStateFlags(VRHI_STATE_WRITE_RGB | VRHI_STATE_WRITE_A |
-						VRHI_STATE_DEPTH_TEST_ENABLE | VRHI_STATE_DEPTH_TEST_LEQUAL |
+						VRHI_STATE_DEPTH_TEST_ENABLE |
+						(overlay ? VRHI_STATE_DEPTH_TEST_LEQUAL : VRHI_STATE_DEPTH_TEST_LESS) |
 						VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES | blend);
 			} else {
 				g_worldState.SetProgram(useDiffuse ? g_worldDiffuseProgram :
@@ -4530,24 +4743,63 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 				"renderer_vrhi: world material stage state failed (first=%u stage=%d)\n",
 				batch.firstIndex, stage);
 		}
-	}
+	};
+	for (size_t batchIndex : opaqueBatches) drawWorldBatch(batchIndex);
+	for (size_t batchIndex : translucentBatches) drawWorldBatch(batchIndex);
 	if (VRHI_BuildSceneGeometry(fd) && VRHI_EnsureSceneBuffers()) {
 		VRHI_Printf(PRINT_DEVELOPER,
 			"renderer_vrhi: scene submissions: entities=%zu polys=%zu modelDraws=%zu draws=%zu vertices=%zu indexes=%zu lights=%zu\n",
 			g_sceneEntities.size(), g_scenePolys.size(), g_sceneModelDraws, g_sceneDraws.size(),
 			g_sceneVertices.size(), g_sceneIndexes.size(), g_sceneLights.size());
-		for (const VRHI_SceneDraw &draw : g_sceneDraws) {
-			const vhTexture texture = VRHI_SceneTexture(draw);
+		std::vector<size_t> opaqueSceneDraws;
+		std::vector<size_t> translucentSceneDraws;
+		opaqueSceneDraws.reserve(g_sceneDraws.size());
+		translucentSceneDraws.reserve(g_sceneDraws.size());
+		for (size_t drawIndex = 0; drawIndex < g_sceneDraws.size(); ++drawIndex)
+			(g_sceneDraws[drawIndex].translucent ? translucentSceneDraws : opaqueSceneDraws)
+				.push_back(drawIndex);
+		const auto sceneDrawDistanceSquared = [&](size_t drawIndex) {
+			const VRHI_SceneDraw &draw = g_sceneDraws[drawIndex];
+			glm::vec3 center(0.0f);
+			size_t count = 0;
+			if (draw.firstIndex <= g_sceneIndexes.size() &&
+				draw.indexCount <= g_sceneIndexes.size() - draw.firstIndex) {
+				for (size_t i = 0; i < draw.indexCount; ++i) {
+					const uint32_t vertexIndex = g_sceneIndexes[draw.firstIndex + i];
+					if (vertexIndex >= g_sceneVertices.size()) continue;
+					center += g_sceneVertices[vertexIndex].position;
+					++count;
+				}
+			}
+			if (count == 0) return 0.0f;
+			center /= static_cast<float>(count);
+			const glm::vec3 delta = center - vieworg;
+			return glm::dot(delta, delta);
+		};
+		std::stable_sort(translucentSceneDraws.begin(), translucentSceneDraws.end(),
+			[&](size_t left, size_t right) {
+				return sceneDrawDistanceSquared(left) > sceneDrawDistanceSquared(right);
+			});
+		const auto drawScene = [&](size_t drawIndex) {
+			VRHI_SceneDraw &draw = g_sceneDraws[drawIndex];
+			const vhTexture texture = VRHI_SceneTexture(&draw);
 			const bool textured = texture != VRHI_INVALID_HANDLE &&
 				g_worldDiffusePixelShader != VRHI_INVALID_HANDLE;
 			const bool lightmapped = draw.lightmapped && g_worldLightmapTexture != VRHI_INVALID_HANDLE &&
 				g_worldLightmapPixelShader != VRHI_INVALID_HANDLE;
 			g_worldState = worldBaseState;
+			const uint64_t sceneBlend = draw.blendMode == VRHI_SHADER_BLEND_ADDITIVE
+				? VRHI_STATE_BLEND_ADD
+				: draw.blendMode == VRHI_SHADER_BLEND_FILTER
+					? VRHI_STATE_BLEND_FUNC(VRHI_STATE_BLEND_DST_COLOUR, VRHI_STATE_BLEND_ZERO)
+					: VRHI_STATE_BLEND_ALPHA;
+			const uint64_t sceneFlags = VRHI_STATE_WRITE_RGB | VRHI_STATE_WRITE_A |
+				VRHI_STATE_DEPTH_TEST_ENABLE | VRHI_STATE_DEPTH_TEST_LESS |
+				VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES |
+				(draw.translucent ? sceneBlend : VRHI_STATE_WRITE_Z);
 			g_worldState.SetProgram(textured ? g_worldDiffuseProgram :
 				(lightmapped ? g_worldLightmapProgram : g_worldSolidProgram))
-				.SetStateFlags(VRHI_STATE_WRITE_RGB | VRHI_STATE_WRITE_A | VRHI_STATE_WRITE_Z |
-					VRHI_STATE_DEPTH_TEST_ENABLE | VRHI_STATE_DEPTH_TEST_LESS |
-					VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES | VRHI_STATE_BLEND_ALPHA)
+				.SetStateFlags(sceneFlags)
 				.SetVertexBuffer(g_sceneVertexBuffer, 0, 0, 0,
 					static_cast<uint32_t>(g_sceneVertices.size()))
 				.SetIndexBuffer(g_sceneIndexBuffer, 0, 0,
@@ -4584,7 +4836,9 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 					"renderer_vrhi: scene draw vhSetState failed (first=%u indexes=%u textured=%s)\n",
 					draw.firstIndex, draw.indexCount, textured ? "yes" : "no");
 			}
-		}
+		};
+		for (size_t drawIndex : opaqueSceneDraws) drawScene(drawIndex);
+		for (size_t drawIndex : translucentSceneDraws) drawScene(drawIndex);
 	}
 	g_worldDrawSubmitted = submitted;
 	// RenderScene is also used for world-less scene frames (menu/model previews),

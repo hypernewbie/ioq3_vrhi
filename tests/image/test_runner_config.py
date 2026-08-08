@@ -15,6 +15,7 @@ from run_image_tests import (  # noqa: E402
     BASE_CVARS,
     Scene,
     apply_frame_classification,
+    apply_vrhi_fallback_gate,
     assess_repeatability,
     build_command,
     is_authoritative_capture,
@@ -265,6 +266,38 @@ class ClassificationPolicyTests(unittest.TestCase):
                     comparison="clear_only",
                     expected_clear_color=bad,
                 )
+
+    def test_vrhi_fallback_gate_rejects_visible_green_placeholder(self) -> None:
+        result: dict[str, object] = {
+            "width": 8,
+            "height": 8,
+            "_normalized_rgb": bytes((61, 107, 56)) * 64,
+        }
+        apply_vrhi_fallback_gate(result, "vrhi")
+        self.assertIn("error", result)
+        self.assertEqual(result["vrhi_solid_fallback_pixels"], 64)
+        self.assertEqual(result["vrhi_solid_fallback_largest_component"], 64)
+
+    def test_vrhi_fallback_gate_allows_isolated_matching_pixels(self) -> None:
+        rgb = bytearray(bytes(VRHI_CLEAR_COLOR_RGB8) * 64)
+        for y in range(8):
+            for x in range(8):
+                if (x + y) % 2 == 0:
+                    pixel = y * 8 + x
+                    rgb[pixel * 3 : pixel * 3 + 3] = bytes((61, 107, 56))
+        result: dict[str, object] = {"width": 8, "height": 8, "_normalized_rgb": bytes(rgb)}
+        apply_vrhi_fallback_gate(result, "vrhi")
+        self.assertNotIn("error", result)
+        self.assertEqual(result["vrhi_solid_fallback_largest_component"], 1)
+
+    def test_vrhi_fallback_gate_ignores_other_renderers(self) -> None:
+        result: dict[str, object] = {
+            "width": 10,
+            "height": 1,
+            "_normalized_rgb": bytes((61, 107, 56)) * 10,
+        }
+        apply_vrhi_fallback_gate(result, "opengl2")
+        self.assertNotIn("error", result)
 
     def test_apply_frame_classification_labels_clear_only(self) -> None:
         scene = Scene(

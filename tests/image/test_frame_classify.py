@@ -12,7 +12,10 @@ from frame_classify import (  # noqa: E402
     CLASS_CONTENT,
     CLASS_UNIFORM_OTHER,
     VRHI_CLEAR_COLOR_RGB8,
+    VRHI_SOLID_FALLBACK_RGB8,
     classify_frame,
+    count_exact_color,
+    largest_exact_color_component,
     classify_tga,
     parse_expected_clear_color,
 )
@@ -92,6 +95,22 @@ class ParseExpectedClearColorTests(unittest.TestCase):
 
 
 class ClassifyFrameTests(unittest.TestCase):
+    def test_counts_renderer_solid_fallback_sentinel(self) -> None:
+        rgb = bytes(VRHI_SOLID_FALLBACK_RGB8) * 3 + bytes((1, 2, 3))
+        self.assertEqual(count_exact_color(rgb, VRHI_SOLID_FALLBACK_RGB8), 3)
+        self.assertEqual(count_exact_color(rgb, (1, 2, 3)), 1)
+
+    def test_largest_exact_color_component_uses_4_connectivity(self) -> None:
+        rgb = bytearray(bytes((0, 0, 0)) * 16)
+        for pixel in (0, 1, 4, 5, 10):
+            rgb[pixel * 3 : pixel * 3 + 3] = bytes(VRHI_SOLID_FALLBACK_RGB8)
+        self.assertEqual(
+            largest_exact_color_component(
+                bytes(rgb), 4, 4, VRHI_SOLID_FALLBACK_RGB8
+            ),
+            4,
+        )
+
     def test_uniform_vrhi_clear_is_clear_only(self) -> None:
         result = classify_frame(
             uniform(8, 8, VRHI_CLEAR_COLOR_RGB8), width=8, height=8

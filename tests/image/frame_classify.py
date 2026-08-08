@@ -49,6 +49,54 @@ CLASSES = (CLASS_CLEAR_ONLY, CLASS_UNIFORM_OTHER, CLASS_CONTENT)
 # normalized to RGB8 this is (9, 14, 22).
 VRHI_CLEAR_COLOR_RGB8 = (9, 14, 22)
 
+# VRHI_WorldSolidPixelSource returns float4(0.24, 0.42, 0.22, 1.0),
+# which is captured as this exact RGB8 color on the current backbuffer. It is
+# a renderer-owned placeholder, not acceptable material output.
+VRHI_SOLID_FALLBACK_RGB8 = (61, 107, 56)
+
+
+def count_exact_color(rgb: bytes, color: tuple[int, int, int]) -> int:
+    """Count exact RGB8 pixels without image-library dependencies."""
+    if len(rgb) % 3:
+        raise ValueError(f"frame byte count {len(rgb)} is not a multiple of 3")
+    target = bytes(color)
+    return sum(rgb[offset : offset + 3] == target for offset in range(0, len(rgb), 3))
+
+
+def largest_exact_color_component(
+    rgb: bytes, width: int, height: int, color: tuple[int, int, int]
+) -> int:
+    """Return the largest 4-connected exact-RGB8 component in a frame."""
+    if width <= 0 or height <= 0 or len(rgb) != width * height * 3:
+        raise ValueError("RGB8 bytes do not match positive frame dimensions")
+    target = bytes(color)
+    visited = bytearray(width * height)
+    largest = 0
+    for start in range(width * height):
+        if visited[start] or rgb[start * 3 : start * 3 + 3] != target:
+            continue
+        visited[start] = 1
+        pending = [start]
+        component = 0
+        while pending:
+            index = pending.pop()
+            component += 1
+            x = index % width
+            for neighbor in (
+                index - width if index >= width else -1,
+                index + width if index < width * (height - 1) else -1,
+                index - 1 if x else -1,
+                index + 1 if x + 1 < width else -1,
+            ):
+                if neighbor < 0 or visited[neighbor]:
+                    continue
+                if rgb[neighbor * 3 : neighbor * 3 + 3] != target:
+                    continue
+                visited[neighbor] = 1
+                pending.append(neighbor)
+        largest = max(largest, component)
+    return largest
+
 # Noise envelope: pixels closer than this (per channel) to the dominant color
 # are considered part of the clear; larger deviations count as drawn content.
 DEFAULT_MAX_CHANNEL_SPREAD = 3
