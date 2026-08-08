@@ -23,6 +23,9 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "client.h"
 
+// VRHI: errno/limits are included only for the bounded opt-in benchmark
+// env-var parsing (SCR_BenchEnvInt) added for renderer frame-phase timing;
+// they are not used by any vanilla SCR_UpdateScreen path.
 #include <errno.h>
 #include <limits.h>
 
@@ -35,6 +38,16 @@ cvar_t		*cl_graphscale;
 cvar_t		*cl_graphshift;
 
 // ======================================================================
+// VRHI: this is the ONE vanilla engine source modification in the VRHI
+// integration. Frame-phase timing (producer = SCR_UpdateScreen entry to
+// just before re.EndFrame; finalize = re.EndFrame duration) cannot be
+// measured from the dlopen'd renderer plugin, so a bounded, environment-
+// gated instrumentation lives here. It is a complete runtime no-op unless
+// IOQ3_BENCH_JSONL is set (one getenv at first frame, then early returns).
+// See tests/benchmark/. If this instrumentation is unwanted, removing the
+// SCR_Bench* block and the four call sites in SCR_UpdateScreen restores
+// fully vanilla cl_scrn.c.
+//
 // Optional JSONL benchmark instrumentation (opt-in, see tests/benchmark/).
 //
 // IOQ3_BENCH_JSONL=1 enables it; IOQ3_BENCH_WARMUP and IOQ3_BENCH_SAMPLES
@@ -792,6 +805,9 @@ void SCR_UpdateScreen( void ) {
 	}
 	recursive = 1;
 
+	// VRHI: the four SCR_Bench*() hooks below are no-ops unless
+	// IOQ3_BENCH_JSONL is set; they bracket producer/finalize timing for the
+	// opt-in benchmark harness (see tests/benchmark/).
 	SCR_BenchFrameBegin();
 
 	// If there is no VM, there are also no rendering commands issued. Stop the renderer in
