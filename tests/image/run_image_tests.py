@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Run isolated, hidden-window OpenArena image smoke tests.
 
-The first test intentionally uses ioquake3's stock screenshot command. It
-proves asset provisioning, renderer startup, demo playback, screenshot output,
-and teardown. The screenshot is not yet an authoritative final-present image;
-that capture path will be added before backend parity is gated.
+The current capture uses ioquake3's stock screenshot command. It proves asset
+provisioning, renderer startup, demo playback, screenshot output, and teardown.
+It is not yet an authoritative final-present capture; that capture path will be
+added before backend parity is gated.
 """
 
 from __future__ import annotations
@@ -12,10 +12,11 @@ from __future__ import annotations
 import argparse
 import ctypes
 from ctypes import wintypes
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
-import shutil
+import re
 import subprocess
 import sys
 import time
@@ -23,15 +24,127 @@ import time
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parents[1]
 ASSET_ROOT = ROOT / "temp" / "assets" / "openarena-0.8.8"
+DEFAULT_MANIFEST = SCRIPT_DIR / "scenes.json"
 DEFAULT_RUN_ROOT = ROOT / "temp" / "image-tests"
-DEFAULT_DEMO = "demo088-test1"
 DEFAULT_TIMEOUT = 90.0
 
-# Keep the smoke test deliberately conservative. It is run against OpenArena's
-# pinned test demo and only checks the stock screenshot path for now.
-SCREENSHOT_NAME = "smoke"
-SCREENSHOT_RELATIVE = Path("baseoa") / "screenshots" / f"{SCREENSHOT_NAME}.tga"
-ACTIVE_ACTION = "wait ; wait ; wait ; wait ; wait ; wait ; wait ; wait ; screenshot smoke ; quit"
+SCREENSHOT_RELATIVE = Path("baseoa") / "screenshots"
+SAFE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+ACTIVE_ACTION_TEMPLATE = "{waits}; screenshot {screenshot}; quit"
+
+# These are deliberately explicit in every test process. In particular, do
+# not rely on a user's q3config.cfg for memory, audio, window, or timing state.
+BASE_CVARS: dict[str, str] = {
+    "s_initsound": "0",
+    "s_volume": "0",
+    "s_muteWhenUnfocused": "1",
+    "sv_cheats": "1",
+    "com_hunkMegs": "512",
+    "com_zoneMegs": "64",
+    "com_maxfps": "0",
+    "fixedtime": "50",
+    "timescale": "1",
+    "cl_timeNudge": "0",
+    "logfile": "2",
+    "r_fullscreen": "0",
+    "r_mode": "3",
+    "r_swapInterval": "0",
+    "r_ignorehwgamma": "1",
+    "r_ext_multisample": "0",
+    "r_picmip": "0",
+    "cg_draw2D": "0",
+    "cg_drawGun": "0",
+    "cg_drawCrosshair": "0",
+    "cg_brassTime": "0",
+    "cg_marks": "0",
+    "cg_gibs": "0",
+    "timedemo": "1",
+}
+
+
+@dataclass(frozen=True)
+class Scene:
+    name: str
+    source: str
+    target: str
+    screenshot: str
+    description: str = ""
+    tier: str = "extended"
+    comparison: str = "exact"
+    waits: int = 8
+    viewpos: str | None = None
+    cvars: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for label, value in (("scene", self.name), ("screenshot", self.screenshot)):
+            if not SAFE_NAME.fullmatch(value):
+                raise ValueError(f"unsafe {label} name: {value!r}")
+        if self.source not in {"demo", "map", "devmap"}:
+            raise ValueError(f"unsupported scene source: {self.source!r}")
+        if self.comparison not in {"exact", "tolerant", "capture"}:
+            raise ValueError(f"unsupported comparison policy: {self.comparison!r}")
+        if not self.target or "/" in self.target or "\\" in self.target:
+            raise ValueError(f"unsafe {self.source} target: {self.target!r}")
+        if self.waits < 0 or self.waits > 1000:
+            raise ValueError(f"invalid wait count for {self.name}: {self.waits}")
+        if self.viewpos is not None:
+            values = self.viewpos.split()
+            if len(values) != 4:
+                raise ValueError(f"viewpos must have x y z yaw: {self.viewpos!r}")
+            try:
+                [float(value) for value in values]
+            except ValueError as error:
+                raise ValueError(f"invalid viewpos: {self.viewpos!r}") from error
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "source": self.source,
+            "target": self.target,
+            "screenshot": self.screenshot,
+            "description": self.description,
+            "tier": self.tier,
+            "comparison": self.comparison,
+            "waits": self.waits,
+            "viewpos": self.viewpos,
+            "cvars": self.cvars,
+        }
+
+
+def load_scenes(path: Path = DEFAULT_MANIFEST) -> list[Scene]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema") != 1:
+        raise ValueError(f"unsupported scene manifest schema in {path}")
+
+    scenes = []
+    names: set[str] = set()
+    for item in payload.get("scenes", []):
+        source = str(item.get("source", "demo"))
+        target_key = "demo" if source == "demo" else "map"
+        if target_key not in item:
+            raise ValueError(f"scene {item.get('name', '<unnamed>')} lacks {target_key}")
+        scene = Scene(
+            name=str(item["name"]),
+            source=source,
+            target=str(item[target_key]),
+            screenshot=str(item.get("screenshot", item["name"])),
+            description=str(item.get("description", "")),
+            tier=str(item.get("tier", "extended")),
+            comparison=str(
+                item.get("comparison", "capture" if source == "map" else "exact")
+            ),
+            waits=int(item.get("waits", 8)),
+            viewpos=(str(item["viewpos"]) if item.get("viewpos") is not None else None),
+            cvars={str(key): str(value) for key, value in item.get("cvars", {}).items()},
+        )
+        if scene.name in names:
+            raise ValueError(f"duplicate scene name in {path}: {scene.name}")
+        names.add(scene.name)
+        scenes.append(scene)
+
+    if not scenes:
+        raise ValueError(f"scene manifest has no scenes: {path}")
+    return scenes
 
 
 def _windows_process_flags() -> tuple[int, object | None]:
@@ -127,8 +240,8 @@ def provision_assets() -> None:
         raise RuntimeError(f"asset provisioning failed with exit code {result.returncode}")
 
 
-def build_command(engine: Path, home: Path, renderer: str, demo: str) -> list[str]:
-    return [
+def build_command(engine: Path, home: Path, renderer: str, scene: Scene) -> list[str]:
+    command = [
         str(engine),
         "+set",
         "fs_basepath",
@@ -142,51 +255,33 @@ def build_command(engine: Path, home: Path, renderer: str, demo: str) -> list[st
         "+set",
         "cl_renderer",
         renderer,
-        # Never initialize or output audio during an automated test.
-        "+set",
-        "s_initsound",
-        "0",
-        "+set",
-        "s_volume",
-        "0",
-        "+set",
-        "s_muteWhenUnfocused",
-        "1",
-        # Leave enough hunk space for the OpenArena VM and demo.
-        "+set",
-        "com_hunkMegs",
-        "512",
-        "+set",
-        "com_zoneMegs",
-        "64",
-        "+set",
-        "logfile",
-        "2",
-        "+set",
-        "r_fullscreen",
-        "0",
-        "+set",
-        "r_mode",
-        "3",
-        "+set",
-        "r_swapInterval",
-        "0",
-        "+set",
-        "timedemo",
-        "1",
-        "+set",
-        "activeAction",
-        ACTIVE_ACTION,
-        "+demo",
-        demo,
     ]
+
+    cvars = dict(BASE_CVARS)
+    cvars.update(scene.cvars)
+    for key, value in cvars.items():
+        command.extend(("+set", key, value))
+
+    actions = []
+    if scene.viewpos is not None:
+        actions.append(f"setviewpos {scene.viewpos}")
+    actions.extend("wait" for _ in range(scene.waits))
+    waits = "; ".join(actions)
+    active_action = ACTIVE_ACTION_TEMPLATE.format(
+        waits=waits,
+        screenshot=scene.screenshot,
+    )
+    command.extend(("+set", "activeAction", active_action))
+    map_command = "devmap" if scene.source == "map" and scene.viewpos else scene.source
+    command.extend((f"+{map_command}", scene.target))
+    return command
 
 
 def run_one(
     engine: Path,
     run_dir: Path,
     renderer: str,
-    demo: str,
+    scene: Scene,
     timeout: float,
     index: int,
 ) -> dict[str, object]:
@@ -195,8 +290,8 @@ def run_one(
     home.mkdir(parents=True, exist_ok=True)
     stdout_path = run_dir / "stdout.log"
     stderr_path = run_dir / "stderr.log"
-    screenshot = home / SCREENSHOT_RELATIVE
-    command = build_command(engine, home, renderer, demo)
+    screenshot = home / SCREENSHOT_RELATIVE / f"{scene.screenshot}.tga"
+    command = build_command(engine, home, renderer, scene)
     flags, startupinfo = _windows_process_flags()
     environment = os.environ.copy()
     environment["SDL_AUDIODRIVER"] = "dummy"
@@ -237,8 +332,9 @@ def run_one(
 
     result: dict[str, object] = {
         "index": index,
+        "scene": scene.name,
+        "scene_definition": scene.as_dict(),
         "renderer": renderer,
-        "demo": demo,
         "command": command,
         "timeout_seconds": timeout,
         "duration_seconds": round(time.monotonic() - started, 3),
@@ -263,7 +359,10 @@ def run_one(
         result["error"] = "engine exited without writing the screenshot"
         return result
 
-    from compare import load_tga_rgb, sha256_bytes
+    try:
+        from compare import load_tga_rgb, sha256_bytes
+    except ImportError:
+        from .compare import load_tga_rgb, sha256_bytes
 
     width, height, normalized = load_tga_rgb(screenshot)
     result.update(
@@ -272,29 +371,92 @@ def run_one(
             "height": height,
             "normalized_rgb_bytes": len(normalized),
             "normalized_rgb_sha256": sha256_bytes(normalized),
+            "_normalized_rgb": normalized,
         }
     )
     return result
+
+
+def select_scenes(
+    scenes: list[Scene], requested: list[str] | None, demo: str | None
+) -> list[Scene]:
+    if demo:
+        return [Scene(name=demo, source="demo", target=demo, screenshot=demo)]
+    if not requested:
+        return scenes
+
+    by_name = {scene.name: scene for scene in scenes}
+    selected = []
+    for name in requested:
+        if name not in by_name:
+            raise ValueError(f"unknown scene {name!r}; use --list-scenes")
+        selected.append(by_name[name])
+    return selected
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", help="path to the compiled ioquake3 executable")
     parser.add_argument("--renderer", default="opengl2")
-    parser.add_argument("--demo", default=DEFAULT_DEMO)
+    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument(
+        "--scene",
+        action="append",
+        help="scene name to run; repeat for a subset (default: all scenes)",
+    )
+    parser.add_argument("--demo", help="run one demo directly, bypassing the manifest")
+    parser.add_argument("--list-scenes", action="store_true")
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     parser.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
     return parser.parse_args()
 
 
+def assess_repeatability(
+    scene: Scene, results: list[dict[str, object]], repeat: int
+) -> tuple[bool, list[dict[str, object]]]:
+    if len(results) != repeat or any("error" in result for result in results):
+        return False, []
+
+    if scene.comparison == "capture":
+        return True, []
+
+    if scene.comparison == "exact":
+        hashes = [result.get("normalized_rgb_sha256") for result in results]
+        return len(set(hashes)) == 1, []
+
+    try:
+        from compare import compare_tolerant
+    except ImportError:
+        from .compare import compare_tolerant
+
+    expected = results[0]["_normalized_rgb"]
+    comparisons = []
+    for result in results[1:]:
+        comparisons.append(compare_tolerant(expected, result["_normalized_rgb"]))
+    return all(comparison["pass"] for comparison in comparisons), comparisons
+
+
+def public_result(result: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in result.items() if key != "_normalized_rgb"}
+
+
 def main() -> int:
     args = parse_args()
+    scenes = load_scenes(args.manifest)
+    if args.list_scenes:
+        for scene in scenes:
+            print(
+                f"{scene.name}\t{scene.source}\t{scene.target}\t"
+                f"{scene.tier}\t{scene.description}"
+            )
+        return 0
     if args.repeat < 1:
         raise ValueError("--repeat must be at least 1")
     if args.timeout <= 0:
         raise ValueError("--timeout must be positive")
 
+    selected = select_scenes(scenes, args.scene, args.demo)
     engine = find_engine(args.engine)
     provision_assets()
     run_root = args.run_root.expanduser().resolve() / (
@@ -302,56 +464,87 @@ def main() -> int:
     )
     run_root.mkdir(parents=True, exist_ok=False)
 
-    results = []
-    for index in range(1, args.repeat + 1):
-        print(f"[image-test] run {index}/{args.repeat}: hidden, muted, timeout={args.timeout:g}s")
-        results.append(
-            run_one(
+    scene_reports: list[dict[str, object]] = []
+    for scene in selected:
+        print(
+            f"[image-test] scene {scene.name} ({scene.source} {scene.target}), "
+            f"renderer={args.renderer}, repeat={args.repeat}"
+        )
+        results: list[dict[str, object]] = []
+        for index in range(1, args.repeat + 1):
+            print(
+                f"[image-test]   run {index}/{args.repeat}: "
+                f"hidden, muted, timeout={args.timeout:g}s"
+            )
+            result = run_one(
                 engine,
-                run_root / f"run-{index}",
+                run_root / scene.name / f"run-{index}",
                 args.renderer,
-                args.demo,
+                scene,
                 args.timeout,
                 index,
             )
-        )
-        result = results[-1]
-        if "error" in result:
-            print(f"[image-test] FAIL: {result['error']}")
-            break
-        print(
-            f"[image-test] capture {result['width']}x{result['height']} "
-            f"sha256={result['normalized_rgb_sha256']}"
-        )
+            results.append(result)
+            if "error" in result:
+                print(f"[image-test]   FAIL: {result['error']}")
+                print(f"[image-test]   logs: {result['stderr']}")
+                break
+            print(
+                f"[image-test]   capture {result['width']}x{result['height']} "
+                f"sha256={result['normalized_rgb_sha256']}"
+            )
 
-    hashes = [result.get("normalized_rgb_sha256") for result in results]
-    repeatable = len(results) == args.repeat and len(set(hashes)) == 1
+        capture_valid = len(results) == args.repeat and all(
+            "error" not in result for result in results
+        )
+        policy_pass, repeatability_metrics = assess_repeatability(
+            scene, results, args.repeat
+        )
+        scene_report = {
+            "scene": scene.as_dict(),
+            "repeat": args.repeat,
+            "repeatability_policy": scene.comparison,
+            "capture_valid": capture_valid,
+            "policy_pass": policy_pass,
+            "repeatable_normalized_rgb": (
+                policy_pass if scene.comparison != "capture" else False
+            ),
+            "repeatability_metrics": repeatability_metrics,
+            "results": [public_result(result) for result in results],
+        }
+        scene_reports.append(scene_report)
+        if policy_pass:
+            print(
+                f"[image-test]   PASS: {scene.name} "
+                f"({scene.comparison} policy)"
+            )
+        else:
+            print(f"[image-test]   FAIL: {scene.name} was not repeatable")
+
     report = {
-        "schema": 1,
-        "test": "stock_screenshot_smoke",
+        "schema": 2,
+        "test": "stock_screenshot_smoke_suite",
         "authoritative_capture": False,
         "engine": str(engine),
         "renderer": args.renderer,
-        "demo": args.demo,
+        "manifest": str(args.manifest.resolve()),
         "repeat": args.repeat,
-        "repeatable_normalized_rgb": repeatable,
         "run_root": str(run_root),
-        "results": results,
+        "scenes": scene_reports,
     }
     report_path = run_root / "report.json"
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(f"[image-test] report: {report_path}")
 
-    passed = (
-        len(results) == args.repeat
-        and all("error" not in result for result in results)
-        and repeatable
+    passed = len(scene_reports) == len(selected) and all(
+        report["policy_pass"] for report in scene_reports
     )
     if not passed:
-        print("[image-test] FAIL: stock screenshot smoke test did not pass")
+        print("[image-test] FAIL: one or more image smoke scenes failed")
         return 1
     print(
-        f"[image-test] PASS: repeated {args.renderer} stock screenshots match exactly"
+        f"[image-test] PASS: {len(scene_reports)} {args.renderer} scenes "
+        "met their repeatability policies"
     )
     return 0
 

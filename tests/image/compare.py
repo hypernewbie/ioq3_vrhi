@@ -68,3 +68,57 @@ def compare_exact(expected: bytes, actual: bytes) -> dict[str, int | bool]:
         "actual_bytes": len(actual),
         "different_bytes": differing,
     }
+
+
+def compare_tolerant(
+    expected: bytes,
+    actual: bytes,
+    *,
+    max_channel_error: int = 8,
+    bad_pixel_threshold: int = 2,
+    max_bad_pixel_ratio: float = 0.40,
+    max_rmse: float = 2.5,
+) -> dict[str, int | float | bool]:
+    """Compare RGB8 images with explicit per-pixel and RMSE gates."""
+    if len(expected) != len(actual) or len(expected) % 3:
+        return {
+            "pass": False,
+            "reason": "size mismatch",
+            "expected_bytes": len(expected),
+            "actual_bytes": len(actual),
+        }
+
+    pixel_errors = []
+    squared_error = 0
+    maximum = 0
+    for offset in range(0, len(expected), 3):
+        error = max(
+            abs(expected[offset + channel] - actual[offset + channel])
+            for channel in range(3)
+        )
+        pixel_errors.append(error)
+        maximum = max(maximum, error)
+        squared_error += sum(
+            (expected[offset + channel] - actual[offset + channel]) ** 2
+            for channel in range(3)
+        )
+
+    pixel_count = len(pixel_errors)
+    bad_pixels = sum(error > bad_pixel_threshold for error in pixel_errors)
+    bad_ratio = bad_pixels / pixel_count if pixel_count else 1.0
+    rmse = (squared_error / len(expected)) ** 0.5 if expected else 0.0
+    passed = (
+        maximum <= max_channel_error
+        and bad_ratio <= max_bad_pixel_ratio
+        and rmse <= max_rmse
+    )
+    return {
+        "pass": passed,
+        "max_channel_error": maximum,
+        "bad_pixel_threshold": bad_pixel_threshold,
+        "bad_pixels": bad_pixels,
+        "bad_pixel_ratio": bad_ratio,
+        "max_bad_pixel_ratio": max_bad_pixel_ratio,
+        "rmse": rmse,
+        "max_rmse": max_rmse,
+    }

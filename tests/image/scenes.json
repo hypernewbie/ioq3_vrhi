@@ -1,0 +1,114 @@
+{
+  "schema": 1,
+  "description": "Pinned OpenArena scenes for hidden stock-screenshot smoke tests.",
+  "scenes": [
+    {
+      "name": "demo088-test1",
+      "source": "demo",
+      "demo": "demo088-test1",
+      "screenshot": "demo088-test1",
+      "tier": "smoke",
+      "description": "OpenArena 0.8.8 test demo (protocol 71)."
+    },
+    {
+      "name": "map-oa-dm1",
+      "source": "map",
+      "map": "oa_dm1",
+      "viewpos": "280 1416 -120 180",
+      "screenshot": "map-oa-dm1",
+      "tier": "extended",
+      "description": "Static world startup on oa_dm1.",
+      "cvars": { "timedemo": "0" }
+    },
+    {
+      "name": "map-oa-dm3",
+      "source": "map",
+      "map": "oa_dm3",
+      "viewpos": "512 896 40 270",
+      "screenshot": "map-oa-dm3",
+      "tier": "extended",
+      "description": "Static world startup on oa_dm3.",
+      "cvars": { "timedemo": "0" }
+    },
+    {
+      "name": "map-aggressor",
+      "source": "map",
+      "map": "aggressor",
+      "viewpos": "-576 192 152 90",
+      "screenshot": "map-aggressor",
+      "tier": "extended",
+      "description": "Static world startup on aggressor.",
+      "cvars": { "timedemo": "0" }
+    },
+    {
+      "name": "map-hydronex",
+      "source": "map",
+      "map": "hydronex",
+      "viewpos": "584 -1912 64 0",
+      "screenshot": "map-hydronex",
+      "tier": "extended",
+      "description": "Static world startup on hydronex.",
+      "cvars": { "timedemo": "0" }
+    },
+    {
+      "name": "map-suspended",
+      "source": "map",
+      "map": "suspended",
+      "viewpos": "952 32 1112 180",
+      "screenshot": "map-suspended",
+      "tier": "extended",
+      "description": "Static world startup on suspended.",
+      "cvars": { "timedemo": "0" }
+    },
+    {
+      "name": "map-oa-bases3",
+      "source": "map",
+      "map": "oa_bases3",
+      "viewpos": "3744 -1408 40 0",
+      "screenshot": "map-oa-bases3",
+      "tier": "extended",
+      "description": "Static world startup on oa_bases3.",
+      "cvars": { "timedemo": "0" }
+    },
+    {
+      "name": "map-ctf-compromise",
+      "source": "map",
+      "map": "ctf_compromise",
+      "viewpos": "-1696 1944 496 135",
+      "screenshot": "map-ctf-compromise",
+      "tier": "extended",
+      "description": "Static world startup on ctf_compromise.",
+      "cvars": { "timedemo": "0" }
+    },
+    {
+      "name": "map-am-lavaarena",
+      "source": "map",
+      "map": "am_lavaarena",
+      "viewpos": "272 1776 -63 -45",
+      "screenshot": "map-am-lavaarena",
+      "tier": "stress",
+      "description": "Static world startup on am_lavaarena.",
+      "cvars": { "timedemo": "0" }
+    },
+    {
+      "name": "map-oasago1",
+      "source": "map",
+      "map": "oasago1",
+      "viewpos": "144 -2256 -168 90",
+      "screenshot": "map-oasago1",
+      "tier": "stress",
+      "description": "Static world startup on oasago1.",
+      "cvars": { "timedemo": "0" }
+    },
+    {
+      "name": "map-oa-thor",
+      "source": "map",
+      "map": "oa_thor",
+      "viewpos": "960 -384 -24 90",
+      "screenshot": "map-oa-thor",
+      "tier": "stress",
+      "description": "Static world startup on oa_thor.",
+      "cvars": { "timedemo": "0" }
+    }
+  ]
+}
