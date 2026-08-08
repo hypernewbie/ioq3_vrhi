@@ -61,6 +61,29 @@ python -m unittest discover tests/image -p "test_*.py"
 python tests/image/classify_fixtures.py
 ```
 
+## Concurrent asset provisioning
+
+`run_image_tests.py` provisions the shared `temp/assets/` tree through
+`tools/get_openarena.py download` before running any scene. That provisioning
+is serialized across processes by a dependency-free lock
+(`tools/asset_lock.py`): two image suites (for example the hidden OpenGL 1 and
+OpenGL 2 suites) that start at the same time no longer race `.part`
+downloads, destination replacement, or the atomic manifest write. The second
+suite waits for the first (printing who holds the lock) for up to
+`--lock-timeout` seconds (default 600), then verifies the already-downloaded
+assets with the pinned Git-blob hashes and rewrites the manifest atomically
+(temp file + rename).
+
+Crashed provisioners leave a lock that is reclaimed automatically: a lock is
+stale only when it is older than a 10 s grace period and its recorded owner
+pid is gone (or its heartbeat stopped); the reclaim uses an atomic rename so
+only one waiter wins. The holder refreshes a heartbeat while downloading, so a
+slow-but-alive download is never reclaimed. Lock state lives entirely under
+the ignored `temp/` tree. `test_asset_lock.py` covers contention, timeout,
+stale-lock reclamation, and heartbeat behavior; `test_asset_provisioning.py`
+covers atomic manifest writes, Git-blob hash verification, and the lock
+integration in the real `download` CLI.
+
 Classify a real capture without any GPU (prints JSON):
 
 ```text

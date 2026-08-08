@@ -48,6 +48,7 @@ ASSET_ROOT = ROOT / "temp" / "assets" / "openarena-0.8.8"
 DEFAULT_MANIFEST = SCRIPT_DIR / "scenes.json"
 DEFAULT_RUN_ROOT = ROOT / "temp" / "image-tests"
 DEFAULT_TIMEOUT = 90.0
+PROVISION_LOCK_TIMEOUT = 600.0
 
 SCREENSHOT_RELATIVE = Path("baseoa") / "screenshots"
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -270,11 +271,29 @@ def find_engine(requested: str | None) -> Path:
     raise FileNotFoundError("ioquake3 executable not found; pass --engine")
 
 
-def provision_assets() -> None:
-    command = [sys.executable, str(ROOT / "tools" / "get_openarena.py"), "download"]
-    result = subprocess.run(command, cwd=ROOT, check=False, timeout=300)
+def provision_assets(lock_timeout: float = PROVISION_LOCK_TIMEOUT) -> None:
+    command = [
+        sys.executable,
+        str(ROOT / "tools" / "get_openarena.py"),
+        "download",
+        "--lock-timeout",
+        str(lock_timeout),
+    ]
+    # The provisioner subprocess itself enforces the lock timeout; give it
+    # headroom for a fresh ~390 MiB download on top of any lock wait.
+    subprocess_timeout = lock_timeout + 300
+    try:
+        result = subprocess.run(
+            command, cwd=ROOT, check=False, timeout=subprocess_timeout
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"asset provisioning timed out after {subprocess_timeout:g}s"
+        ) from error
     if result.returncode != 0:
-        raise RuntimeError(f"asset provisioning failed with exit code {result.returncode}")
+        raise RuntimeError(
+            f"asset provisioning failed with exit code {result.returncode}"
+        )
 
 
 def is_authoritative_capture(renderer: str) -> bool:
@@ -500,6 +519,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--list-scenes", action="store_true")
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    parser.add_argument(
+        "--lock-timeout",
+        type=float,
+        default=PROVISION_LOCK_TIMEOUT,
+        help="seconds to wait for another asset provisioning process before "
+        f"failing (default: {PROVISION_LOCK_TIMEOUT:g})",
+    )
     parser.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
     return parser.parse_args()
 
@@ -562,7 +588,7 @@ def main() -> int:
 
     selected = select_scenes(scenes, args.scene, args.demo)
     engine = find_engine(args.engine)
-    provision_assets()
+    provision_assets(args.lock_timeout)
     run_root = args.run_root.expanduser().resolve() / (
         time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
     )

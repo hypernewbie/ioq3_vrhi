@@ -29,6 +29,15 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ASSET_DIR = ROOT / "temp" / "assets" / "openarena-0.8.8"
 DEFAULT_HOME_DIR = ROOT / "temp" / "openarena-home"
 
+# Make the sibling lock module importable both when this file is run as a
+# script (``python tools/get_openarena.py``) and when it is imported.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from asset_lock import (  # noqa: E402
+    DEFAULT_TIMEOUT as LOCK_DEFAULT_TIMEOUT,
+    LOCK_DIR_NAME,
+    ProvisionLock,
+)
+
 # OpenArena-Ioq3/oa-assets is a mirror of the GPL OpenArena 0.8.8 asset set.
 # Keep the commit and Git blob hashes pinned. The hash is verified as a Git
 # blob hash (SHA-1 over "blob <size>\\0<bytes>") in addition to SHA-256 being
@@ -73,7 +82,9 @@ def valid_asset(path: Path, expected_size: int, expected_git_sha1: str) -> bool:
     )
 
 
-def download_file(url: str, destination: Path, expected_size: int) -> None:
+def download_file(
+    url: str, destination: Path, expected_size: int, heartbeat=None
+) -> None:
     partial = destination.with_suffix(destination.suffix + ".part")
     if partial.exists():
         partial.unlink()
@@ -106,6 +117,8 @@ def download_file(url: str, destination: Path, expected_size: int) -> None:
                                 f"{expected_size / 1048576:.1f} MiB",
                                 flush=True,
                             )
+                            if heartbeat is not None:
+                                heartbeat()
                             last_report = now
                 if read != expected_size:
                     raise RuntimeError(
@@ -122,12 +135,66 @@ def download_file(url: str, destination: Path, expected_size: int) -> None:
             time.sleep(attempt * 2)
 
 
-def ensure_assets(asset_dir: Path) -> Path:
+def write_asset_manifest(
+    asset_dir: Path, files: list[tuple[str, int, str]]
+) -> Path:
+    """Atomically write the asset manifest (temp file + atomic rename).
+
+    The manifest is written only after every asset has been verified, and the
+    rename is atomic on Windows and POSIX, so a concurrent reader never
+    observes a partially written manifest. SHA-256 of every verified asset is
+    recorded for later integrity checks.
+    """
+    baseoa = asset_dir / "baseoa"
+    manifest = {
+        "schema": 1,
+        "repository": ASSET_REPOSITORY,
+        "commit": ASSET_COMMIT,
+        "asset_directory": str(baseoa),
+        "files": [
+            {
+                "name": filename,
+                "size": expected_size,
+                "git_blob_sha1": expected_git_sha1,
+                "sha256": sha256(baseoa / filename),
+            }
+            for filename, expected_size, expected_git_sha1 in files
+        ],
+    }
+    manifest_path = asset_dir / "manifest.json"
+    temporary_manifest = manifest_path.with_suffix(".json.tmp")
+    temporary_manifest.write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    )
+    temporary_manifest.replace(manifest_path)
+    return manifest_path
+
+
+def ensure_assets(
+    asset_dir: Path, lock_timeout: float = LOCK_DEFAULT_TIMEOUT
+) -> Path:
+    """Verify/download the pinned assets, serialized across processes.
+
+    The whole download/verify/manifest cycle runs under a cross-process lock
+    (``tools/asset_lock.py``) so concurrent image suites (for example the
+    hidden OpenGL 1 and OpenGL 2 suites) never race ``.part`` downloads,
+    destination replacement, or the atomic manifest write. A stuck holder
+    fails after ``lock_timeout`` seconds instead of hanging the caller.
+    """
+    asset_dir = asset_dir.expanduser().resolve()
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    lock_dir = asset_dir / LOCK_DIR_NAME
+    with ProvisionLock(lock_dir, timeout=lock_timeout) as lock:
+        return _ensure_assets_locked(asset_dir, lock)
+
+
+def _ensure_assets_locked(asset_dir: Path, lock: ProvisionLock) -> Path:
     baseoa = asset_dir / "baseoa"
     baseoa.mkdir(parents=True, exist_ok=True)
     print(f"[OpenArena] Asset directory: {baseoa}")
 
     for filename, expected_size, expected_git_sha1 in ASSETS:
+        lock.refresh()
         destination = baseoa / filename
         if valid_asset(destination, expected_size, expected_git_sha1):
             print(f"  verified {filename}")
@@ -141,7 +208,7 @@ def ensure_assets(asset_dir: Path) -> Path:
             f"{ASSET_COMMIT}/baseoa/{filename}"
         )
         print(f"  downloading {filename} ({expected_size / 1048576:.1f} MiB)")
-        download_file(url, destination, expected_size)
+        download_file(url, destination, expected_size, heartbeat=lock.refresh)
         actual = git_blob_sha1(destination, expected_size)
         if actual != expected_git_sha1:
             destination.unlink(missing_ok=True)
@@ -156,25 +223,9 @@ def ensure_assets(asset_dir: Path) -> Path:
                 raise RuntimeError(f"corrupt PK3 {filename}, first bad entry: {bad_member}")
         print(f"    verified {filename}")
 
-    manifest = {
-        "schema": 1,
-        "repository": ASSET_REPOSITORY,
-        "commit": ASSET_COMMIT,
-        "asset_directory": str(baseoa),
-        "files": [
-            {
-                "name": filename,
-                "size": expected_size,
-                "git_blob_sha1": expected_git_sha1,
-                "sha256": sha256(baseoa / filename),
-            }
-            for filename, expected_size, expected_git_sha1 in ASSETS
-        ],
-    }
-    manifest_path = asset_dir / "manifest.json"
-    temporary_manifest = manifest_path.with_suffix(".json.tmp")
-    temporary_manifest.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    temporary_manifest.replace(manifest_path)
+    lock.refresh()
+    manifest_path = write_asset_manifest(asset_dir, list(ASSETS))
+    print(f"[OpenArena] Manifest: {manifest_path}")
     print(f"[OpenArena] Assets ready: {baseoa}")
     return asset_dir
 
@@ -207,7 +258,9 @@ def find_engine(requested: str | None) -> Path:
 
 
 def run_engine(args: argparse.Namespace, extra_args: list[str]) -> int:
-    asset_dir = ensure_assets(args.asset_dir.expanduser().resolve())
+    asset_dir = ensure_assets(
+        args.asset_dir.expanduser().resolve(), lock_timeout=args.lock_timeout
+    )
     engine = find_engine(args.engine)
     home_dir = args.home_dir.expanduser().resolve()
     home_dir.mkdir(parents=True, exist_ok=True)
@@ -244,6 +297,13 @@ def parse_args() -> argparse.Namespace:
             default=DEFAULT_ASSET_DIR,
             help=f"asset root containing baseoa (default: {DEFAULT_ASSET_DIR})",
         )
+        subparser.add_argument(
+            "--lock-timeout",
+            type=float,
+            default=LOCK_DEFAULT_TIMEOUT,
+            help="seconds to wait for another provisioning process before "
+            f"failing (default: {LOCK_DEFAULT_TIMEOUT:g})",
+        )
 
     run_parser = subparsers.choices["run"]
     run_parser.add_argument("--engine", help="path to ioquake3 executable")
@@ -260,7 +320,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if args.command in (None, "download"):
-        ensure_assets(args.asset_dir)
+        ensure_assets(
+            getattr(args, "asset_dir", DEFAULT_ASSET_DIR),
+            lock_timeout=getattr(args, "lock_timeout", LOCK_DEFAULT_TIMEOUT),
+        )
         return 0
 
     extra_args = args.engine_args
