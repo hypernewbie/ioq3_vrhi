@@ -462,6 +462,58 @@ void testPathSafetyHelpers() {
 	CHECK(!VRHI_ResolveDirectImagePath("textures/foo/bar.tgax", &resolved));
 }
 
+void testConsoleScriptResolution() {
+	// OpenArena defines the in-game console background as a script shader
+	// (scripts/oanew.shader): `console { { map textures/sfx/logo256.tga } }`.
+	// The VRHI UI texture path resolves such shader names through the bounded
+	// script-stage table ONLY when the name is on the adapter's closed,
+	// case-insensitive UI allowlist (vrhi_stub.cpp VRHI_IsUIScriptShader,
+	// which contains exactly 'console'); normal world/model registration can
+	// never add names to that list. This test pins the parser side of the
+	// contract: the exact table entry the adapter consumes (one opaque stage
+	// whose path is the logo image) and the case-insensitive name matching
+	// the allowlist relies on. If the parser ever stops accepting this block,
+	// the console background silently falls back to a solid box again.
+	const std::string text =
+		"console\n{\n{\nmap textures/sfx/logo256.tga\n}\n}\n";
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("console", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(text), text.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	const std::unordered_map<std::string, std::vector<VRHI_ShaderStage> >::const_iterator
+		found = results.find("console");
+	CHECK(found != results.end());
+	if (found != results.end()) {
+		const std::vector<VRHI_ShaderStage> &stages = found->second;
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK_EQ_STR(stages[0].path, "textures/sfx/logo256.tga");
+			CHECK_EQ_INT(stages[0].blendMode, VRHI_SHADER_BLEND_OPAQUE);
+			CHECK(VRHI_ShaderPathIsSafe(stages[0].path));
+			// The stage path must be a real image qpath, never a special
+			// texture placeholder like $whiteimage/$lightmap.
+			CHECK(!stages[0].path.empty() && stages[0].path[0] != '$');
+		}
+	}
+	// The allowlist is case-insensitive: a script block written in any case
+	// still resolves under the lowercased 'console' key the adapter uses for
+	// its exact-match lookup.
+	const std::string upperText =
+		"CONSOLE\n{\n{\nmap textures/sfx/logo256.tga\n}\n}\n";
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > upperResults;
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(upperText), upperText.size(),
+		wanted, &upperResults));
+	CHECK_EQ_INT(upperResults.size(), 1u);
+	CHECK(upperResults.find("console") != upperResults.end());
+	// A shader of the same name that stays unresolved must not appear.
+	std::unordered_map<std::string, bool> wantedMissing;
+	wantedMissing.emplace("console2", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > missing;
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(text), text.size(), wantedMissing, &missing));
+	CHECK_EQ_INT(missing.size(), 0u);
+}
+
 } // namespace
 
 int main() {
@@ -477,6 +529,7 @@ int main() {
 	testWantedFilteringAndNames();
 	testBlockLevelBoundaries();
 	testSimpleMultiStageExtraction();
+	testConsoleScriptResolution();
 	testPathSafetyHelpers();
 
 	if (g_failures != 0) {

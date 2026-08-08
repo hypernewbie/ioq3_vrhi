@@ -1,7 +1,9 @@
 // Standalone, dependency-free unit test for the VRHI bounded true-color TGA
 // decoder (code/renderervrhi/vrhi_tga_decode.h). No engine headers, no
-// filesystem, no third-party libraries: the test builds TGA byte streams in
-// memory and asserts decode results.
+// third-party libraries: the test builds TGA byte streams in memory and
+// asserts decode results. Optional argv file arguments decode real TGA files
+// (for example extracted OpenArena assets) under the renderer's UI texture
+// caps.
 //
 // Build and run (any C++11-or-later compiler):
 //   clang++ -std=c++17 -O1 -Wall -Wextra -Werror tests/vrhi_tga_decode_test.cpp -o vrhi_tga_decode_test && ./vrhi_tga_decode_test
@@ -15,6 +17,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
+#include <string>
 #include <vector>
 
 namespace {
@@ -432,13 +437,53 @@ void testRejections() {
 	}
 }
 
+// Optional real-file mode: `vrhi_tga_decode_test <file.tga> [...]` decodes
+// each file under the renderer's UI texture caps (2048x2048, 64 MiB, the
+// caps VRHI_RegisterDirectUITexture applies). This validates that script-
+// resolved UI assets (for example the OpenArena console background
+// textures/sfx/logo256.tga) actually decode under the caps the adapter
+// enforces, without needing the engine.
+static bool readFile(const char *path, std::vector<std::uint8_t> *data) {
+	if (path == nullptr || data == nullptr) return false;
+	std::ifstream stream(path, std::ios::binary);
+	if (!stream) return false;
+	data->assign((std::istreambuf_iterator<char>(stream)),
+		std::istreambuf_iterator<char>());
+	return !stream.bad() && !data->empty();
+}
+
+static void testRealFile(const char *path) {
+	std::vector<std::uint8_t> data;
+	if (!readFile(path, &data)) {
+		++g_failures;
+		std::printf("FAIL %s: cannot read file\n", path);
+		return;
+	}
+	const int uiMaxDimension = 2048; // VRHI_MAX_UI_TEXTURE_DIMENSION
+	const std::size_t uiMaxBytes = 64u * 1024u * 1024u; // VRHI_MAX_UI_TEXTURE_BYTES
+	vrhi_tga::DecodeResult out;
+	if (!decode(data, uiMaxDimension, uiMaxBytes, &out)) {
+		++g_failures;
+		std::printf("FAIL %s: decode failed under UI caps\n", path);
+		return;
+	}
+	CHECK(out.ok && out.width > 0 && out.height > 0);
+	CHECK(out.rgba.size() ==
+		static_cast<std::size_t>(out.width) * out.height * 4);
+	std::printf("OK  %s -> %dx%d rgba=%zu bytes\n", path, out.width,
+		out.height, out.rgba.size());
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
 	testType2();
 	testType10();
 	testEquivalence();
 	testRejections();
+	for (int i = 1; i < argc; ++i) {
+		testRealFile(argv[i]);
+	}
 
 	if (g_failures == 0) {
 		std::printf("PASS: all %d checks passed (vrhi_tga_decode)\n", g_checks);

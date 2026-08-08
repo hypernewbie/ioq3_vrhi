@@ -347,6 +347,7 @@ static bool g_worldLightmapAvailable = false;
 static bool g_worldLoaded = false;
 static bool g_worldShaderInitialized = false;
 static void VRHI_UploadUITextures(void);
+static bool VRHI_RegisterDirectUITexture(qhandle_t handle, const char *name);
 static void VRHI_DestroyCinematicTextures(void);
 static bool VRHI_FiniteVec3(const float *v);
 static bool VRHI_FiniteEntity(const refEntity_t &entity);
@@ -2691,6 +2692,27 @@ static bool VRHI_ResolveShaderScriptFile(const char *fileName,
 	return true;
 }
 
+// Closed, code-grounded allowlist of UI shader names that may resolve through
+// the world shader-script stage table into g_uiTextures. Normal world/model
+// registration (RegisterShader, RegisterShaderNoMip, RegisterModelShader) can
+// never add entries here, so arbitrary material stages can never be uploaded
+// as 2D UI textures. Matching is exact after ASCII lowercasing; empty,
+// overlong, or differently named inputs are rejected.
+static bool VRHI_IsUIScriptShader(const char *name) {
+	if (name == nullptr) return false;
+	size_t length = 0;
+	while (length < MAX_QPATH && name[length] != '\0') ++length;
+	if (length == 0 || length >= MAX_QPATH) return false;
+	// Known OpenArena in-game console background (scripts/oanew.shader):
+	// `console { { map textures/sfx/logo256.tga } }`.
+	static const char *const kUIScriptShaderNames[] = { "console" };
+	const std::string key = VRHI_LowerASCII(std::string(name, length));
+	for (const char *allowed : kUIScriptShaderNames) {
+		if (key == allowed) return true;
+	}
+	return false;
+}
+
 static void VRHI_ScanShaderScripts(const std::vector<std::string> &shaderNames) {
 	g_worldShaderNames = shaderNames;
 	g_worldShaderScriptStages.clear();
@@ -2747,6 +2769,37 @@ static void VRHI_ScanShaderScripts(const std::vector<std::string> &shaderNames) 
 		if (activeFileData != nullptr && g_ri.FS_FreeFile != nullptr) g_ri.FS_FreeFile(activeFileData);
 		if (fileList != nullptr && g_ri.FS_FreeFileList != nullptr) g_ri.FS_FreeFileList(fileList);
 		g_worldShaderScriptStages.clear();
+	}
+
+	// UI shaders registered before this scan (for example the 'console'
+	// background, which SCR_Init registers ahead of the world-load script
+	// scan) already failed their one-shot direct-image probe. Retry only the
+	// closed UI allowlist: a handle may be re-probed only when its name is
+	// exactly an allowlisted UI shader (case-insensitively) AND now resolves
+	// in the script table. Normal world/model registration can never add
+	// names to that allowlist, so arbitrary material stages cannot be
+	// uploaded into g_uiTextures. Handles that already own a UI texture or
+	// that still have no script entry are left untouched; a failed retry
+	// re-marks the handle attempted, so this pass stays a bounded no-op for
+	// names that never gain a table entry.
+	if (!g_worldShaderScriptStages.empty()) {
+		try {
+			for (const auto &entry : g_shaderHandles) {
+				const qhandle_t handle = entry.second;
+				if (handle == 0 ||
+					g_uiTextureByHandle.find(handle) != g_uiTextureByHandle.end() ||
+					!VRHI_IsUIScriptShader(entry.first.c_str()))
+					continue;
+				if (g_worldShaderScriptStages.find(
+						VRHI_LowerASCII(entry.first)) == g_worldShaderScriptStages.end())
+					continue;
+				g_uiTextureAttempts.erase(handle);
+				VRHI_RegisterDirectUITexture(handle, entry.first.c_str());
+			}
+		} catch (...) {
+			// A decode/upload failure must not abort the scan; the affected
+			// handles simply remain on their existing fallback.
+		}
 	}
 }
 
@@ -2953,6 +3006,44 @@ static void VRHI_UploadUITextures(void) {
 	}
 }
 
+// UI shader names that are not direct images (for example the OpenArena
+// in-game console background 'console', which scripts/oanew.shader defines
+// as a single-stage `map textures/sfx/logo256.tga`) resolve through the same
+// bounded script-stage table as world materials, but only for the closed UI
+// allowlist (VRHI_IsUIScriptShader). UI pics draw the base stage only,
+// matching the GL 2D path: take stage zero's direct-image path and decode it
+// under the UI caps. The parser already guarantees that path is a safe,
+// non-special qpath. Returns false when scripts are not scanned yet, the
+// name is not on the allowlist or absent from the table, or the stage image
+// fails to decode, leaving the caller's solid-color fallback in place.
+static bool VRHI_LoadScriptUITexture(const char *name, std::string *path,
+	vrhi_image::DecodeResult *decoded) {
+	if (name == nullptr || path == nullptr || decoded == nullptr ||
+		!g_worldShaderScriptsScanned) return false;
+	// The resolver serves the closed UI allowlist only. Every other name
+	// that reaches this fallback (world/model materials included) keeps its
+	// solid-color fallback, so script-stage art can never leak into
+	// g_uiTextures through normal registration.
+	if (!VRHI_IsUIScriptShader(name)) return false;
+	size_t length = 0;
+	while (length < MAX_QPATH && name[length] != '\0') ++length;
+	if (length == 0 || length >= MAX_QPATH) return false;
+	const std::string key = VRHI_LowerASCII(std::string(name, length));
+	const auto found = g_worldShaderScriptStages.find(key);
+	if (found == g_worldShaderScriptStages.end() || found->second.empty()) {
+		return false;
+	}
+	const VRHI_ShaderStage &stage = found->second[0];
+	if (stage.path.empty()) return false;
+	std::string stagePath;
+	vrhi_image::DecodeResult stageDecoded;
+	if (!VRHI_DecodeDirectImage(stage.path.c_str(), VRHI_MAX_UI_TEXTURE_DIMENSION,
+		VRHI_MAX_UI_TEXTURE_BYTES, &stagePath, &stageDecoded)) return false;
+	*path = std::move(stagePath);
+	*decoded = std::move(stageDecoded);
+	return true;
+}
+
 static bool VRHI_RegisterDirectUITexture(qhandle_t handle, const char *name) {
 	if (handle == 0 || g_uiTextureAttempts.find(handle) != g_uiTextureAttempts.end()) return false;
 	g_uiTextureAttempts.emplace(handle, true);
@@ -2965,10 +3056,14 @@ static bool VRHI_RegisterDirectUITexture(qhandle_t handle, const char *name) {
 	vrhi_image::DecodeResult decoded;
 	if (!VRHI_DecodeDirectImage(name, VRHI_MAX_UI_TEXTURE_DIMENSION,
 		VRHI_MAX_UI_TEXTURE_BYTES, &path, &decoded)) {
-		VRHI_Printf(PRINT_DEVELOPER,
-			"renderer_vrhi: UI shader '%s' uses solid-color fallback (only bounded TGA/JPG/PNG images are supported)\n",
-			name != nullptr ? name : "(null)");
-		return false;
+		// Shader-script UI names are not direct images; resolve their base
+		// stage through the bounded script table before falling back.
+		if (!VRHI_LoadScriptUITexture(name, &path, &decoded)) {
+			VRHI_Printf(PRINT_DEVELOPER,
+				"renderer_vrhi: UI shader '%s' uses solid-color fallback (only bounded TGA/JPG/PNG images or script base stages are supported)\n",
+				name != nullptr ? name : "(null)");
+			return false;
+		}
 	}
 	size_t existingBytes = 0;
 	for (const VRHI_UITexture &image : g_uiTextures) existingBytes += image.pixels.size();
