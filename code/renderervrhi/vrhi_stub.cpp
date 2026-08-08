@@ -583,7 +583,7 @@ static void VRHI_FillConfig(glconfig_t *config) {
 }
 
 static const char *VRHI_WorldVertexSource = R"(
-struct GlobalUniforms : register(b0, VRHI_STAGE_SPACE)
+cbuffer GlobalUniforms : register(b0, VRHI_STAGE_SPACE)
 {
     float4 u_viewRect;
     float4 u_viewTexel;
@@ -596,7 +596,7 @@ struct GlobalUniforms : register(b0, VRHI_STAGE_SPACE)
     float4 u_alphaRef4;
     float4 u_global[21];
 };
-struct WorldUniforms : register(b1, VRHI_STAGE_SPACE)
+cbuffer WorldUniforms : register(b1, VRHI_STAGE_SPACE)
 {
     float4x4 u_world[4];
     float4x4 u_worldView;
