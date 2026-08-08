@@ -4190,7 +4190,7 @@ static void VRHI_DrawStretchRaw(int x, int y, int w, int h, int cols,
 	// the slot has no usable texture or its dimensions no longer match the
 	// current frame, (re)upload from this frame's data first.
 	if (slot.texture == VRHI_INVALID_HANDLE || !slot.uploaded ||
-		slot.width != cols || slot.height != rows) {
+		slot.width != cols || slot.height != rows || dirty) {
 		if (data == nullptr) {
 			return;
 		}
