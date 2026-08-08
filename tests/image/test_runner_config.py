@@ -6,9 +6,15 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from frame_classify import (  # noqa: E402
+    CLASS_CLEAR_ONLY,
+    CLASS_CONTENT,
+    VRHI_CLEAR_COLOR_RGB8,
+)
 from run_image_tests import (  # noqa: E402
     BASE_CVARS,
     Scene,
+    apply_frame_classification,
     assess_repeatability,
     build_command,
     is_authoritative_capture,
@@ -16,6 +22,44 @@ from run_image_tests import (  # noqa: E402
     public_result,
     select_scenes,
 )
+
+
+def uniform_frame(
+    width: int, height: int, color: tuple[int, int, int] = VRHI_CLEAR_COLOR_RGB8
+) -> bytes:
+    return bytes(color) * (width * height)
+
+
+def rect_frame(
+    width: int,
+    height: int,
+    background: tuple[int, int, int],
+    color: tuple[int, int, int],
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+) -> bytes:
+    pixels = bytearray(width * height * 3)
+    for offset in range(0, len(pixels), 3):
+        pixels[offset : offset + 3] = bytes(background)
+    for y in range(y0, min(y1, height)):
+        for x in range(x0, min(x1, width)):
+            offset = (y * width + x) * 3
+            pixels[offset : offset + 3] = bytes(color)
+    return bytes(pixels)
+
+
+def classified_result(
+    rgb: bytes, width: int, height: int, scene: Scene
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "width": width,
+        "height": height,
+        "_normalized_rgb": rgb,
+    }
+    apply_frame_classification(result, scene)
+    return result
 
 
 class RunnerConfigTests(unittest.TestCase):
@@ -173,6 +217,183 @@ class RunnerConfigTests(unittest.TestCase):
         demo_scenes = [scene for scene in scenes if scene.source == "demo"]
         self.assertTrue(demo_scenes)
         self.assertTrue(all(scene.comparison == "exact" for scene in demo_scenes))
+
+
+class ClassificationPolicyTests(unittest.TestCase):
+    def test_content_and_clear_only_policies_are_valid(self) -> None:
+        Scene(
+            name="unit-content",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-content",
+            comparison="content",
+        )
+        Scene(
+            name="unit-clear",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-clear",
+            comparison="clear_only",
+        )
+
+    def test_unknown_policy_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            Scene(
+                name="unit-bogus",
+                source="map",
+                target="oa_dm1",
+                screenshot="unit-bogus",
+                comparison="sparkly",
+            )
+
+    def test_expected_clear_color_is_validated(self) -> None:
+        Scene(
+            name="unit-ok",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-ok",
+            comparison="clear_only",
+            expected_clear_color="9 14 22",
+        )
+        for bad in ("9 14", "a b c", "300 0 0", "9 14 22 1"):
+            with self.assertRaises(ValueError):
+                Scene(
+                    name="unit-bad",
+                    source="map",
+                    target="oa_dm1",
+                    screenshot="unit-bad",
+                    comparison="clear_only",
+                    expected_clear_color=bad,
+                )
+
+    def test_apply_frame_classification_labels_clear_only(self) -> None:
+        scene = Scene(
+            name="unit-clear",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-clear",
+            comparison="clear_only",
+        )
+        result = classified_result(uniform_frame(8, 8), 8, 8, scene)
+        self.assertEqual(result["frame_class"], CLASS_CLEAR_ONLY)
+        self.assertTrue(result["frame_classification"]["expected_clear_matches"])
+
+    def test_apply_frame_classification_labels_content(self) -> None:
+        scene = Scene(
+            name="unit-content",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-content",
+            comparison="content",
+        )
+        rgb = rect_frame(8, 8, VRHI_CLEAR_COLOR_RGB8, (255, 0, 0), 2, 2, 6, 6)
+        result = classified_result(rgb, 8, 8, scene)
+        self.assertEqual(result["frame_class"], CLASS_CONTENT)
+
+    def test_apply_frame_classification_flags_wrong_clear_color(self) -> None:
+        scene = Scene(
+            name="unit-clear",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-clear",
+            comparison="clear_only",
+        )
+        result = classified_result(uniform_frame(8, 8, (0, 0, 0)), 8, 8, scene)
+        self.assertEqual(result["frame_class"], "uniform_other")
+        self.assertFalse(result["frame_classification"]["expected_clear_matches"])
+
+    def test_apply_frame_classification_skips_failed_runs(self) -> None:
+        scene = Scene(
+            name="unit-clear",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-clear",
+            comparison="clear_only",
+        )
+        result: dict[str, object] = {"error": "engine exited with 1"}
+        apply_frame_classification(result, scene)
+        self.assertIsNone(result["frame_class"])
+        self.assertIsNone(result["frame_classification"])
+
+    def test_content_policy_requires_content_frames(self) -> None:
+        scene = Scene(
+            name="unit-content",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-content",
+            comparison="content",
+        )
+        content = classified_result(
+            rect_frame(8, 8, VRHI_CLEAR_COLOR_RGB8, (255, 0, 0), 2, 2, 6, 6),
+            8,
+            8,
+            scene,
+        )
+        cleared = classified_result(uniform_frame(8, 8), 8, 8, scene)
+        self.assertTrue(assess_repeatability(scene, [content, content], 2)[0])
+        self.assertFalse(assess_repeatability(scene, [content, cleared], 2)[0])
+        self.assertFalse(assess_repeatability(scene, [cleared, cleared], 2)[0])
+
+    def test_content_policy_metrics_are_exposed(self) -> None:
+        scene = Scene(
+            name="unit-content",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-content",
+            comparison="content",
+        )
+        content = classified_result(
+            rect_frame(8, 8, VRHI_CLEAR_COLOR_RGB8, (255, 0, 0), 2, 2, 6, 6),
+            8,
+            8,
+            scene,
+        )
+        _, metrics = assess_repeatability(scene, [content, content], 2)
+        self.assertEqual(len(metrics), 2)
+        self.assertEqual(metrics[0]["frame_class"], CLASS_CONTENT)
+
+    def test_clear_only_policy_requires_clear_frames(self) -> None:
+        scene = Scene(
+            name="unit-clear",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-clear",
+            comparison="clear_only",
+        )
+        cleared = classified_result(uniform_frame(8, 8), 8, 8, scene)
+        content = classified_result(
+            rect_frame(8, 8, VRHI_CLEAR_COLOR_RGB8, (255, 0, 0), 2, 2, 6, 6),
+            8,
+            8,
+            scene,
+        )
+        self.assertTrue(assess_repeatability(scene, [cleared, cleared], 2)[0])
+        self.assertFalse(assess_repeatability(scene, [cleared, content], 2)[0])
+
+    def test_clear_only_policy_fails_wrong_uniform_color(self) -> None:
+        scene = Scene(
+            name="unit-clear",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-clear",
+            comparison="clear_only",
+        )
+        wrong = classified_result(uniform_frame(8, 8, (61, 107, 56)), 8, 8, scene)
+        self.assertEqual(wrong["frame_class"], "uniform_other")
+        self.assertFalse(assess_repeatability(scene, [wrong, wrong], 2)[0])
+
+    def test_classification_policies_fail_on_errored_results(self) -> None:
+        scene = Scene(
+            name="unit-content",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-content",
+            comparison="content",
+        )
+        errored: dict[str, object] = {"error": "process timeout"}
+        passed, metrics = assess_repeatability(scene, [errored, errored], 2)
+        self.assertFalse(passed)
+        self.assertEqual(metrics, [])
 
 
 if __name__ == "__main__":

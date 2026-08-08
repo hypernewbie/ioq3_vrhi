@@ -25,6 +25,23 @@ import subprocess
 import sys
 import time
 
+try:
+    from frame_classify import (
+        CLASS_CLEAR_ONLY,
+        CLASS_CONTENT,
+        VRHI_CLEAR_COLOR_RGB8,
+        classify_frame,
+        parse_expected_clear_color,
+    )
+except ImportError:  # pragma: no cover - module import fallback
+    from .frame_classify import (
+        CLASS_CLEAR_ONLY,
+        CLASS_CONTENT,
+        VRHI_CLEAR_COLOR_RGB8,
+        classify_frame,
+        parse_expected_clear_color,
+    )
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parents[1]
 ASSET_ROOT = ROOT / "temp" / "assets" / "openarena-0.8.8"
@@ -78,6 +95,7 @@ class Scene:
     waits: int = 8
     viewpos: str | None = None
     cvars: dict[str, str] = field(default_factory=dict)
+    expected_clear_color: str | None = None
 
     def __post_init__(self) -> None:
         for label, value in (("scene", self.name), ("screenshot", self.screenshot)):
@@ -85,7 +103,13 @@ class Scene:
                 raise ValueError(f"unsafe {label} name: {value!r}")
         if self.source not in {"demo", "map", "devmap"}:
             raise ValueError(f"unsupported scene source: {self.source!r}")
-        if self.comparison not in {"exact", "tolerant", "capture"}:
+        if self.comparison not in {
+            "exact",
+            "tolerant",
+            "capture",
+            "content",
+            "clear_only",
+        }:
             raise ValueError(f"unsupported comparison policy: {self.comparison!r}")
         if not self.target or "/" in self.target or "\\" in self.target:
             raise ValueError(f"unsafe {self.source} target: {self.target!r}")
@@ -99,6 +123,9 @@ class Scene:
                 [float(value) for value in values]
             except ValueError as error:
                 raise ValueError(f"invalid viewpos: {self.viewpos!r}") from error
+        if self.expected_clear_color is not None:
+            # Raises ValueError for malformed or out-of-range 'R G B' text.
+            parse_expected_clear_color(self.expected_clear_color)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -112,6 +139,7 @@ class Scene:
             "waits": self.waits,
             "viewpos": self.viewpos,
             "cvars": self.cvars,
+            "expected_clear_color": self.expected_clear_color,
         }
 
 
@@ -140,6 +168,11 @@ def load_scenes(path: Path = DEFAULT_MANIFEST) -> list[Scene]:
             waits=int(item.get("waits", 8)),
             viewpos=(str(item["viewpos"]) if item.get("viewpos") is not None else None),
             cvars={str(key): str(value) for key, value in item.get("cvars", {}).items()},
+            expected_clear_color=(
+                str(item["expected_clear_color"])
+                if item.get("expected_clear_color") is not None
+                else None
+            ),
         )
         if scene.name in names:
             raise ValueError(f"duplicate scene name in {path}: {scene.name}")
@@ -301,6 +334,37 @@ def build_command(engine: Path, home: Path, renderer: str, scene: Scene) -> list
     return command
 
 
+def apply_frame_classification(result: dict[str, object], scene: Scene) -> None:
+    """Classify a captured frame and publish the class on the result dict.
+
+    Publishes ``frame_class`` (clear_only/uniform_other/content or None) and
+    ``frame_classification`` (full metrics dict) for every successful capture.
+    The expected clear color defaults to the renderer_vrhi clear so that a
+    wrong-color uniform frame is flagged as ``uniform_other`` instead of being
+    silently treated as the expected clear.
+    """
+    normalized = result.get("_normalized_rgb")
+    if not isinstance(normalized, bytes) or not normalized:
+        result["frame_class"] = None
+        result["frame_classification"] = None
+        return
+    expected: tuple[int, int, int] | None = (
+        parse_expected_clear_color(scene.expected_clear_color)
+        if scene.expected_clear_color is not None
+        else VRHI_CLEAR_COLOR_RGB8
+    )
+    width = result.get("width")
+    height = result.get("height")
+    classification = classify_frame(
+        normalized,
+        width=int(width) if width is not None else None,
+        height=int(height) if height is not None else None,
+        expected_clear_color=expected,
+    )
+    result["frame_class"] = classification.frame_class
+    result["frame_classification"] = classification.as_dict()
+
+
 def run_one(
     engine: Path,
     run_dir: Path,
@@ -401,6 +465,7 @@ def run_one(
             "_normalized_rgb": normalized,
         }
     )
+    apply_frame_classification(result, scene)
     return result
 
 
@@ -447,6 +512,18 @@ def assess_repeatability(
 
     if scene.comparison == "capture":
         return True, []
+
+    if scene.comparison in (CLASS_CONTENT, CLASS_CLEAR_ONLY):
+        classifications = [result.get("frame_classification") for result in results]
+        if any(not isinstance(item, dict) for item in classifications):
+            return False, []
+        expected_class = (
+            CLASS_CONTENT if scene.comparison == CLASS_CONTENT else CLASS_CLEAR_ONLY
+        )
+        passed = all(
+            item.get("frame_class") == expected_class for item in classifications
+        )
+        return passed, classifications
 
     if scene.comparison == "exact":
         hashes = [result.get("normalized_rgb_sha256") for result in results]
@@ -518,7 +595,8 @@ def main() -> int:
                 break
             print(
                 f"[image-test]   capture {result['width']}x{result['height']} "
-                f"sha256={result['normalized_rgb_sha256']}"
+                f"sha256={result['normalized_rgb_sha256']} "
+                f"class={result.get('frame_class')}"
             )
 
         capture_valid = len(results) == args.repeat and all(
