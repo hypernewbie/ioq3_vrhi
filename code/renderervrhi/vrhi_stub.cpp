@@ -90,7 +90,7 @@ static vhState g_frameState;
 static vhTexture g_frameBackbuffer = VRHI_INVALID_HANDLE;
 static const vhStateId g_frameStateId = 1;
 
-static const float VRHI_WORLD_NEAR = 1.0f;
+static const float VRHI_WORLD_NEAR = 4.0f;
 static const float VRHI_WORLD_FAR = 131072.0f;
 
 // Keep the generated qpath within MAX_QPATH while allowing the command to
@@ -808,7 +808,7 @@ static bool VRHI_UploadWorldGeometry(void) {
 	vhCreateVertexBuffer(g_worldVertexBuffer, "VRHI_WorldPositions", vertices, "float3",
 		g_worldPositions.size());
 	vhCreateIndexBuffer(g_worldIndexBuffer, "VRHI_WorldIndexes", indexes,
-		g_worldIndexes.size());
+		g_worldIndexes.size(), VRHI_BUFFER_INDEX32);
 	vhFinish();
 	if (g_vhErrorCounter.load(std::memory_order_relaxed) != errorsBefore) {
 		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: world buffer upload reported VRHI errors\n");
@@ -1180,19 +1180,108 @@ static qhandle_t VRHI_RegisterShaderNoMip(const char *name) {
 	// the GL renderers where both paths resolve through the same shader table.
 	return VRHI_RegisterName(g_shaderHandles, name, "RegisterShaderNoMip");
 }
-static bool VRHI_ValidLump(const dheader_t *header, int index, long fileSize,
+static bool VRHI_ValidLump(const lump_t &lump, size_t fileSize,
 	const char *name) {
-	const lump_t &lump = header->lumps[index];
+	// Check the subtraction only after proving that the offset is in range;
+	// this keeps malformed signed on-disk values from wrapping.
 	if (lump.fileofs < 0 || lump.filelen < 0 ||
-		static_cast<long long>(lump.fileofs) > fileSize ||
-		static_cast<long long>(lump.filelen) >
-			static_cast<long long>(fileSize) - lump.fileofs) {
+		static_cast<size_t>(lump.fileofs) > fileSize ||
+		static_cast<size_t>(lump.filelen) >
+			fileSize - static_cast<size_t>(lump.fileofs)) {
 		VRHI_Printf(PRINT_WARNING,
-			"renderer_vrhi: BSP lump %s invalid (offset=%d length=%d file=%ld)\n",
+			"renderer_vrhi: BSP lump %s invalid (offset=%d length=%d file=%zu)\n",
 			name, lump.fileofs, lump.filelen, fileSize);
 		return false;
 	}
 	return true;
+}
+
+static dmodel_t VRHI_DecodeModel(const dmodel_t &disk) {
+	dmodel_t host = disk;
+	for (int i = 0; i < 3; ++i) {
+		host.mins[i] = LittleFloat(disk.mins[i]);
+		host.maxs[i] = LittleFloat(disk.maxs[i]);
+	}
+	host.firstSurface = LittleLong(disk.firstSurface);
+	host.numSurfaces = LittleLong(disk.numSurfaces);
+	host.firstBrush = LittleLong(disk.firstBrush);
+	host.numBrushes = LittleLong(disk.numBrushes);
+	return host;
+}
+
+static dsurface_t VRHI_DecodeSurface(const dsurface_t &disk) {
+	dsurface_t host = disk;
+	host.shaderNum = LittleLong(disk.shaderNum);
+	host.fogNum = LittleLong(disk.fogNum);
+	host.surfaceType = LittleLong(disk.surfaceType);
+	host.firstVert = LittleLong(disk.firstVert);
+	host.numVerts = LittleLong(disk.numVerts);
+	host.firstIndex = LittleLong(disk.firstIndex);
+	host.numIndexes = LittleLong(disk.numIndexes);
+	host.lightmapNum = LittleLong(disk.lightmapNum);
+	host.lightmapX = LittleLong(disk.lightmapX);
+	host.lightmapY = LittleLong(disk.lightmapY);
+	host.lightmapWidth = LittleLong(disk.lightmapWidth);
+	host.lightmapHeight = LittleLong(disk.lightmapHeight);
+	for (int i = 0; i < 3; ++i) {
+		host.lightmapOrigin[i] = LittleFloat(disk.lightmapOrigin[i]);
+		for (int j = 0; j < 3; ++j) {
+			host.lightmapVecs[i][j] = LittleFloat(disk.lightmapVecs[i][j]);
+		}
+	}
+	host.patchWidth = LittleLong(disk.patchWidth);
+	host.patchHeight = LittleLong(disk.patchHeight);
+	return host;
+}
+
+static dshader_t VRHI_DecodeShader(const dshader_t &disk) {
+	dshader_t host = disk;
+	host.surfaceFlags = LittleLong(disk.surfaceFlags);
+	host.contentFlags = LittleLong(disk.contentFlags);
+	return host;
+}
+
+static drawVert_t VRHI_DecodeDrawVert(const drawVert_t &disk) {
+	drawVert_t host = disk;
+	for (int i = 0; i < 3; ++i) {
+		host.xyz[i] = LittleFloat(disk.xyz[i]);
+		host.normal[i] = LittleFloat(disk.normal[i]);
+	}
+	for (int i = 0; i < 2; ++i) {
+		host.st[i] = LittleFloat(disk.st[i]);
+		host.lightmap[i] = LittleFloat(disk.lightmap[i]);
+	}
+	return host;
+}
+
+static dmodel_t VRHI_ReadModel(const byte *lumpData, int index) {
+	dmodel_t disk;
+	std::memcpy(&disk, lumpData + static_cast<size_t>(index) * sizeof(disk), sizeof(disk));
+	return VRHI_DecodeModel(disk);
+}
+
+static dsurface_t VRHI_ReadSurface(const byte *lumpData, int index) {
+	dsurface_t disk;
+	std::memcpy(&disk, lumpData + static_cast<size_t>(index) * sizeof(disk), sizeof(disk));
+	return VRHI_DecodeSurface(disk);
+}
+
+static dshader_t VRHI_ReadShader(const byte *lumpData, int index) {
+	dshader_t disk;
+	std::memcpy(&disk, lumpData + static_cast<size_t>(index) * sizeof(disk), sizeof(disk));
+	return VRHI_DecodeShader(disk);
+}
+
+static drawVert_t VRHI_ReadDrawVert(const byte *lumpData, int index) {
+	drawVert_t disk;
+	std::memcpy(&disk, lumpData + static_cast<size_t>(index) * sizeof(disk), sizeof(disk));
+	return VRHI_DecodeDrawVert(disk);
+}
+
+static int VRHI_ReadIndex(const byte *lumpData, int index) {
+	int disk;
+	std::memcpy(&disk, lumpData + static_cast<size_t>(index) * sizeof(disk), sizeof(disk));
+	return LittleLong(disk);
 }
 
 static void VRHI_LoadWorld(const char *name) {
@@ -1202,56 +1291,62 @@ static void VRHI_LoadWorld(const char *name) {
 		return;
 	}
 	void *fileData = nullptr;
-	const long fileSize = g_ri.FS_ReadFile(name, &fileData);
-	if (fileSize < static_cast<long>(sizeof(dheader_t)) || fileData == nullptr) {
+	const long fileSizeLong = g_ri.FS_ReadFile(name, &fileData);
+	if (fileSizeLong < static_cast<long>(sizeof(dheader_t)) || fileData == nullptr) {
 		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: BSP world '%s' read failed (%ld bytes)\n",
-			name, fileSize);
+			name, fileSizeLong);
 		return;
 	}
-	const dheader_t *header = reinterpret_cast<const dheader_t *>(fileData);
-	if (header->ident != BSP_IDENT || header->version != BSP_VERSION) {
+	const size_t fileSize = static_cast<size_t>(fileSizeLong);
+	const byte *fileBytes = static_cast<const byte *>(fileData);
+	dheader_t diskHeader;
+	std::memcpy(&diskHeader, fileBytes, sizeof(diskHeader));
+	const int ident = LittleLong(diskHeader.ident);
+	const int version = LittleLong(diskHeader.version);
+	if (ident != BSP_IDENT || version != BSP_VERSION) {
 		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: BSP world '%s' rejected (ident=0x%08x version=%d)\n",
-			name, header->ident, header->version);
+			name, ident, version);
 		g_ri.FS_FreeFile(fileData);
 		return;
+	}
+	lump_t lumps[HEADER_LUMPS];
+	for (int i = 0; i < HEADER_LUMPS; ++i) {
+		lumps[i].fileofs = LittleLong(diskHeader.lumps[i].fileofs);
+		lumps[i].filelen = LittleLong(diskHeader.lumps[i].filelen);
 	}
 	static const char *lumpNames[HEADER_LUMPS] = { "entities", "shaders", "planes", "nodes",
 		"leafs", "leafsurfaces", "leafbrushes", "models", "brushes", "brushsides",
 		"drawverts", "drawindexes", "fogs", "surfaces", "lightmaps", "lightgrid", "visibility" };
 	for (int i = 0; i < HEADER_LUMPS; ++i) {
-		if (!VRHI_ValidLump(header, i, fileSize, lumpNames[i])) {
+		if (!VRHI_ValidLump(lumps[i], fileSize, lumpNames[i])) {
 			g_ri.FS_FreeFile(fileData);
 			return;
 		}
 	}
-	const lump_t &modelsLump = header->lumps[LUMP_MODELS];
-	const lump_t &surfacesLump = header->lumps[LUMP_SURFACES];
-	const lump_t &vertsLump = header->lumps[LUMP_DRAWVERTS];
-	const lump_t &indexesLump = header->lumps[LUMP_DRAWINDEXES];
-	const lump_t &shadersLump = header->lumps[LUMP_SHADERS];
-	if (modelsLump.filelen < static_cast<int>(sizeof(dmodel_t)) ||
-		shadersLump.filelen % static_cast<int>(sizeof(dshader_t)) != 0 ||
-		surfacesLump.filelen % static_cast<int>(sizeof(dsurface_t)) != 0 ||
-		vertsLump.filelen % static_cast<int>(sizeof(drawVert_t)) != 0 ||
-		indexesLump.filelen % static_cast<int>(sizeof(int)) != 0) {
+	const lump_t &modelsLump = lumps[LUMP_MODELS];
+	const lump_t &surfacesLump = lumps[LUMP_SURFACES];
+	const lump_t &vertsLump = lumps[LUMP_DRAWVERTS];
+	const lump_t &indexesLump = lumps[LUMP_DRAWINDEXES];
+	const lump_t &shadersLump = lumps[LUMP_SHADERS];
+	if (static_cast<size_t>(modelsLump.filelen) < sizeof(dmodel_t) ||
+		static_cast<size_t>(shadersLump.filelen) % sizeof(dshader_t) != 0 ||
+		static_cast<size_t>(surfacesLump.filelen) % sizeof(dsurface_t) != 0 ||
+		static_cast<size_t>(vertsLump.filelen) % sizeof(drawVert_t) != 0 ||
+		static_cast<size_t>(indexesLump.filelen) % sizeof(int) != 0) {
 		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: BSP world '%s' has malformed geometry lumps\n", name);
 		g_ri.FS_FreeFile(fileData);
 		return;
 	}
-	const dmodel_t *models = reinterpret_cast<const dmodel_t *>(
-		static_cast<const byte *>(fileData) + modelsLump.fileofs);
-	const dsurface_t *surfaces = reinterpret_cast<const dsurface_t *>(
-		static_cast<const byte *>(fileData) + surfacesLump.fileofs);
-	const dshader_t *shaders = reinterpret_cast<const dshader_t *>(
-		static_cast<const byte *>(fileData) + shadersLump.fileofs);
-	const drawVert_t *drawVerts = reinterpret_cast<const drawVert_t *>(
-		static_cast<const byte *>(fileData) + vertsLump.fileofs);
-	const int *drawIndexes = reinterpret_cast<const int *>(
-		static_cast<const byte *>(fileData) + indexesLump.fileofs);
+	const byte *modelsData = fileBytes + static_cast<size_t>(modelsLump.fileofs);
+	const byte *surfacesData = fileBytes + static_cast<size_t>(surfacesLump.fileofs);
+	const byte *shadersData = fileBytes + static_cast<size_t>(shadersLump.fileofs);
+	const byte *vertsData = fileBytes + static_cast<size_t>(vertsLump.fileofs);
+	const byte *indexesData = fileBytes + static_cast<size_t>(indexesLump.fileofs);
 	const int surfaceCount = surfacesLump.filelen / static_cast<int>(sizeof(dsurface_t));
 	const int vertCount = vertsLump.filelen / static_cast<int>(sizeof(drawVert_t));
 	const int indexCount = indexesLump.filelen / static_cast<int>(sizeof(int));
-	const dmodel_t &model = models[0];
+	const int shaderCount = shadersLump.filelen / static_cast<int>(sizeof(dshader_t));
+	const dmodel_t model = VRHI_ReadModel(modelsData, 0);
 	if (model.firstSurface < 0 || model.numSurfaces < 0 ||
 		model.firstSurface > surfaceCount || model.numSurfaces > surfaceCount - model.firstSurface) {
 		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: BSP world '%s' has invalid first model surface range\n", name);
@@ -1262,11 +1357,12 @@ static void VRHI_LoadWorld(const char *name) {
 	int skipped = 0;
 	for (int surfaceIndex = model.firstSurface;
 		surfaceIndex < model.firstSurface + model.numSurfaces; ++surfaceIndex) {
-		const dsurface_t &surface = surfaces[surfaceIndex];
+		const dsurface_t surface = VRHI_ReadSurface(surfacesData, surfaceIndex);
+		const dshader_t shader = surface.shaderNum >= 0 && surface.shaderNum < shaderCount
+			? VRHI_ReadShader(shadersData, surface.shaderNum) : dshader_t();
 		if ((surface.surfaceType != MST_PLANAR && surface.surfaceType != MST_TRIANGLE_SOUP) ||
-			surface.shaderNum < 0 || surface.shaderNum >=
-			shadersLump.filelen / static_cast<int>(sizeof(dshader_t)) ||
-			(shaders[surface.shaderNum].surfaceFlags & (SURF_SKY | SURF_NODRAW)) ||
+			surface.shaderNum < 0 || surface.shaderNum >= shaderCount ||
+			(shader.surfaceFlags & (SURF_SKY | SURF_NODRAW)) ||
 			surface.firstVert < 0 || surface.numVerts < 3 ||
 			surface.firstVert > vertCount || surface.numVerts > vertCount - surface.firstVert ||
 			surface.firstIndex < 0 || surface.numIndexes < 3 ||
@@ -1278,13 +1374,15 @@ static void VRHI_LoadWorld(const char *name) {
 		std::unordered_map<int, uint32_t> localVertices;
 		int surfaceTriangles = 0;
 		for (int i = 0; i + 2 < surface.numIndexes; i += 3) {
-			const int source[3] = { drawIndexes[surface.firstIndex + i],
-				drawIndexes[surface.firstIndex + i + 1], drawIndexes[surface.firstIndex + i + 2] };
+			const int source[3] = { VRHI_ReadIndex(indexesData, surface.firstIndex + i),
+				VRHI_ReadIndex(indexesData, surface.firstIndex + i + 1),
+				VRHI_ReadIndex(indexesData, surface.firstIndex + i + 2) };
 			bool valid = true;
 			glm::vec3 position[3];
 			for (int corner = 0; corner < 3; ++corner) {
 				if (source[corner] < 0 || source[corner] >= surface.numVerts) { valid = false; break; }
-				const drawVert_t &vertex = drawVerts[surface.firstVert + source[corner]];
+				const drawVert_t vertex = VRHI_ReadDrawVert(vertsData,
+					surface.firstVert + source[corner]);
 				position[corner] = glm::vec3(vertex.xyz[0], vertex.xyz[1], vertex.xyz[2]);
 				if (!std::isfinite(position[corner].x) || !std::isfinite(position[corner].y) ||
 					!std::isfinite(position[corner].z)) { valid = false; break; }
@@ -1300,8 +1398,7 @@ static void VRHI_LoadWorld(const char *name) {
 				if (found == localVertices.end()) {
 					local = static_cast<uint32_t>(g_worldPositions.size());
 					localVertices.emplace(source[corner], local);
-					const drawVert_t &vertex = drawVerts[surface.firstVert + source[corner]];
-					g_worldPositions.emplace_back(vertex.xyz[0], vertex.xyz[1], vertex.xyz[2]);
+					g_worldPositions.push_back(position[corner]);
 				} else local = found->second;
 				g_worldIndexes.push_back(local);
 			}
