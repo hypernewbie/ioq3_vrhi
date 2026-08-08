@@ -29,6 +29,7 @@
 #endif
 
 #include <atomic>
+#include <cstdint>
 #include <cctype>
 #include <cstdarg>
 #include <cmath>
@@ -109,6 +110,7 @@ static std::vector<polyVert_t> g_scenePolyVerts;
 static std::vector<VRHI_WorldVertex> g_sceneVertices;
 static std::vector<uint32_t> g_sceneIndexes;
 static std::vector<VRHI_SceneDraw> g_sceneDraws;
+static size_t g_sceneModelDraws = 0;
 static vhBuffer g_sceneVertexBuffer = VRHI_INVALID_HANDLE;
 static vhBuffer g_sceneIndexBuffer = VRHI_INVALID_HANDLE;
 static bool g_sceneBuffersCreated = false;
@@ -166,6 +168,56 @@ static std::vector<VRHI_UITexture> g_uiTextures;
 static std::unordered_map<qhandle_t, size_t> g_uiTextureByHandle;
 static std::unordered_map<qhandle_t, bool> g_uiTextureAttempts;
 static std::vector<byte> g_worldLightmapPixels;
+
+// MD3 is intentionally a data-only model slice: compressed positions/normals
+// and material UVs are retained, while normal decoding/lighting and shader
+// stages remain outside this renderer's scope. The limits below are independent of
+// the legacy qfiles.h limits so malformed files cannot consume the renderer's
+// entire image/scene budget.
+static const size_t VRHI_MAX_MD3_FILE_BYTES = 64u * 1024u * 1024u;
+static const size_t VRHI_MAX_MD3_MEMORY = 64u * 1024u * 1024u;
+static const int VRHI_MAX_MD3_MODELS = 4096;
+static const int VRHI_MAX_MD3_FRAMES = MD3_MAX_FRAMES;
+static const int VRHI_MAX_MD3_SURFACES = MD3_MAX_SURFACES;
+static const int VRHI_MAX_MD3_VERTICES = MD3_MAX_VERTS;
+static const int VRHI_MAX_MD3_TRIANGLES = MD3_MAX_TRIANGLES;
+static const int VRHI_MAX_MD3_SHADERS = MD3_MAX_SHADERS;
+struct VRHI_MD3XYZ { int16_t x, y, z, normal; };
+struct VRHI_MD3Tag {
+	std::string name;
+	glm::vec3 origin = glm::vec3(0.0f);
+	glm::vec3 axis[3] = { glm::vec3(0.0f), glm::vec3(0.0f), glm::vec3(0.0f) };
+};
+struct VRHI_MD3Surface {
+	int numFrames = 0;
+	int numVerts = 0;
+	std::vector<glm::vec2> st;
+	std::vector<VRHI_MD3XYZ> xyz;
+	std::vector<uint32_t> indexes;
+	qhandle_t shader = 0;
+};
+struct VRHI_MD3Model {
+	std::string name;
+	bool valid = false;
+	int numFrames = 0;
+	int numTags = 0;
+	size_t cpuBytes = 0;
+	std::vector<glm::vec3> frameMins;
+	std::vector<glm::vec3> frameMaxs;
+	std::vector<VRHI_MD3Tag> tags;
+	std::vector<VRHI_MD3Surface> surfaces;
+};
+static std::vector<VRHI_MD3Model> g_md3Models;
+static std::unordered_map<qhandle_t, size_t> g_md3ModelByHandle;
+static size_t g_md3MemoryBytes = 0;
+static const size_t VRHI_MD3_HEADER_BYTES = 108u;
+static const size_t VRHI_MD3_FRAME_BYTES = 56u;
+static const size_t VRHI_MD3_TAG_BYTES = 112u;
+static const size_t VRHI_MD3_SURFACE_BYTES = 108u;
+static const size_t VRHI_MD3_SHADER_BYTES = 68u;
+static const size_t VRHI_MD3_TRIANGLE_BYTES = 12u;
+static const size_t VRHI_MD3_ST_BYTES = 8u;
+static const size_t VRHI_MD3_XYZ_BYTES = 8u;
 // BSP PVS cull state (CPU copies, see VRHI_WorldPlane/Node/Leaf above).
 static std::vector<VRHI_WorldPlane> g_worldPlanes;
 static std::vector<VRHI_WorldNode> g_worldNodes;
@@ -267,6 +319,9 @@ static const size_t VRHI_MAX_SCENE_POLYS = 4096u;
 static const size_t VRHI_MAX_SCENE_POLY_VERTICES = 65536u;
 static const size_t VRHI_MAX_SCENE_VERTICES = 131072u;
 static const size_t VRHI_MAX_SCENE_INDEXES = 393216u;
+// Every generated draw (entity/quad/poly/model surface) shares one draw
+// table, so the cap is the sum of the two submission sources.
+static const size_t VRHI_MAX_SCENE_DRAWS = VRHI_MAX_SCENE_ENTITIES + VRHI_MAX_SCENE_POLYS;
 
 // Keep the generated qpath within MAX_QPATH while allowing the command to
 // accept only a basename.  The prefix and suffix are fixed and never come
@@ -1258,6 +1313,7 @@ static void VRHI_ResetSceneSubmissions(void) {
 	g_sceneVertices.clear();
 	g_sceneIndexes.clear();
 	g_sceneDraws.clear();
+	g_sceneModelDraws = 0;
 }
 
 static void VRHI_ReserveSceneStorage(void) {
@@ -1273,8 +1329,8 @@ static void VRHI_ReserveSceneStorage(void) {
 		g_sceneVertices.reserve(VRHI_MAX_SCENE_VERTICES);
 	if (g_sceneIndexes.capacity() < VRHI_MAX_SCENE_INDEXES)
 		g_sceneIndexes.reserve(VRHI_MAX_SCENE_INDEXES);
-	if (g_sceneDraws.capacity() < VRHI_MAX_SCENE_ENTITIES + VRHI_MAX_SCENE_POLYS)
-		g_sceneDraws.reserve(VRHI_MAX_SCENE_ENTITIES + VRHI_MAX_SCENE_POLYS);
+	if (g_sceneDraws.capacity() < VRHI_MAX_SCENE_DRAWS)
+		g_sceneDraws.reserve(VRHI_MAX_SCENE_DRAWS);
 }
 
 static void VRHI_DestroyUITextures(bool clearData) {
@@ -1295,6 +1351,13 @@ static void VRHI_DestroyUITextures(bool clearData) {
 		g_uiTextureByHandle.clear();
 		g_uiTextureAttempts.clear();
 	}
+}
+
+static void VRHI_DestroyMD3Resources(bool clearData) {
+	if (!clearData) return;
+	g_md3Models.clear();
+	g_md3ModelByHandle.clear();
+	g_md3MemoryBytes = 0;
 }
 
 static void VRHI_DestroyUI(void) {
@@ -1508,6 +1571,7 @@ static void VRHI_Shutdown(qboolean destroyWindow) {
 	// for CPU ownership.
 	VRHI_DestroyWorldResources(true);
 	VRHI_DestroyUI();
+	VRHI_DestroyMD3Resources(true);
 	if (g_deviceInitialized) {
 		vhFinish();
 		vhShutdown(false);
@@ -1692,8 +1756,234 @@ static std::unordered_map<std::string, qhandle_t> g_shaderHandles;
 static bool VRHI_RegisterDirectUITexture(qhandle_t handle, const char *name);
 static void VRHI_UploadUITextures(void);
 
+static bool VRHI_MD3Range(size_t offset, size_t bytes, size_t limit) {
+	return offset <= limit && bytes <= limit - offset;
+}
+static int32_t VRHI_MD3Int(const byte *p) {
+	int32_t value;
+	std::memcpy(&value, p, sizeof(value));
+	return LittleLong(value);
+}
+static float VRHI_MD3Float(const byte *p) {
+	float value;
+	std::memcpy(&value, p, sizeof(value));
+	return LittleFloat(value);
+}
+static int16_t VRHI_MD3Short(const byte *p) {
+	int16_t value;
+	std::memcpy(&value, p, sizeof(value));
+	return static_cast<int16_t>(LittleShort(value));
+}
+static bool VRHI_MD3String(const byte *p, size_t maxBytes, std::string *out) {
+	size_t length = 0;
+	while (length < maxBytes && p[length] != '\0') ++length;
+	if (length == maxBytes) return false;
+	if (out != nullptr) out->assign(reinterpret_cast<const char *>(p), length);
+	return true;
+}
+static bool VRHI_MD3SafeName(const char *name, size_t *lengthOut) {
+	if (name == nullptr || name[0] == '\0') return false;
+	size_t length = 0;
+	while (length < MAX_QPATH && name[length] != '\0') ++length;
+	if (length == 0 || length >= MAX_QPATH || name[0] == '*' ||
+		std::strstr(name, "..") != nullptr) return false;
+	if (lengthOut != nullptr) *lengthOut = length;
+	return true;
+}
+static bool VRHI_MD3Extension(const char *name) {
+	if (name == nullptr) return false;
+	const char *slash = std::strrchr(name, '/');
+	const char *backslash = std::strrchr(name, '\\'); // a single '\' escape: the Windows path separator
+	const char *base = slash != nullptr && slash > backslash ? slash + 1 :
+		(backslash != nullptr ? backslash + 1 : name);
+	const char *dot = std::strrchr(base, '.');
+	if (dot == nullptr || dot[1] == '\0') return false;
+	char ext[5] = {};
+	size_t length = std::strlen(dot + 1);
+	if (length != 3) return false;
+	for (size_t i = 0; i < length; ++i)
+		ext[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(dot[1 + i])));
+	return std::strcmp(ext, "md3") == 0;
+}
+static qhandle_t VRHI_RegisterModelShader(const std::string &shaderName) {
+	if (shaderName.empty()) return 0;
+	const qhandle_t handle = VRHI_RegisterName(g_shaderHandles, shaderName.c_str(),
+		"RegisterModelShader");
+	if (handle != 0) VRHI_RegisterDirectUITexture(handle, shaderName.c_str());
+	return handle;
+}
+
+static bool VRHI_ParseMD3(const byte *file, size_t fileSize, const char *name,
+	VRHI_MD3Model *out) {
+	if (file == nullptr || out == nullptr || fileSize < VRHI_MD3_HEADER_BYTES ||
+		fileSize > VRHI_MAX_MD3_FILE_BYTES) return false;
+	const int32_t ident = VRHI_MD3Int(file + 0);
+	const int32_t version = VRHI_MD3Int(file + 4);
+	if (ident != MD3_IDENT || version != MD3_VERSION) return false;
+	const int32_t numFrames = VRHI_MD3Int(file + 76);
+	const int32_t numTags = VRHI_MD3Int(file + 80);
+	const int32_t numSurfaces = VRHI_MD3Int(file + 84);
+	const int32_t ofsFrames = VRHI_MD3Int(file + 92);
+	const int32_t ofsTags = VRHI_MD3Int(file + 96);
+	const int32_t ofsSurfaces = VRHI_MD3Int(file + 100);
+	const int32_t ofsEnd = VRHI_MD3Int(file + 104);
+	if (numFrames <= 0 || numFrames > VRHI_MAX_MD3_FRAMES || numTags < 0 ||
+		numTags > MD3_MAX_TAGS || numSurfaces < 0 ||
+		numSurfaces > VRHI_MAX_MD3_SURFACES || ofsEnd < static_cast<int32_t>(VRHI_MD3_HEADER_BYTES) ||
+		static_cast<size_t>(ofsEnd) > fileSize) return false;
+	const size_t end = static_cast<size_t>(ofsEnd);
+	if (static_cast<size_t>(numFrames) > std::numeric_limits<size_t>::max() / VRHI_MD3_FRAME_BYTES ||
+		!VRHI_MD3Range(static_cast<size_t>(ofsFrames), static_cast<size_t>(numFrames) * VRHI_MD3_FRAME_BYTES, end) ||
+		static_cast<size_t>(numTags) > std::numeric_limits<size_t>::max() / VRHI_MD3_TAG_BYTES ||
+		!VRHI_MD3Range(static_cast<size_t>(ofsTags), static_cast<size_t>(numFrames) * static_cast<size_t>(numTags) * VRHI_MD3_TAG_BYTES, end) ||
+		(numSurfaces > 0 && !VRHI_MD3Range(static_cast<size_t>(ofsSurfaces), VRHI_MD3_SURFACE_BYTES, end))) return false;
+	try {
+		VRHI_MD3Model model;
+		model.name = name;
+		model.numFrames = numFrames;
+		model.numTags = numTags;
+		model.frameMins.reserve(static_cast<size_t>(numFrames));
+		model.frameMaxs.reserve(static_cast<size_t>(numFrames));
+		for (int frame = 0; frame < numFrames; ++frame) {
+			const byte *p = file + static_cast<size_t>(ofsFrames) + static_cast<size_t>(frame) * VRHI_MD3_FRAME_BYTES;
+			glm::vec3 mins(VRHI_MD3Float(p + 0), VRHI_MD3Float(p + 4), VRHI_MD3Float(p + 8));
+			glm::vec3 maxs(VRHI_MD3Float(p + 12), VRHI_MD3Float(p + 16), VRHI_MD3Float(p + 20));
+			const glm::vec3 localOrigin(VRHI_MD3Float(p + 24), VRHI_MD3Float(p + 28), VRHI_MD3Float(p + 32));
+			const float radius = VRHI_MD3Float(p + 36);
+			std::string frameName;
+			if (!VRHI_MD3String(p + 40, 16, &frameName) ||
+				!std::isfinite(mins.x) || !std::isfinite(mins.y) || !std::isfinite(mins.z) ||
+				!std::isfinite(maxs.x) || !std::isfinite(maxs.y) || !std::isfinite(maxs.z) ||
+				!std::isfinite(localOrigin.x) || !std::isfinite(localOrigin.y) || !std::isfinite(localOrigin.z) ||
+				!std::isfinite(radius)) return false;
+			model.frameMins.push_back(mins);
+			model.frameMaxs.push_back(maxs);
+		}
+		const size_t tagCount = static_cast<size_t>(numFrames) * static_cast<size_t>(numTags);
+		model.tags.reserve(tagCount);
+		for (size_t i = 0; i < tagCount; ++i) {
+			const byte *p = file + static_cast<size_t>(ofsTags) + i * VRHI_MD3_TAG_BYTES;
+			VRHI_MD3Tag tag;
+			if (!VRHI_MD3String(p, MAX_QPATH, &tag.name)) return false;
+			tag.origin = glm::vec3(VRHI_MD3Float(p + 64), VRHI_MD3Float(p + 68), VRHI_MD3Float(p + 72));
+			for (int axis = 0; axis < 3; ++axis) tag.axis[axis] = glm::vec3(
+				VRHI_MD3Float(p + 76 + axis * 12), VRHI_MD3Float(p + 80 + axis * 12), VRHI_MD3Float(p + 84 + axis * 12));
+			if (!std::isfinite(tag.origin.x) || !std::isfinite(tag.origin.y) || !std::isfinite(tag.origin.z)) return false;
+			for (int axis = 0; axis < 3; ++axis) if (!std::isfinite(tag.axis[axis].x) || !std::isfinite(tag.axis[axis].y) || !std::isfinite(tag.axis[axis].z)) return false;
+			model.tags.push_back(std::move(tag));
+		}
+		size_t surfaceOffset = static_cast<size_t>(ofsSurfaces);
+		for (int surfaceIndex = 0; surfaceIndex < numSurfaces; ++surfaceIndex) {
+			if (!VRHI_MD3Range(surfaceOffset, VRHI_MD3_SURFACE_BYTES, end)) return false;
+			const byte *p = file + surfaceOffset;
+			if (VRHI_MD3Int(p + 0) != MD3_IDENT) return false;
+			const int32_t surfaceFrames = VRHI_MD3Int(p + 72);
+			const int32_t shaderCount = VRHI_MD3Int(p + 76);
+			const int32_t numVerts = VRHI_MD3Int(p + 80);
+			const int32_t numTriangles = VRHI_MD3Int(p + 84);
+			const int32_t ofsTriangles = VRHI_MD3Int(p + 88);
+			const int32_t ofsShaders = VRHI_MD3Int(p + 92);
+			const int32_t ofsSt = VRHI_MD3Int(p + 96);
+			const int32_t ofsXYZ = VRHI_MD3Int(p + 100);
+			const int32_t surfaceEndDisk = VRHI_MD3Int(p + 104);
+			if (surfaceFrames != numFrames || shaderCount < 0 || shaderCount > VRHI_MAX_MD3_SHADERS ||
+				numVerts <= 0 || numVerts > VRHI_MAX_MD3_VERTICES || numTriangles <= 0 ||
+				numTriangles > VRHI_MAX_MD3_TRIANGLES || surfaceEndDisk < static_cast<int32_t>(VRHI_MD3_SURFACE_BYTES) ||
+				static_cast<size_t>(surfaceEndDisk) > end || !VRHI_MD3Range(surfaceOffset, static_cast<size_t>(surfaceEndDisk), end)) return false;
+			const size_t surfaceEnd = surfaceOffset + static_cast<size_t>(surfaceEndDisk);
+			if (ofsTriangles < static_cast<int32_t>(VRHI_MD3_SURFACE_BYTES) ||
+				ofsShaders < static_cast<int32_t>(VRHI_MD3_SURFACE_BYTES) ||
+				ofsSt < static_cast<int32_t>(VRHI_MD3_SURFACE_BYTES) ||
+				ofsXYZ < static_cast<int32_t>(VRHI_MD3_SURFACE_BYTES) ||
+				static_cast<size_t>(ofsTriangles) > static_cast<size_t>(surfaceEndDisk) ||
+				static_cast<size_t>(ofsShaders) > static_cast<size_t>(surfaceEndDisk) ||
+				static_cast<size_t>(ofsSt) > static_cast<size_t>(surfaceEndDisk) ||
+				static_cast<size_t>(ofsXYZ) > static_cast<size_t>(surfaceEndDisk) ||
+				static_cast<size_t>(numTriangles) > std::numeric_limits<size_t>::max() / VRHI_MD3_TRIANGLE_BYTES ||
+				static_cast<size_t>(shaderCount) > std::numeric_limits<size_t>::max() / VRHI_MD3_SHADER_BYTES ||
+				static_cast<size_t>(numVerts) > std::numeric_limits<size_t>::max() / VRHI_MD3_ST_BYTES ||
+				static_cast<size_t>(numFrames) * static_cast<size_t>(numVerts) > std::numeric_limits<size_t>::max() / VRHI_MD3_XYZ_BYTES ||
+				!VRHI_MD3Range(surfaceOffset + static_cast<size_t>(ofsTriangles), static_cast<size_t>(numTriangles) * VRHI_MD3_TRIANGLE_BYTES, surfaceEnd) ||
+				!VRHI_MD3Range(surfaceOffset + static_cast<size_t>(ofsShaders), static_cast<size_t>(shaderCount) * VRHI_MD3_SHADER_BYTES, surfaceEnd) ||
+				!VRHI_MD3Range(surfaceOffset + static_cast<size_t>(ofsSt), static_cast<size_t>(numVerts) * VRHI_MD3_ST_BYTES, surfaceEnd) ||
+				!VRHI_MD3Range(surfaceOffset + static_cast<size_t>(ofsXYZ), static_cast<size_t>(numFrames) * static_cast<size_t>(numVerts) * VRHI_MD3_XYZ_BYTES, surfaceEnd)) return false;
+			VRHI_MD3Surface surface;
+			surface.numFrames = numFrames;
+			surface.numVerts = numVerts;
+			surface.st.reserve(static_cast<size_t>(numVerts));
+			surface.xyz.reserve(static_cast<size_t>(numFrames) * static_cast<size_t>(numVerts));
+			surface.indexes.reserve(static_cast<size_t>(numTriangles) * 3u);
+			for (int shader = 0; shader < shaderCount; ++shader) {
+				std::string shaderName;
+				if (!VRHI_MD3String(file + surfaceOffset + static_cast<size_t>(ofsShaders) + static_cast<size_t>(shader) * VRHI_MD3_SHADER_BYTES, MAX_QPATH, &shaderName)) return false;
+				if (shader == 0) surface.shader = VRHI_RegisterModelShader(shaderName);
+			}
+			for (int vertex = 0; vertex < numVerts; ++vertex) {
+				const byte *st = file + surfaceOffset + static_cast<size_t>(ofsSt) + static_cast<size_t>(vertex) * VRHI_MD3_ST_BYTES;
+				const float s = VRHI_MD3Float(st), t = VRHI_MD3Float(st + 4);
+				if (!std::isfinite(s) || !std::isfinite(t)) return false;
+				surface.st.emplace_back(s, t);
+			}
+			for (int frame = 0; frame < numFrames; ++frame) for (int vertex = 0; vertex < numVerts; ++vertex) {
+				const byte *xyz = file + surfaceOffset + static_cast<size_t>(ofsXYZ) +
+					(static_cast<size_t>(frame) * static_cast<size_t>(numVerts) + static_cast<size_t>(vertex)) * VRHI_MD3_XYZ_BYTES;
+				VRHI_MD3XYZ value = { VRHI_MD3Short(xyz), VRHI_MD3Short(xyz + 2), VRHI_MD3Short(xyz + 4), VRHI_MD3Short(xyz + 6) };
+				surface.xyz.push_back(value);
+			}
+			for (int triangle = 0; triangle < numTriangles; ++triangle) {
+				const byte *tri = file + surfaceOffset + static_cast<size_t>(ofsTriangles) + static_cast<size_t>(triangle) * VRHI_MD3_TRIANGLE_BYTES;
+				for (int corner = 0; corner < 3; ++corner) {
+					const int32_t index = VRHI_MD3Int(tri + corner * 4);
+					if (index < 0 || index >= numVerts) return false;
+					surface.indexes.push_back(static_cast<uint32_t>(index));
+				}
+			}
+			model.surfaces.push_back(std::move(surface));
+			surfaceOffset += static_cast<size_t>(surfaceEndDisk);
+		}
+		if (surfaceOffset > end) return false;
+		model.cpuBytes = static_cast<size_t>(numFrames) * VRHI_MD3_FRAME_BYTES + tagCount * VRHI_MD3_TAG_BYTES;
+		for (const VRHI_MD3Surface &surface : model.surfaces) model.cpuBytes += surface.st.size() * sizeof(glm::vec2) + surface.xyz.size() * sizeof(VRHI_MD3XYZ) + surface.indexes.size() * sizeof(uint32_t);
+		if (model.cpuBytes > VRHI_MAX_MD3_MEMORY || g_md3MemoryBytes > VRHI_MAX_MD3_MEMORY - model.cpuBytes) return false;
+		*out = std::move(model);
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
 static qhandle_t VRHI_RegisterModel(const char *name) {
-	return VRHI_RegisterName(g_modelHandles, name, "RegisterModel");
+	size_t length = 0;
+	// Preserve qhandle 0 semantics for invalid names exactly like the GL
+	// renderers: NULL/empty/overlong and traversal-style names report "not
+	// registered" instead of consuming a fake non-zero handle that mods
+	// would treat as a real model.
+	if (!VRHI_MD3SafeName(name, &length)) {
+		VRHI_Printf(PRINT_DEVELOPER, "renderer_vrhi: RegisterModel('%s') rejected; qhandle 0\n",
+			name != nullptr ? name : "(null)");
+		return 0;
+	}
+	const qhandle_t handle = VRHI_RegisterName(g_modelHandles, name, "RegisterModel");
+	if (g_md3ModelByHandle.find(handle) != g_md3ModelByHandle.end()) return handle;
+	if (!VRHI_MD3Extension(name) || g_md3Models.size() >= VRHI_MAX_MD3_MODELS ||
+		g_ri.FS_ReadFile == nullptr || g_ri.FS_FreeFile == nullptr) return handle;
+	void *fileData = nullptr;
+	const long fileSizeLong = g_ri.FS_ReadFile(name, &fileData);
+	VRHI_MD3Model model;
+	bool parsed = fileData != nullptr && fileSizeLong > 0 &&
+		static_cast<unsigned long>(fileSizeLong) <= VRHI_MAX_MD3_FILE_BYTES &&
+		VRHI_ParseMD3(static_cast<const byte *>(fileData), static_cast<size_t>(fileSizeLong), name, &model);
+	if (fileData != nullptr) g_ri.FS_FreeFile(fileData);
+	if (!parsed) {
+		VRHI_Printf(PRINT_DEVELOPER, "renderer_vrhi: MD3 '%s' rejected; solid/no-op model handle %d\n", name, static_cast<int>(handle));
+		return handle;
+	}
+	model.valid = true;
+	g_md3MemoryBytes += model.cpuBytes;
+	g_md3ModelByHandle.emplace(handle, g_md3Models.size());
+	g_md3Models.push_back(std::move(model));
+	VRHI_Printf(PRINT_ALL, "renderer_vrhi: registered MD3 '%s' handle=%d frames=%d surfaces=%zu bytes=%zu\n", name, static_cast<int>(handle), g_md3Models.back().numFrames, g_md3Models.back().surfaces.size(), g_md3Models.back().cpuBytes);
+	return handle;
 }
 static qhandle_t VRHI_RegisterSkin(const char *name) {
 	return VRHI_RegisterName(g_skinHandles, name, "RegisterSkin");
@@ -2852,6 +3142,7 @@ static void VRHI_ClearScene(void) {
 	g_sceneVertices.clear();
 	g_sceneIndexes.clear();
 	g_sceneDraws.clear();
+	g_sceneModelDraws = 0;
 }
 static void VRHI_AddRefEntityToScene(const refEntity_t *entity) {
 	if (entity == nullptr || !VRHI_FiniteEntity(*entity)) {
@@ -2859,10 +3150,10 @@ static void VRHI_AddRefEntityToScene(const refEntity_t *entity) {
 		return;
 	}
 	if (entity->reType < 0 || entity->reType >= RT_MAX_REF_ENTITY_TYPE) return;
-	// RT_MODEL/rail/lightning/portal remain explicit safe no-ops: this bounded
-	// renderer has no MD3 parser or shader/material stage evaluator. Inline BSP
-	// submodels are likewise not transformed here; only static model 0 is loaded.
-	if (entity->reType != RT_SPRITE && entity->reType != RT_BEAM) {
+	// MD3 RT_MODEL is handled during BuildSceneGeometry. Inline BSP '*N'
+	// handles, unsupported model extensions, and complex effect types remain
+	// explicit safe no-ops; BSP model 0 remains on the static world path.
+	if (entity->reType != RT_MODEL && entity->reType != RT_SPRITE && entity->reType != RT_BEAM) {
 		// Report each unsupported type once per renderer lifetime instead of
 		// once per entity per frame; model entities dominate real scenes and
 		// would otherwise flood developer-mode console output.
@@ -2975,7 +3266,11 @@ static bool VRHI_FiniteVec3(const float *v) {
 
 static bool VRHI_FiniteEntity(const refEntity_t &entity) {
 	if (!VRHI_FiniteVec3(entity.origin) || !VRHI_FiniteVec3(entity.oldorigin) ||
-		!std::isfinite(entity.radius) || !std::isfinite(entity.rotation)) return false;
+		!VRHI_FiniteVec3(entity.lightingOrigin) || !std::isfinite(entity.shadowPlane) ||
+		!std::isfinite(entity.backlerp) || !std::isfinite(entity.shaderTexCoord[0]) ||
+		!std::isfinite(entity.shaderTexCoord[1]) ||
+		!std::isfinite(entity.shaderTime) || !std::isfinite(entity.radius) ||
+		!std::isfinite(entity.rotation)) return false;
 	for (int i = 0; i < 3; ++i) {
 		if (!VRHI_FiniteVec3(entity.axis[i])) return false;
 	}
@@ -2996,7 +3291,7 @@ static VRHI_WorldVertex VRHI_SceneVertex(const glm::vec3 &position,
 static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	size_t indexCount) {
 	if (indexCount == 0 || firstIndex > UINT32_MAX || indexCount > UINT32_MAX ||
-		g_sceneDraws.size() >= VRHI_MAX_SCENE_ENTITIES + VRHI_MAX_SCENE_POLYS) return false;
+		g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) return false;
 	VRHI_SceneDraw draw;
 	draw.firstIndex = static_cast<uint32_t>(firstIndex);
 	draw.indexCount = static_cast<uint32_t>(indexCount);
@@ -3015,7 +3310,7 @@ static vhTexture VRHI_SceneTexture(qhandle_t shader) {
 
 static bool VRHI_AppendSceneQuad(const glm::vec3 corners[4],
 	const glm::vec4 &color, qhandle_t shader) {
-	if (g_sceneDraws.size() >= VRHI_MAX_SCENE_ENTITIES + VRHI_MAX_SCENE_POLYS ||
+	if (g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS ||
 		g_sceneVertices.size() > VRHI_MAX_SCENE_VERTICES - 4 ||
 		g_sceneIndexes.size() > VRHI_MAX_SCENE_INDEXES - 6) return false;
 	const uint32_t firstVertex = static_cast<uint32_t>(g_sceneVertices.size());
@@ -3028,11 +3323,96 @@ static bool VRHI_AppendSceneQuad(const glm::vec3 corners[4],
 	return VRHI_AppendSceneDraw(shader, firstIndex, 6);
 }
 
+static int VRHI_MD3Frame(const VRHI_MD3Model &model, int frame,
+	const refEntity_t &entity) {
+	if (model.numFrames <= 0) return 0;
+	if ((entity.renderfx & RF_WRAP_FRAMES) != 0) {
+		int wrapped = frame % model.numFrames;
+		if (wrapped < 0) wrapped += model.numFrames;
+		return wrapped;
+	}
+	return glm::clamp(frame, 0, model.numFrames - 1);
+}
+static bool VRHI_AppendMD3Model(const refEntity_t &entity, const glm::vec4 &color) {
+	const auto found = g_md3ModelByHandle.find(entity.hModel);
+	if (found == g_md3ModelByHandle.end() || found->second >= g_md3Models.size()) return false;
+	const VRHI_MD3Model &model = g_md3Models[found->second];
+	if (!model.valid || model.numFrames <= 0) return false;
+	const int frame = VRHI_MD3Frame(model, entity.frame, entity);
+	const int oldFrame = VRHI_MD3Frame(model, entity.oldframe, entity);
+	const float backlerp = glm::clamp(entity.backlerp, 0.0f, 1.0f);
+	const glm::vec3 origin(entity.origin[0], entity.origin[1], entity.origin[2]);
+	for (const VRHI_MD3Surface &surface : model.surfaces) {
+		if (surface.numVerts <= 0 || surface.numFrames != model.numFrames ||
+			surface.st.size() != static_cast<size_t>(surface.numVerts) ||
+			surface.xyz.size() != static_cast<size_t>(surface.numVerts) * static_cast<size_t>(model.numFrames) ||
+			surface.indexes.empty() || surface.indexes.size() % 3 != 0) continue;
+		const size_t indexCount = surface.indexes.size();
+		// Check every per-scene cap before appending anything so a full
+		// vertex/index/draw table never strands partial surface geometry.
+		if (g_sceneVertices.size() > VRHI_MAX_SCENE_VERTICES - static_cast<size_t>(surface.numVerts) ||
+			indexCount > VRHI_MAX_SCENE_INDEXES - g_sceneIndexes.size() ||
+			g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) continue;
+		// Build the surface in scratch first: the defensive validation below
+		// (positions/UVs and index range) is already guaranteed by the parser,
+		// but failing here must never leave the scene buffers half-written.
+		std::vector<VRHI_WorldVertex> scratchVertices;
+		std::vector<uint32_t> scratchIndexes;
+		scratchVertices.reserve(static_cast<size_t>(surface.numVerts));
+		scratchIndexes.reserve(indexCount);
+		bool valid = true;
+		for (int vertex = 0; vertex < surface.numVerts; ++vertex) {
+			const VRHI_MD3XYZ &current = surface.xyz[static_cast<size_t>(frame) * static_cast<size_t>(surface.numVerts) + static_cast<size_t>(vertex)];
+			const VRHI_MD3XYZ &old = surface.xyz[static_cast<size_t>(oldFrame) * static_cast<size_t>(surface.numVerts) + static_cast<size_t>(vertex)];
+			const glm::vec3 currentPosition(current.x * static_cast<float>(MD3_XYZ_SCALE), current.y * static_cast<float>(MD3_XYZ_SCALE), current.z * static_cast<float>(MD3_XYZ_SCALE));
+			const glm::vec3 oldPosition(old.x * static_cast<float>(MD3_XYZ_SCALE), old.y * static_cast<float>(MD3_XYZ_SCALE), old.z * static_cast<float>(MD3_XYZ_SCALE));
+			const glm::vec3 local = currentPosition * (1.0f - backlerp) + oldPosition * backlerp;
+			// Expand the basis explicitly at the API seam; this is the same
+			// column-vector convention used by the Quake renderers.
+			const glm::vec3 position = origin + glm::vec3(
+				entity.axis[0][0] * local.x + entity.axis[1][0] * local.y + entity.axis[2][0] * local.z,
+				entity.axis[0][1] * local.x + entity.axis[1][1] * local.y + entity.axis[2][1] * local.z,
+				entity.axis[0][2] * local.x + entity.axis[1][2] * local.y + entity.axis[2][2] * local.z);
+			const glm::vec2 uv = surface.st[static_cast<size_t>(vertex)];
+			if (!std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z) ||
+				!std::isfinite(uv.x) || !std::isfinite(uv.y)) {
+				valid = false;
+				break;
+			}
+			scratchVertices.push_back(VRHI_SceneVertex(position, uv, color));
+		}
+		if (!valid) continue;
+		const uint32_t baseVertex = static_cast<uint32_t>(g_sceneVertices.size());
+		for (uint32_t index : surface.indexes) {
+			if (index >= static_cast<uint32_t>(surface.numVerts)) {
+				valid = false;
+				break;
+			}
+			scratchIndexes.push_back(index);
+		}
+		if (!valid) continue;
+		const uint32_t firstIndex = static_cast<uint32_t>(g_sceneIndexes.size());
+		g_sceneVertices.insert(g_sceneVertices.end(), scratchVertices.begin(), scratchVertices.end());
+		for (uint32_t index : scratchIndexes) g_sceneIndexes.push_back(baseVertex + index);
+		// Every failure mode of AppendSceneDraw was pre-checked above; roll
+		// back anyway so the surface stays atomic even if it ever changes.
+		if (!VRHI_AppendSceneDraw(entity.customShader != 0 ? entity.customShader : surface.shader,
+			firstIndex, indexCount)) {
+			g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
+			g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
+			continue;
+		}
+		++g_sceneModelDraws;
+	}
+	return true;
+}
+
 static bool VRHI_BuildSceneGeometry(const refdef_t *fd) {
 	VRHI_ReserveSceneStorage();
 	g_sceneVertices.clear();
 	g_sceneIndexes.clear();
 	g_sceneDraws.clear();
+	g_sceneModelDraws = 0;
 	if (fd == nullptr || !VRHI_FiniteVec3(fd->vieworg) ||
 		!VRHI_FiniteVec3(fd->viewaxis[0]) || !VRHI_FiniteVec3(fd->viewaxis[1]) ||
 		!VRHI_FiniteVec3(fd->viewaxis[2])) return false;
@@ -3045,7 +3425,9 @@ static bool VRHI_BuildSceneGeometry(const refdef_t *fd) {
 		glm::vec4 color(entity.shaderRGBA[0] / 255.0f, entity.shaderRGBA[1] / 255.0f,
 			entity.shaderRGBA[2] / 255.0f, entity.shaderRGBA[3] / 255.0f);
 		if (color == glm::vec4(0.0f)) color = glm::vec4(1.0f);
-		if (entity.reType == RT_SPRITE) {
+		if (entity.reType == RT_MODEL) {
+			VRHI_AppendMD3Model(entity, color);
+		} else if (entity.reType == RT_SPRITE) {
 			if (!(entity.radius > 0.0f) || !std::isfinite(entity.radius)) continue;
 			const float angle = entity.rotation * 3.14159265358979323846f / 180.0f;
 			const float c = std::cos(angle), s = std::sin(angle);
@@ -3078,7 +3460,8 @@ static bool VRHI_BuildSceneGeometry(const refdef_t *fd) {
 		if (poly.numVerts < 3 || poly.firstVertex > g_scenePolyVerts.size() ||
 			poly.numVerts > g_scenePolyVerts.size() - poly.firstVertex) continue;
 		if (g_sceneVertices.size() > VRHI_MAX_SCENE_VERTICES - poly.numVerts ||
-			poly.numVerts - 2 > (VRHI_MAX_SCENE_INDEXES - g_sceneIndexes.size()) / 3) continue;
+			poly.numVerts - 2 > (VRHI_MAX_SCENE_INDEXES - g_sceneIndexes.size()) / 3 ||
+			g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) continue;
 		const uint32_t firstVertex = static_cast<uint32_t>(g_sceneVertices.size());
 		const uint32_t firstIndex = static_cast<uint32_t>(g_sceneIndexes.size());
 		for (uint32_t i = 0; i < poly.numVerts; ++i) {
@@ -3256,7 +3639,7 @@ static int VRHI_CullDebugEnabled(void) {
 }
 
 static void VRHI_RenderScene(const refdef_t *fd) {
-	if (fd == nullptr || (fd->rdflags & (RDF_NOWORLDMODEL | RDF_HYPERSPACE)) != 0 ||
+	if (fd == nullptr || (fd->rdflags & RDF_HYPERSPACE) != 0 ||
 		!g_deviceInitialized || !g_frameBackbufferReady ||
 		!g_worldShaderInitialized || g_worldDepthTexture == VRHI_INVALID_HANDLE ||
 		fd->width <= 0 || fd->height <= 0 || !std::isfinite(fd->fov_x) ||
@@ -3372,8 +3755,8 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 	}
 	if (VRHI_BuildSceneGeometry(fd) && VRHI_EnsureSceneBuffers()) {
 		VRHI_Printf(PRINT_DEVELOPER,
-			"renderer_vrhi: scene submissions: entities=%zu polys=%zu draws=%zu vertices=%zu indexes=%zu\n",
-			g_sceneEntities.size(), g_scenePolys.size(), g_sceneDraws.size(),
+			"renderer_vrhi: scene submissions: entities=%zu polys=%zu modelDraws=%zu draws=%zu vertices=%zu indexes=%zu\n",
+			g_sceneEntities.size(), g_scenePolys.size(), g_sceneModelDraws, g_sceneDraws.size(),
 			g_sceneVertices.size(), g_sceneIndexes.size());
 		for (const VRHI_SceneDraw &draw : g_sceneDraws) {
 			const vhTexture texture = VRHI_SceneTexture(draw.shader);
@@ -3394,6 +3777,17 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 					.SetSampler(0, { "u_diffuseSampler", 0,
 						VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
 						VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_WRAP });
+				// The shared diffuse shader declares its optional lightmap
+				// resources even for scene/model draws. Bind the map lightmap
+				// when available so model images never leave a declared slot
+				// unbound; the no-world preview retains the solid fallback
+				// behavior if no lightmap resource exists.
+				if (g_worldLightmapTexture != VRHI_INVALID_HANDLE) {
+					g_worldState.SetTexture(1, { "u_lightmap", 1, g_worldLightmapTexture })
+						.SetSampler(1, { "u_lightmapSampler", 1,
+							VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
+							VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP });
+				}
 			}
 			if (vhSetState(g_worldStateId, g_worldState)) {
 				if (!submitted) vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
@@ -3512,23 +3906,40 @@ static int VRHI_MarkFragments(int numPoints, const vec3_t *points,
 }
 static int VRHI_LerpTag(orientation_t *tag, qhandle_t model, int startFrame,
 	int endFrame, float frac, const char *tagName) {
-	(void)model;
-	(void)startFrame;
-	(void)endFrame;
-	(void)frac;
-	(void)tagName;
-	if (tag != nullptr) {
-		std::memset(tag, 0, sizeof(*tag));
+	if (tag != nullptr) std::memset(tag, 0, sizeof(*tag));
+	const auto found = g_md3ModelByHandle.find(model);
+	if (tag == nullptr || found == g_md3ModelByHandle.end() || found->second >= g_md3Models.size() ||
+		tagName == nullptr || !std::isfinite(frac)) return 0;
+	const VRHI_MD3Model &data = g_md3Models[found->second];
+	if (!data.valid || data.numTags <= 0 || data.numFrames <= 0) return 0;
+	const int start = glm::clamp(startFrame, 0, data.numFrames - 1);
+	const int end = glm::clamp(endFrame, 0, data.numFrames - 1);
+	const float blend = glm::clamp(frac, 0.0f, 1.0f);
+	size_t tagNameLength = 0;
+	if (!VRHI_MD3SafeName(tagName, &tagNameLength)) return 0;
+	for (int index = 0; index < data.numTags; ++index) {
+		const VRHI_MD3Tag &a = data.tags[static_cast<size_t>(start) * data.numTags + index];
+		if (a.name.size() != tagNameLength || std::strncmp(a.name.c_str(), tagName, tagNameLength) != 0) continue;
+		const VRHI_MD3Tag &b = data.tags[static_cast<size_t>(end) * data.numTags + index];
+		tag->origin[0] = a.origin.x * (1.0f - blend) + b.origin.x * blend;
+		tag->origin[1] = a.origin.y * (1.0f - blend) + b.origin.y * blend;
+		tag->origin[2] = a.origin.z * (1.0f - blend) + b.origin.z * blend;
+		for (int axis = 0; axis < 3; ++axis) for (int component = 0; component < 3; ++component)
+			tag->axis[axis][component] = a.axis[axis][component] * (1.0f - blend) + b.axis[axis][component] * blend;
+		return 1;
 	}
 	return 0;
 }
 static void VRHI_ModelBounds(qhandle_t model, vec3_t mins, vec3_t maxs) {
-	(void)model;
-	if (mins != nullptr) {
-		std::memset(mins, 0, sizeof(vec3_t));
-	}
-	if (maxs != nullptr) {
-		std::memset(maxs, 0, sizeof(vec3_t));
+	if (mins != nullptr) std::memset(mins, 0, sizeof(vec3_t));
+	if (maxs != nullptr) std::memset(maxs, 0, sizeof(vec3_t));
+	const auto found = g_md3ModelByHandle.find(model);
+	if (found == g_md3ModelByHandle.end() || found->second >= g_md3Models.size()) return;
+	const VRHI_MD3Model &data = g_md3Models[found->second];
+	if (!data.valid || data.frameMins.empty() || mins == nullptr || maxs == nullptr) return;
+	for (int i = 0; i < 3; ++i) {
+		mins[i] = data.frameMins[0][i];
+		maxs[i] = data.frameMaxs[0][i];
 	}
 }
 static void VRHI_RegisterFont(const char *fontName, int pointSize,
