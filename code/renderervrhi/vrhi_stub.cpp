@@ -295,10 +295,12 @@ static void VRHI_FillConfig(glconfig_t *config) {
 static void VRHI_BeginRegistration(glconfig_t *config) {
 	int requestedWidth;
 	int requestedHeight;
+	if (!VRHI_EnsureSDLVideo()) {
+		return;
+	}
 	VRHI_GetRequestedResolution(&requestedWidth, &requestedHeight);
 
-	if (!VRHI_EnsureSDLVideo() ||
-		!VRHI_CreateWindow(requestedWidth, requestedHeight) ||
+	if (!VRHI_CreateWindow(requestedWidth, requestedHeight) ||
 		!VRHI_UpdateWindowSize(requestedWidth, requestedHeight, true) ||
 		!VRHI_GetWindowHandle()) {
 		return;
