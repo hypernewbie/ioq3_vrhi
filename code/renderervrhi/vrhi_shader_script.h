@@ -110,6 +110,28 @@ input buffer, so no FS storage can be referenced after FS_FreeFile.
 // slice, and the statement never borrows tokens past the stage end. The
 // conservative first-stage helper still treats `tcMod` as unsupported and
 // rejects such shaders.
+//
+// The bounded stage-local `tcMod scroll` slice extends the same simple
+// multi-stage parser with exactly the Quake3 time-based `tcMod scroll s t`
+// statement: both components must be finite and |value| <= the defined safe
+// magnitude bound (VRHI_SCRIPT_TCMOD_SCROLL_MAX below); zero is accepted
+// because a zero rate is the identity no-scroll case and the default. The
+// parsed rates are carried through the world, inline-BSP, and scene
+// shader-cache/draw paths, and the textured material pixel shaders receive
+// the current refdef/render time in seconds so they scroll the diffuse
+// (material) UVs by rate * time after the static tcMod scale is applied
+// (scale then time scroll), wrapping the offset into [0,1) exactly like the
+// GL1 renderer's RB_CalcScrollTexCoords. World and scene draws share one
+// per-frame time value and the scroll uniform is bound only to the textured
+// diffuse/overlay material programs, never to the solid/lightmap fallbacks.
+// It is applied ONLY to the diffuse/material sample; lightmap UVs, UI
+// textures, vertex colour, blend classification, const generators, depth,
+// and alpha testing are never modified. Every other tcMod variant (rotate,
+// turb, stretch, ...) and every malformed, truncated, non-finite, or
+// out-of-range scroll keeps the existing fallback: the stage stays accepted
+// and samples with no scroll exactly as before this slice, and the statement
+// never borrows tokens past the stage end. The conservative first-stage
+// helper still treats `tcMod` as unsupported and rejects such shaders.
 ===========================================================================
 */
 #ifndef __VRHI_SHADER_SCRIPT_H
@@ -201,6 +223,23 @@ struct VRHI_ShaderStage {
 	bool tcModScale = false;
 	float tcModScaleS = 1.0f;
 	float tcModScaleT = 1.0f;
+	// Bounded stage-local time-based `tcMod scroll s t`: true only when the
+	// stage's tcMod statement used the Quake3 `scroll` variant with two
+	// finite, safely bounded components (|value| <=
+	// VRHI_SCRIPT_TCMOD_SCROLL_MAX; zero is accepted as the identity
+	// no-scroll rate and is the default). The rates are carried into the
+	// world/scene draw state and the textured material pixel shaders scroll
+	// the diffuse (material) UVs by rate * frameTimeSeconds after the static
+	// tcMod scale is applied (scale then time scroll); lightmap UVs, UI
+	// textures, vertex colour, blend modes, const generators, depth, and
+	// alpha testing are never modified. Stages without the keyword (or with
+	// any other tcMod variant such as rotate, turb, or stretch) keep the
+	// zero-scroll fallback exactly as before. A stage may carry both
+	// tcModScale and tcModScroll; the shader applies the scale first, then
+	// the time scroll.
+	bool tcModScroll = false;
+	float tcModScrollS = 0.0f;
+	float tcModScrollT = 0.0f;
 };
 
 // Strict bounds, independent of the legacy qfiles.h limits so malformed or
@@ -229,6 +268,15 @@ static const float VRHI_SCRIPT_GENCONST_ALPHA_MAX = 1.0f;
 // while remaining numerically safe for the pixel-shader multiply.
 static const float VRHI_SCRIPT_TCMOD_SCALE_MIN = 1.0f / 64.0f;
 static const float VRHI_SCRIPT_TCMOD_SCALE_MAX = 64.0f;
+
+// Bounded `tcMod scroll` rate range. Each component must be finite and
+// |value| <= VRHI_SCRIPT_TCMOD_SCROLL_MAX; zero is accepted (a zero rate is
+// the identity no-scroll case and the default). The bound comfortably covers
+// every practical Quake3 scroll rate (commonly 0.01..2 for water/lava/light
+// sweeps) while keeping rate * frameTimeSeconds numerically safe for the
+// pixel-shader multiply and its [0,1) wrap, so extreme magnitudes can never
+// smear or explode the material sampling.
+static const float VRHI_SCRIPT_TCMOD_SCROLL_MAX = 16.0f;
 
 struct VRHI_ShaderScriptToken {
 	std::string text;
@@ -284,6 +332,25 @@ inline bool VRHI_ShaderParseTcModScale(const std::string &text, float *value) {
 	const float magnitude = std::fabs(parsed);
 	if (magnitude < VRHI_SCRIPT_TCMOD_SCALE_MIN ||
 		magnitude > VRHI_SCRIPT_TCMOD_SCALE_MAX) return false;
+	*value = parsed;
+	return true;
+}
+
+// Parses one token as a bounded `tcMod scroll` component: finite and
+// |value| <= VRHI_SCRIPT_TCMOD_SCROLL_MAX (zero is accepted: a zero rate is
+// the identity no-scroll case). Returns false for empty, non-numeric,
+// partially consumed (trailing junk), non-finite, or out-of-range tokens, so
+// the tcMod scroll slice accepts only exact in-range components and every
+// other value keeps the existing no-scroll fallback. Locale behaviour
+// mirrors the original renderer's atof-based ParseVector path.
+inline bool VRHI_ShaderParseTcModScroll(const std::string &text, float *value) {
+	if (value == nullptr || text.empty()) return false;
+	char *end = nullptr;
+	errno = 0;
+	const float parsed = std::strtof(text.c_str(), &end);
+	if (end == text.c_str() || *end != '\0' || errno == ERANGE ||
+		!std::isfinite(parsed)) return false;
+	if (std::fabs(parsed) > VRHI_SCRIPT_TCMOD_SCROLL_MAX) return false;
 	*value = parsed;
 	return true;
 }
@@ -753,13 +820,19 @@ inline bool VRHI_ParseSimpleShaderBlock(
 				continue;
 			}
 			if (keyword == "tcmod") {
-				// Bounded static `tcMod scale s t`: preserved only when the next
-				// token is the `scale` variant and both components are finite,
-				// nonzero, and inside the defined safe magnitude range. Every
-				// other tcMod variant (scroll, rotate, turb, stretch, ...) keeps
-				// the existing unsupported fallback: the keyword is consumed and
-				// its argument tokens remain bounded and ignored below, exactly
-				// as before this slice.
+				// Bounded static `tcMod scale s t` and time-based `tcMod scroll
+				// s t`: preserved only when the next token is the `scale` or
+				// `scroll` variant and both components are finite and inside the
+				// defined safe range (scale: nonzero, |value| in
+				// [VRHI_SCRIPT_TCMOD_SCALE_MIN, VRHI_SCRIPT_TCMOD_SCALE_MAX];
+				// scroll: |value| <= VRHI_SCRIPT_TCMOD_SCROLL_MAX, zero
+				// accepted as the identity no-scroll rate). Every other tcMod
+				// variant (rotate, turb, stretch, ...) keeps the existing
+				// unsupported fallback: the keyword is consumed and its
+				// argument tokens remain bounded and ignored below, exactly as
+				// before this slice. A stage may carry both a scale and a
+				// scroll; the pixel shader applies the scale first, then the
+				// time scroll.
 				if (j + 1 < stageEnd && VRHI_ShaderTokenIs(tokens[j + 1], "scale")) {
 					// A syntactically complete `tcMod scale s t` statement
 					// consumes exactly four tokens (keyword + "scale" + s + t)
@@ -789,7 +862,37 @@ inline bool VRHI_ParseSimpleShaderBlock(
 					j += 2;
 					continue;
 				}
-				// Non-scale tcMod (scroll/rotate/turb/stretch/...): keep the
+				if (j + 1 < stageEnd && VRHI_ShaderTokenIs(tokens[j + 1], "scroll")) {
+					// A syntactically complete `tcMod scroll s t` statement
+					// consumes exactly four tokens (keyword + "scroll" + s + t)
+					// so a following directive (map, blendFunc, ...) still
+					// parses normally. A complete but invalid/out-of-range
+					// statement (for example `tcMod scroll 1e30 2` or
+					// `tcMod scroll abc 2`) also consumes its whole declared
+					// argument count, so keyword-looking argument tokens cannot
+					// be re-parsed as stage directives; the stage stays accepted
+					// with the zero-scroll fallback (the existing behavior).
+					if (j + 3 < stageEnd) {
+						float s = 0.0f;
+						float t = 0.0f;
+						if (VRHI_ShaderParseTcModScroll(tokens[j + 2].text, &s) &&
+							VRHI_ShaderParseTcModScroll(tokens[j + 3].text, &t)) {
+							stage.tcModScroll = true;
+							stage.tcModScrollS = s;
+							stage.tcModScrollT = t;
+						}
+						j += 4;
+						continue;
+					}
+					// Truncated `tcMod scroll` at the end of a stage: consume
+					// the keyword and the `scroll` marker (and any partial
+					// argument below via the generic fallthrough), keep the
+					// zero-scroll fallback, and never borrow tokens past the
+					// stage end.
+					j += 2;
+					continue;
+				}
+				// Non-scale/scroll tcMod (rotate/turb/stretch/...): keep the
 				// existing fallback by consuming just the keyword; the remaining
 				// argument tokens are bounded by stageEnd and ignored below.
 				j += 1;

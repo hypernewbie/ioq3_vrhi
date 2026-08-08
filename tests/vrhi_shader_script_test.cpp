@@ -21,7 +21,15 @@
 // components and carries the per-stage scale to the textured material UV
 // sampling; every other tcMod variant (scroll/rotate/turb/stretch) and every
 // malformed, truncated, zero, or out-of-range scale keeps the identity-UV
-// fallback with the stage still accepted.
+// fallback with the stage still accepted. The bounded stage-local `tcMod
+// scroll s t` slice accepts only finite, safely bounded (|value| <= 16)
+// rates (zero accepted as the identity no-scroll rate) and carries the
+// per-stage rates to the textured material UV sampling, where the pixel
+// shader combines them with the current refdef/render time in seconds after
+// the static scale (scale then time scroll); every other tcMod variant
+// (rotate/turb/stretch) and every malformed, truncated, non-finite, or
+// out-of-range rate keeps the zero-scroll fallback with the stage still
+// accepted.
 //
 // Build and run (any C++11-or-later compiler):
 //   clang++ -std=c++17 -O1 -Wall -Wextra -Werror tests/vrhi_shader_script_test.cpp -o vrhi_shader_script_test && ./vrhi_shader_script_test
@@ -1211,6 +1219,254 @@ void testStageTcModScale() {
 		"{ map textures/foo/bar.tga tcMod scale 2 2 }", nullptr), "");
 }
 
+void testStageTcModScroll() {
+	// Direct parser-helper bounds/token safety: VRHI_ShaderParseTcModScroll
+	// accepts finite in-range rates (zero included), rejects empty,
+	// non-numeric, trailing-junk, non-finite, and out-of-range tokens, and
+	// never writes through a null output pointer.
+	float value = 123.0f;
+	CHECK(VRHI_ShaderParseTcModScroll("0", &value));
+	CHECK(value == 0.0f);
+	CHECK(VRHI_ShaderParseTcModScroll("-16", &value));
+	CHECK(value == -16.0f);
+	CHECK(VRHI_ShaderParseTcModScroll("0.0625", &value));
+	CHECK(value > 0.062f && value < 0.063f);
+	CHECK(!VRHI_ShaderParseTcModScroll("", &value));
+	CHECK(!VRHI_ShaderParseTcModScroll("abc", &value));
+	CHECK(!VRHI_ShaderParseTcModScroll("0.5x", &value));
+	CHECK(!VRHI_ShaderParseTcModScroll("nan", &value));
+	CHECK(!VRHI_ShaderParseTcModScroll("inf", &value));
+	CHECK(!VRHI_ShaderParseTcModScroll("1e30", &value));
+	CHECK(!VRHI_ShaderParseTcModScroll("16.0001", &value));
+	CHECK(!VRHI_ShaderParseTcModScroll("-16.5", &value));
+	CHECK(!VRHI_ShaderParseTcModScroll("0.1", nullptr));
+
+	// Bounded time-based `tcMod scroll s t`: both components must be finite
+	// and |value| <= VRHI_SCRIPT_TCMOD_SCROLL_MAX (zero accepted as the
+	// identity no-scroll rate); the parsed rates are carried per stage for
+	// the textured material UV scroll, composed AFTER the static tcMod
+	// scale. Every other tcMod variant (rotate, turb, stretch, ...) and
+	// every malformed/truncated/non-finite/out-of-range rate keeps the
+	// existing fallback: the stage stays accepted and samples with no
+	// scroll exactly as before.
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	// Basic acceptance: fractional, mirrored (negative), boundary, and zero
+	// rates all parse; the magnitude bound is inclusive. Split across two
+	// scripts (the parser caps every shader at four stages).
+	const std::string accepted = script(
+		"{ map textures/base.tga tcMod scroll 0.1 0.2 }\n"
+		"{ map textures/a.png blendFunc blend tcMod scroll -2 -3 }\n"
+		"{ map textures/b.png blendFunc blend tcMod scroll 16 -16 }\n"
+		"{ map textures/c.png blendFunc blend tcMod scroll 0 0 }");
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(accepted), accepted.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 4u);
+		if (stages.size() == 4) {
+			CHECK(stages[0].tcModScroll);
+			CHECK(stages[0].tcModScrollS > 0.09f && stages[0].tcModScrollS < 0.11f);
+			CHECK(stages[0].tcModScrollT > 0.19f && stages[0].tcModScrollT < 0.21f);
+			CHECK(stages[1].tcModScroll);
+			CHECK(stages[1].tcModScrollS < -1.99f && stages[1].tcModScrollS > -2.01f);
+			CHECK(stages[1].tcModScrollT < -2.99f && stages[1].tcModScrollT > -3.01f);
+			CHECK(stages[2].tcModScroll);
+			CHECK(stages[2].tcModScrollS == 16.0f);
+			CHECK(stages[2].tcModScrollT == -16.0f);
+			// A zero rate is accepted as the identity no-scroll case.
+			CHECK(stages[3].tcModScroll);
+			CHECK(stages[3].tcModScrollS == 0.0f);
+			CHECK(stages[3].tcModScrollT == 0.0f);
+		}
+	}
+	// Stage locality: each stage keeps its own rates, and stages without
+	// the keyword keep no scroll (flag false, rates 0).
+	const std::string locality = script(
+		"{ map textures/base.tga tcMod scroll 0.5 0.25 }\n"
+		"{ map textures/a.png blendFunc blend }\n"
+		"{ map textures/b.png blendFunc blend tcMod scroll 1 2 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(locality), locality.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			CHECK(stages[0].tcModScroll);
+			CHECK(stages[0].tcModScrollS > 0.49f && stages[0].tcModScrollS < 0.51f);
+			CHECK(!stages[1].tcModScroll);
+			CHECK(stages[1].tcModScrollS == 0.0f);
+			CHECK(stages[1].tcModScrollT == 0.0f);
+			CHECK(stages[2].tcModScroll);
+			CHECK(stages[2].tcModScrollT > 1.99f && stages[2].tcModScrollT < 2.01f);
+		}
+	}
+	// The scroll statement consumes exactly four tokens, so a following
+	// directive still parses, and the scroll composes with the static scale
+	// (scale then time scroll) plus every other bounded stage slice without
+	// changing any of them.
+	const std::string composed = script(
+		"{ clampmap textures/clamped.tga tcMod scale 2 3 tcMod scroll 0.5 0.25 blendFunc blend depthWrite alphaFunc GE128 rgbGen const 0.5 0.5 0.5 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(composed), composed.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(stages[0].tcModScroll);
+			CHECK(stages[0].tcModScrollS > 0.49f && stages[0].tcModScrollS < 0.51f);
+			CHECK(stages[0].tcModScrollT > 0.24f && stages[0].tcModScrollT < 0.26f);
+			CHECK(stages[0].tcModScale);
+			CHECK(stages[0].tcModScaleS > 1.99f && stages[0].tcModScaleS < 2.01f);
+			CHECK(stages[0].clampMap);
+			CHECK_EQ_INT(stages[0].blendMode, VRHI_SHADER_BLEND_ALPHA);
+			CHECK(stages[0].depthWrite);
+			CHECK_EQ_INT(stages[0].alphaFunc, VRHI_SHADER_ALPHAFUNC_GE128);
+			CHECK(stages[0].rgbGenConst);
+		}
+	}
+	// Keyword matching is case-insensitive, like every other directive.
+	const std::string upper = script(
+		"{ map textures/base.tga TCMOD SCROLL 0.1 0.1 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(upper), upper.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) CHECK(stages[0].tcModScroll);
+	}
+	// Statement order is independent: a scroll declared before the map still
+	// parses and consumes exactly its own tokens.
+	const std::string scrollFirst = script(
+		"{ tcMod scroll 0.5 0.5 map textures/base.tga }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(scrollFirst), scrollFirst.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(stages[0].tcModScroll);
+			CHECK(stages[0].tcModScrollS > 0.49f && stages[0].tcModScrollS < 0.51f);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+		}
+	}
+	// Fallbacks: out-of-range, non-numeric, trailing-junk, and truncated
+	// rates keep the stage accepted with no scroll (flag false, rates 0)
+	// instead of rejecting the material.
+	const std::string fallbacks = script(
+		"{ map textures/base.tga tcMod scroll 1e30 0.1 }\n"
+		"{ map textures/a.png blendFunc blend tcMod scroll 100 -100 }\n"
+		"{ map textures/b.png blendFunc blend tcMod scroll abc def }\n"
+		"{ map textures/c.png blendFunc blend tcMod scroll 0.1 2x }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(fallbacks), fallbacks.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 4u);
+		if (stages.size() == 4) {
+			for (std::size_t i = 0; i < stages.size(); ++i) {
+				CHECK(!stages[i].tcModScroll);
+				CHECK(stages[i].tcModScrollS == 0.0f);
+				CHECK(stages[i].tcModScrollT == 0.0f);
+			}
+		}
+	}
+	// Truncated `tcMod scroll` statements at the end of a stage keep the
+	// fallback (no scroll) and never borrow tokens past the stage end.
+	const std::string truncated = script("{ map textures/base.tga tcMod scroll 0.1 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncated), truncated.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(!stages[0].tcModScroll);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+		}
+	}
+	const std::string truncatedMarker = script("{ map textures/base.tga tcMod scroll }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncatedMarker), truncatedMarker.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) CHECK(!stages[0].tcModScroll);
+	}
+	// A syntactically complete scroll statement with invalid/out-of-range
+	// rates consumes its whole declared argument count, so keyword-looking
+	// argument tokens (for example `tcMod scroll 0.1 map`) cannot be
+	// re-parsed as stage directives: the stage stays accepted with no
+	// scroll.
+	const std::string keywordValues = script(
+		"{ map textures/base.tga tcMod scroll 0.1 map }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(keywordValues), keywordValues.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(!stages[0].tcModScroll);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+		}
+	}
+	// Unsupported tcMod variants keep the existing fallback: the stage stays
+	// accepted with no scroll, exactly as before this slice.
+	const std::string unsupported = script(
+		"{ map textures/base.tga tcMod rotate 90 }\n"
+		"{ map textures/a.png blendFunc blend tcMod turb 0 1 1 0.5 0.5 }\n"
+		"{ map textures/b.png blendFunc blend tcMod stretch sin 0 1 0.5 0.5 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(unsupported), unsupported.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			for (std::size_t i = 0; i < stages.size(); ++i) {
+				CHECK(!stages[i].tcModScroll);
+				CHECK(stages[i].tcModScrollS == 0.0f);
+				CHECK(stages[i].tcModScrollT == 0.0f);
+			}
+		}
+	}
+	// A dynamic tcMod followed by a static scroll keeps the scroll slice
+	// intact (rotate falls back, the scroll is preserved), and a scroll
+	// plus a scale compose (scale then time scroll).
+	const std::string mixed = script(
+		"{ map textures/base.tga tcMod rotate 90 tcMod scroll 0.1 0.2 }\n"
+		"{ map textures/a.png blendFunc blend tcMod scroll 0.5 0.5 tcMod scale 2 2 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(mixed), mixed.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 2u);
+		if (stages.size() == 2) {
+			CHECK(stages[0].tcModScroll);
+			CHECK(stages[0].tcModScrollS > 0.09f && stages[0].tcModScrollS < 0.11f);
+			CHECK(!stages[0].tcModScale);
+			CHECK(stages[1].tcModScroll);
+			CHECK(stages[1].tcModScrollT > 0.49f && stages[1].tcModScrollT < 0.51f);
+			CHECK(stages[1].tcModScale);
+			CHECK(stages[1].tcModScaleS > 1.99f && stages[1].tcModScaleS < 2.01f);
+		}
+	}
+	// The conservative first-stage opaque helper still rejects tcMod: only
+	// identity matches the fixed opaque diffuse pass, so a tcMod scroll
+	// shader keeps its existing fallback there.
+	CHECK_EQ_STR(candidateBody(
+		"{ map textures/foo/bar.tga tcMod scroll 0.1 0.1 }", nullptr), "");
+}
+
 void testConsoleScriptResolution() {
 	// OpenArena defines the in-game console background as a script shader
 	// (scripts/oanew.shader): `console { { map textures/sfx/logo256.tga } }`.
@@ -1283,6 +1539,7 @@ int main() {
 	testStageAlphaFunc();
 	testStageClampMap();
 	testStageTcModScale();
+	testStageTcModScroll();
 	testConsoleScriptResolution();
 	testPathSafetyHelpers();
 
