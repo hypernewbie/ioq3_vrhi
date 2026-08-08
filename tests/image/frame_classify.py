@@ -54,6 +54,36 @@ VRHI_CLEAR_COLOR_RGB8 = (9, 14, 22)
 # a renderer-owned placeholder, not acceptable material output.
 VRHI_SOLID_FALLBACK_RGB8 = (61, 107, 56)
 
+# In-game console scene geometry (ioq3 cl_console.c Con_DrawSolidConsole):
+# ``toggleconsole`` sets KEYCATCH_CONSOLE, Con_RunConsole ramps
+# con.displayFrac to 0.5 (half screen) at scr_conspeed, and
+# Con_DrawSolidConsole draws the console background pic over the top
+# ``frac * SCREEN_HEIGHT`` rows, then a 2-pixel red separator line
+# (SCR_FillRect with color (1,0,0,1)) at ``frac * SCREEN_HEIGHT``, then the
+# scrollback text above it. The OpenArena 'console' shader
+# (scripts/oanew.shader: ``console { { map textures/sfx/logo256.tga } }``)
+# resolves through the script-stage table; when the alias falls back, the
+# background becomes the renderer's solid placeholder rectangle
+# (VRHI_SOLID_FALLBACK_RGB8).
+CONSOLE_FRAC = 0.5
+# Console background region inspected for texture content: top rows below the
+# separator line (excludes the red line, the version string, and the world
+# rendered below the console).
+CONSOLE_REGION_FRAC = 0.45
+# The pinned OpenArena console background logo256.tga (512x256, stretched
+# over the top half) has 22 unique colors with a dominant dark red (93,23,23)
+# at ~91%. A solid-rectangle fallback leaves only the fill color plus a
+# handful of console-text colors (~10 or fewer), so a 16-color floor cleanly
+# separates a real texture from any flat fallback fill.
+CONSOLE_MIN_REGION_UNIQUE_COLORS = 16
+# A solid-rectangle fallback covers the console region with the renderer
+# sentinel (VRHI_SOLID_FALLBACK_RGB8); the real logo texture has none of it.
+CONSOLE_MAX_SOLID_FALLBACK_FRACTION = 0.5
+# The 2-pixel red separator line must span most of the width; this is the
+# machine-readable proof that the console was open (and fully ramped) when
+# the capture was taken.
+CONSOLE_MIN_RED_RUN_FRACTION = 0.4
+
 
 def count_exact_color(rgb: bytes, color: tuple[int, int, int]) -> int:
     """Count exact RGB8 pixels without image-library dependencies."""
@@ -96,6 +126,163 @@ def largest_exact_color_component(
                 pending.append(neighbor)
         largest = max(largest, component)
     return largest
+
+
+def _is_red_pixel(rgb: bytes, offset: int) -> bool:
+    """Loose red predicate for the console separator line pixels."""
+    return rgb[offset] >= 180 and rgb[offset + 1] <= 90 and rgb[offset + 2] <= 90
+
+
+def _longest_horizontal_red_run(rgb: bytes, row: int, width: int) -> int:
+    """Longest contiguous run of red pixels along one row."""
+    best = 0
+    run = 0
+    for x in range(width):
+        offset = (row * width + x) * 3
+        if _is_red_pixel(rgb, offset):
+            run += 1
+            if run > best:
+                best = run
+        else:
+            run = 0
+    return best
+
+
+def console_region_metrics(
+    rgb: bytes,
+    width: int,
+    height: int,
+    *,
+    console_frac: float = CONSOLE_FRAC,
+    region_frac: float = CONSOLE_REGION_FRAC,
+) -> dict[str, object]:
+    """Measure the console region of a normalized top-left RGB8 frame.
+
+    The console region is the top ``region_frac`` of the frame (the console
+    background pic area below the separator line); the boundary scan looks
+    for the red separator line in the rows around ``console_frac * height``.
+    Raises ValueError for malformed dimensions.
+    """
+    if width <= 0 or height <= 0 or len(rgb) != width * height * 3:
+        raise ValueError("RGB8 bytes do not match positive frame dimensions")
+    region_rows = max(0, int(region_frac * height))
+    counts: dict[tuple[int, int, int], int] = {}
+    sentinel = 0
+    for offset in range(0, region_rows * width * 3, 3):
+        pixel = (rgb[offset], rgb[offset + 1], rgb[offset + 2])
+        counts[pixel] = counts.get(pixel, 0) + 1
+        if pixel == VRHI_SOLID_FALLBACK_RGB8:
+            sentinel += 1
+    region_pixels = region_rows * width
+    modal_color: tuple[int, int, int] | None = None
+    modal_count = 0
+    if counts:
+        modal_color = max(counts, key=counts.__getitem__)
+        modal_count = counts[modal_color]
+    boundary_row = int(console_frac * height)
+    best_run = 0
+    # The separator line is drawn at rows boundary_row..boundary_row+1;
+    # scan one row either side for rasterization tolerance. Rows below the
+    # console (world content) are deliberately excluded so world red pixels
+    # cannot masquerade as the separator.
+    for row in range(max(0, boundary_row - 1), min(height, boundary_row + 2)):
+        best_run = max(best_run, _longest_horizontal_red_run(rgb, row, width))
+    return {
+        "console_frac": console_frac,
+        "region_rows": region_rows,
+        "region_pixels": region_pixels,
+        "region_unique_colors": len(counts),
+        "region_modal_color": list(modal_color) if modal_color else None,
+        "region_modal_fraction": (
+            round(modal_count / region_pixels, 9) if region_pixels else 0.0
+        ),
+        "region_solid_fallback_pixels": sentinel,
+        "region_solid_fallback_fraction": (
+            round(sentinel / region_pixels, 9) if region_pixels else 0.0
+        ),
+        "boundary_row": boundary_row,
+        "boundary_red_run_pixels": best_run,
+        "boundary_red_run_fraction": round(best_run / width, 9) if width else 0.0,
+    }
+
+
+def check_console_open_invariants(
+    rgb: bytes,
+    width: int,
+    height: int,
+    **kwargs: float,
+) -> dict[str, object]:
+    """Machine-check that a capture shows the standard in-game console open.
+
+    Three console-specific invariants, each stronger than a whole-frame
+    'image is content' classification:
+
+    - ``console_boundary_line``: a red separator run spanning at least
+      CONSOLE_MIN_RED_RUN_FRACTION of the width at the console boundary. This
+      is the proof the console was actually open (and fully ramped) when the
+      capture was taken; a closed console has no such line.
+    - ``console_background_textured``: the console region holds at least
+      CONSOLE_MIN_REGION_UNIQUE_COLORS distinct colors. The pinned OpenArena
+      background logo256.tga has 22; a solid-rectangle fallback of any color
+      leaves only the fill plus a few console-text colors.
+    - ``console_background_not_solid_fallback``: the renderer solid placeholder
+      (VRHI_SOLID_FALLBACK_RGB8) covers at most
+      CONSOLE_MAX_SOLID_FALLBACK_FRACTION of the console region. This directly
+      encodes "the console script alias did not fall back to a solid
+      rectangle" and is scoped to the console region, not the whole frame.
+
+    Returns ``{"pass": bool, "checks": [...], "metrics": {...}}``.
+    """
+    metrics = console_region_metrics(rgb, width, height, **kwargs)
+    red_run = metrics["boundary_red_run_fraction"]
+    unique = metrics["region_unique_colors"]
+    sentinel = metrics["region_solid_fallback_fraction"]
+    checks = [
+        {
+            "name": "console_boundary_line",
+            "pass": red_run >= CONSOLE_MIN_RED_RUN_FRACTION,
+            "metric": "boundary_red_run_fraction",
+            "value": red_run,
+            "threshold": CONSOLE_MIN_RED_RUN_FRACTION,
+            "reason": (
+                f"red separator run is {red_run:.3f} of the width "
+                f"(need >= {CONSOLE_MIN_RED_RUN_FRACTION:.1f}); the console "
+                "must be open and fully ramped at capture time"
+            ),
+        },
+        {
+            "name": "console_background_textured",
+            "pass": unique >= CONSOLE_MIN_REGION_UNIQUE_COLORS,
+            "metric": "region_unique_colors",
+            "value": unique,
+            "threshold": CONSOLE_MIN_REGION_UNIQUE_COLORS,
+            "reason": (
+                f"console region has {unique} unique colors "
+                f"(need >= {CONSOLE_MIN_REGION_UNIQUE_COLORS}); a "
+                "solid-rectangle console alias fallback leaves only the fill "
+                "color plus a few text colors"
+            ),
+        },
+        {
+            "name": "console_background_not_solid_fallback",
+            "pass": sentinel <= CONSOLE_MAX_SOLID_FALLBACK_FRACTION,
+            "metric": "region_solid_fallback_fraction",
+            "value": sentinel,
+            "threshold": CONSOLE_MAX_SOLID_FALLBACK_FRACTION,
+            "reason": (
+                f"console region is {sentinel:.3f} renderer solid-fallback "
+                f"color (need <= {CONSOLE_MAX_SOLID_FALLBACK_FRACTION:.1f}); "
+                "the console background must not be the solid placeholder "
+                "rectangle"
+            ),
+        },
+    ]
+    return {
+        "pass": all(check["pass"] for check in checks),
+        "checks": checks,
+        "metrics": metrics,
+    }
+
 
 # Noise envelope: pixels closer than this (per channel) to the dominant color
 # are considered part of the clear; larger deviations count as drawn content.

@@ -9,12 +9,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from frame_classify import (  # noqa: E402
     CLASS_CLEAR_ONLY,
     CLASS_CONTENT,
+    CONSOLE_REGION_FRAC,
     VRHI_CLEAR_COLOR_RGB8,
+    VRHI_SOLID_FALLBACK_RGB8,
 )
 from run_image_tests import (  # noqa: E402
     BASE_CVARS,
     Scene,
+    apply_console_gate,
     apply_frame_classification,
+    apply_scene_gates,
     apply_vrhi_fallback_gate,
     assess_repeatability,
     build_command,
@@ -22,6 +26,10 @@ from run_image_tests import (  # noqa: E402
     load_scenes,
     public_result,
     select_scenes,
+)
+from test_frame_classify import (  # noqa: E402
+    console_open_frame,
+    logo_console_region,
 )
 
 
@@ -214,10 +222,61 @@ class RunnerConfigTests(unittest.TestCase):
         scenes = load_scenes()
         map_scenes = [scene for scene in scenes if scene.source == "map"]
         self.assertTrue(map_scenes)
-        self.assertTrue(all(scene.comparison == "capture" for scene in map_scenes))
+        plain_maps = [scene for scene in map_scenes if not scene.open_console]
+        console_maps = [scene for scene in map_scenes if scene.open_console]
+        self.assertTrue(plain_maps)
+        self.assertTrue(all(scene.comparison == "capture" for scene in plain_maps))
+        # The console regression scene opts into the console policy and
+        # explicitly opens the in-game console.
+        self.assertTrue(console_maps)
+        self.assertTrue(
+            all(
+                scene.comparison == "console" and scene.open_console
+                for scene in console_maps
+            )
+        )
         demo_scenes = [scene for scene in scenes if scene.source == "demo"]
         self.assertTrue(demo_scenes)
         self.assertTrue(all(scene.comparison == "exact" for scene in demo_scenes))
+
+    def test_console_policy_and_open_console_flag_are_valid(self) -> None:
+        scene = Scene(
+            name="unit-console",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-console",
+            comparison="console",
+            open_console=True,
+        )
+        self.assertTrue(scene.open_console)
+        self.assertEqual(scene.as_dict()["open_console"], True)
+
+    def test_console_scene_action_opens_console_before_capture(self) -> None:
+        scene = Scene(
+            name="unit-console",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-console",
+            comparison="console",
+            open_console=True,
+            waits=4,
+        )
+        command = build_command(Path("ioquake3.exe"), Path("home"), "vrhi", scene)
+        action = command[command.index("activeAction") + 1]
+        self.assertTrue(action.startswith("toggleconsole;"))
+        self.assertIn("screenshot unit-console; wait; wait; quit", action)
+
+        closed = Scene(
+            name="unit-map",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-map",
+            comparison="capture",
+        )
+        other = build_command(Path("ioquake3.exe"), Path("home"), "vrhi", closed)
+        self.assertNotIn(
+            "toggleconsole", other[other.index("activeAction") + 1]
+        )
 
 
 class ClassificationPolicyTests(unittest.TestCase):
@@ -414,6 +473,164 @@ class ClassificationPolicyTests(unittest.TestCase):
         wrong = classified_result(uniform_frame(8, 8, (61, 107, 56)), 8, 8, scene)
         self.assertEqual(wrong["frame_class"], "uniform_other")
         self.assertFalse(assess_repeatability(scene, [wrong, wrong], 2)[0])
+
+    def test_console_policy_requires_open_console_invariants(self) -> None:
+        scene = Scene(
+            name="unit-console",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-console",
+            comparison="console",
+        )
+        passed = {"pass": True, "checks": []}
+        failed = {"pass": False, "checks": []}
+        self.assertTrue(
+            assess_repeatability(
+                scene, [{"console_invariants": passed}], 1
+            )[0]
+        )
+        self.assertFalse(
+            assess_repeatability(
+                scene, [{"console_invariants": failed}], 1
+            )[0]
+        )
+        self.assertFalse(
+            assess_repeatability(scene, [{"error": "boom"}], 1)[0]
+        )
+
+    def test_apply_console_gate_publishes_metrics_and_passes_texture(self) -> None:
+        rows = int(CONSOLE_REGION_FRAC * 480)
+        frame = console_open_frame(
+            640,
+            480,
+            logo_console_region(640, rows),
+            world_color=(61, 107, 56),
+        )
+        result: dict[str, object] = {
+            "width": 640,
+            "height": 480,
+            "_normalized_rgb": frame,
+        }
+        apply_console_gate(result)
+        self.assertNotIn("error", result)
+        self.assertTrue(result["console_invariants"]["pass"])
+        self.assertEqual(result["console_metrics"]["boundary_row"], 240)
+
+    def test_apply_console_gate_fails_solid_fallback_rectangle(self) -> None:
+        rows = int(CONSOLE_REGION_FRAC * 480)
+        background = bytes((61, 107, 56)) * (640 * rows)
+        frame = console_open_frame(
+            640, 480, background, world_color=VRHI_CLEAR_COLOR_RGB8
+        )
+        result: dict[str, object] = {
+            "width": 640,
+            "height": 480,
+            "_normalized_rgb": frame,
+        }
+        apply_console_gate(result)
+        self.assertIn("error", result)
+        self.assertIn("console-open invariants failed", str(result["error"]))
+        self.assertIn(
+            "console_background_textured", str(result["error"])
+        )
+        self.assertIn(
+            "console_background_not_solid_fallback", str(result["error"])
+        )
+
+    def test_apply_console_gate_skips_failed_runs(self) -> None:
+        result: dict[str, object] = {"error": "engine exited with 1"}
+        apply_console_gate(result)
+        self.assertNotIn("console_invariants", result)
+
+    def _closed_console_frame(self) -> bytes:
+        # A capture with the console closed: no separator line at the console
+        # boundary, no textured console region. If the console gate ran on
+        # this frame it would fail console_boundary_line and
+        # console_background_textured (see test_closed_console_fails_*).
+        rows = int(CONSOLE_REGION_FRAC * 480)
+        background = bytes(VRHI_CLEAR_COLOR_RGB8) * (640 * rows)
+        return console_open_frame(
+            640,
+            480,
+            background,
+            world_color=VRHI_CLEAR_COLOR_RGB8,
+            boundary_row=0,
+        )
+
+    def test_scene_gates_skip_console_checks_for_ordinary_scenes(self) -> None:
+        # Regression: run_one invoked apply_console_gate unconditionally, so
+        # every ordinary non-console scene failed its open-console invariants.
+        # A frame that would fail the console checks must not gain a console
+        # error (or any console keys) for capture/content scenes.
+        for comparison in ("capture", "content"):
+            scene = Scene(
+                name=f"unit-{comparison}",
+                source="map",
+                target="oa_dm1",
+                screenshot=f"unit-{comparison}",
+                comparison=comparison,
+            )
+            result: dict[str, object] = {
+                "width": 640,
+                "height": 480,
+                "_normalized_rgb": self._closed_console_frame(),
+            }
+            apply_scene_gates(result, scene, "vrhi")
+            self.assertNotIn("error", result)
+            self.assertNotIn("console_invariants", result)
+            self.assertNotIn("console_metrics", result)
+            # The other gates still ran: the frame is classified and VRHI
+            # metrics are published.
+            self.assertEqual(result["frame_class"], CLASS_CONTENT)
+            self.assertIn("vrhi_solid_fallback_fraction", result)
+
+    def test_scene_gates_console_scene_gets_console_metrics(self) -> None:
+        rows = int(CONSOLE_REGION_FRAC * 480)
+        frame = console_open_frame(
+            640,
+            480,
+            logo_console_region(640, rows),
+            world_color=VRHI_CLEAR_COLOR_RGB8,
+        )
+        scene = Scene(
+            name="unit-console",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-console",
+            comparison="console",
+        )
+        result: dict[str, object] = {
+            "width": 640,
+            "height": 480,
+            "_normalized_rgb": frame,
+        }
+        apply_scene_gates(result, scene, "vrhi")
+        self.assertNotIn("error", result)
+        self.assertTrue(result["console_invariants"]["pass"])
+        self.assertEqual(result["console_metrics"]["boundary_row"], 240)
+
+    def test_scene_gates_console_scene_fails_solid_fallback(self) -> None:
+        rows = int(CONSOLE_REGION_FRAC * 480)
+        background = bytes(VRHI_SOLID_FALLBACK_RGB8) * (640 * rows)
+        frame = console_open_frame(
+            640, 480, background, world_color=VRHI_CLEAR_COLOR_RGB8
+        )
+        scene = Scene(
+            name="unit-console",
+            source="map",
+            target="oa_dm1",
+            screenshot="unit-console",
+            comparison="console",
+        )
+        result: dict[str, object] = {
+            "width": 640,
+            "height": 480,
+            "_normalized_rgb": frame,
+        }
+        apply_scene_gates(result, scene, "vrhi")
+        self.assertIn("error", result)
+        self.assertIn("console-open invariants failed", str(result["error"]))
+        self.assertFalse(result["console_invariants"]["pass"])
 
     def test_classification_policies_fail_on_errored_results(self) -> None:
         scene = Scene(

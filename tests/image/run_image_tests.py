@@ -31,6 +31,7 @@ try:
         CLASS_CONTENT,
         VRHI_CLEAR_COLOR_RGB8,
         VRHI_SOLID_FALLBACK_RGB8,
+        check_console_open_invariants,
         classify_frame,
         count_exact_color,
         largest_exact_color_component,
@@ -42,6 +43,7 @@ except ImportError:  # pragma: no cover - module import fallback
         CLASS_CONTENT,
         VRHI_CLEAR_COLOR_RGB8,
         VRHI_SOLID_FALLBACK_RGB8,
+        check_console_open_invariants,
         classify_frame,
         count_exact_color,
         largest_exact_color_component,
@@ -106,6 +108,7 @@ class Scene:
     viewpos: str | None = None
     cvars: dict[str, str] = field(default_factory=dict)
     expected_clear_color: str | None = None
+    open_console: bool = False
 
     def __post_init__(self) -> None:
         for label, value in (("scene", self.name), ("screenshot", self.screenshot)):
@@ -119,6 +122,7 @@ class Scene:
             "capture",
             "content",
             "clear_only",
+            "console",
         }:
             raise ValueError(f"unsupported comparison policy: {self.comparison!r}")
         if not self.target or "/" in self.target or "\\" in self.target:
@@ -150,6 +154,7 @@ class Scene:
             "viewpos": self.viewpos,
             "cvars": self.cvars,
             "expected_clear_color": self.expected_clear_color,
+            "open_console": self.open_console,
         }
 
 
@@ -183,6 +188,7 @@ def load_scenes(path: Path = DEFAULT_MANIFEST) -> list[Scene]:
                 if item.get("expected_clear_color") is not None
                 else None
             ),
+            open_console=item.get("open_console", False) is True,
         )
         if scene.name in names:
             raise ValueError(f"duplicate scene name in {path}: {scene.name}")
@@ -339,6 +345,12 @@ def build_command(engine: Path, home: Path, renderer: str, scene: Scene) -> list
         command.extend(("+set", key, value))
 
     actions = []
+    if scene.open_console:
+        # Open the standard in-game console (Con_ToggleConsole_f) before the
+        # waits so con.displayFrac ramps to its 0.5 half-screen target before
+        # the capture; the scene's console comparison policy then machine-
+        # checks the console-specific invariants on the captured frame.
+        actions.append("toggleconsole")
     if scene.viewpos is not None:
         actions.append(f"setviewpos {scene.viewpos}")
     actions.extend("wait" for _ in range(scene.waits))
@@ -419,6 +431,55 @@ def apply_vrhi_fallback_gate(
             f"largest contiguous region={largest_component} pixels "
             f"(total {fallback_pixels}/{pixel_count}, {fallback_fraction:.3%})"
         )
+
+
+def apply_console_gate(result: dict[str, object]) -> None:
+    """Publish console-open metrics and fail console-scene captures.
+
+    Runs the console-specific invariants from
+    ``check_console_open_invariants`` (boundary separator line, textured
+    console background, no solid-fallback rectangle in the console region)
+    and records the metrics plus a run error when any invariant fails.
+
+    Callers must only invoke this gate for ``console`` comparison scenes
+    (see ``apply_scene_gates``); ordinary scenes never open the console, so
+    their captures cannot satisfy the open-console invariants.
+    """
+    normalized = result.get("_normalized_rgb")
+    width = result.get("width")
+    height = result.get("height")
+    if (
+        not isinstance(normalized, bytes)
+        or not isinstance(width, int)
+        or not isinstance(height, int)
+    ):
+        return
+    invariants = check_console_open_invariants(normalized, width, height)
+    result["console_metrics"] = invariants["metrics"]
+    result["console_invariants"] = invariants
+    if not invariants["pass"]:
+        failed = ", ".join(
+            check["name"] for check in invariants["checks"] if not check["pass"]
+        )
+        result["error"] = f"console-open invariants failed: {failed}"
+
+
+def apply_scene_gates(
+    result: dict[str, object], scene: Scene, renderer: str
+) -> None:
+    """Apply the post-capture gates for one successful run.
+
+    Frame classification and the VRHI solid-fallback gate run for every
+    capture. The console-open gate is scoped to ``console`` comparison
+    scenes: ordinary content/capture/clear_only scenes never open the
+    in-game console, so judging their captures by the open-console
+    invariants would fail every normal scene. This is the exact gate
+    sequence ``run_one`` executes after a successful capture.
+    """
+    apply_frame_classification(result, scene)
+    apply_vrhi_fallback_gate(result, renderer)
+    if scene.comparison == "console":
+        apply_console_gate(result)
 
 
 def run_one(
@@ -521,8 +582,7 @@ def run_one(
             "_normalized_rgb": normalized,
         }
     )
-    apply_frame_classification(result, scene)
-    apply_vrhi_fallback_gate(result, renderer)
+    apply_scene_gates(result, scene, renderer)
     return result
 
 
@@ -576,6 +636,14 @@ def assess_repeatability(
 
     if scene.comparison == "capture":
         return True, []
+
+    if scene.comparison == "console":
+        invariants = [result.get("console_invariants") for result in results]
+        if any(
+            not isinstance(item, dict) or not item.get("pass") for item in invariants
+        ):
+            return False, invariants
+        return True, invariants
 
     if scene.comparison in (CLASS_CONTENT, CLASS_CLEAR_ONLY):
         classifications = [result.get("frame_classification") for result in results]

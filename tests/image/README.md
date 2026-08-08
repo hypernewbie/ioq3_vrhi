@@ -161,3 +161,32 @@ A flat-shaded world fill that covers the whole viewport classifies as
 `uniform_other`, which fails both gates by design: it is renderer output but
 not yet real world content, and it must never be mistaken for the expected
 clear.
+
+### Console-open regression scene (renderer_vrhi)
+
+`map-oa-dm1-console` opens the standard in-game console with `toggleconsole`
+before the capture and machine-checks console-specific invariants on the
+captured frame (see `check_console_open_invariants` in
+`frame_classify.py`). The scene sets `scr_conspeed 1000` so the console ramps
+immediately to its 0.5 half-screen target, and its `console` comparison
+policy requires every repeat to pass all three invariants:
+
+- `console_boundary_line` - a red separator run spanning at least 40% of the
+  width in the rows around the half-screen console boundary. This is the
+  machine-readable proof that the console was actually open (and fully
+  ramped) when the capture was taken.
+- `console_background_textured` - the console region (top 45% of the frame)
+  has at least 16 unique colors. The pinned OpenArena background
+  `textures/sfx/logo256.tga` (resolved through the `console` script alias in
+  `scripts/oanew.shader`) has 22; a solid-rectangle alias fallback of any
+  color leaves only the fill plus a few console-text colors.
+- `console_background_not_solid_fallback` - the renderer solid placeholder
+  color `(61, 107, 56)` covers at most half of the console region, directly
+  encoding "the `console` script alias did not fall back to a solid
+  rectangle", scoped to the console region rather than the whole frame.
+
+Every successful capture in a console scene carries `console_metrics` and
+`console_invariants` in its report entry; a failing invariant fails the run
+like any other capture error. This is a regression test for the console
+background path specifically, not just a generic "the image has content"
+classification.

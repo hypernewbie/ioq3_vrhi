@@ -109,6 +109,19 @@
       "tier": "stress",
       "description": "Static world startup on oa_thor.",
       "cvars": { "timedemo": "0" }
+    },
+    {
+      "name": "map-oa-dm1-console",
+      "source": "map",
+      "map": "oa_dm1",
+      "viewpos": "280 1416 -120 180",
+      "screenshot": "map-oa-dm1-console",
+      "tier": "extended",
+      "description": "Standard in-game console (toggleconsole) open over static world startup on oa_dm1; machine-checks console-specific invariants (separator line, textured background, no solid-rectangle alias fallback).",
+      "comparison": "console",
+      "waits": 12,
+      "cvars": { "timedemo": "0", "scr_conspeed": "1000" },
+      "open_console": true
     }
   ]
 }
