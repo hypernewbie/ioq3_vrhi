@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "name": "ioq3-benchmark-workloads-v1",
+  "description": "Immutable workload manifest for the API-neutral benchmark harness. This file is a pinned, read-only contract: the runner never modifies it, names must resolve against it, and any intended change requires a deliberate schema bump and review.",
+  "immutable": true,
+  "fields": {
+    "producer_seconds": true,
+    "finalize_seconds": true,
+    "gpu_seconds": false
+  },
+  "defaults": {
+    "warmup": 3,
+    "samples": 15,
+    "trials": 3,
+    "timeout_seconds": 120,
+    "order": "fixed",
+    "seed": 1
+  },
+  "backends": [
+    {
+      "name": "opengl2",
+      "description": "OpenGL 2 backend. JSONL timing instrumentation is not implemented in the engine yet.",
+      "args": ["+set", "cl_renderer", "opengl2"],
+      "jsonl_support": false
+    },
+    {
+      "name": "vrhi",
+      "description": "VRHI backend. JSONL timing instrumentation is not implemented in the engine yet.",
+      "args": ["+set", "cl_renderer", "vrhi"],
+      "jsonl_support": false
+    }
+  ],
+  "workloads": [
+    {
+      "name": "demo-frame",
+      "description": "Demo playback frame workload: plays the pinned OpenArena demo while the engine emits one JSONL timing line per benchmarked frame.",
+      "args": ["+demo", "demo088-test1"]
+    }
+  ]
+}
