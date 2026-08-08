@@ -77,6 +77,8 @@ static std::vector<glm::vec3> g_worldPositions;
 static std::vector<uint32_t> g_worldIndexes;
 static bool g_worldLoaded = false;
 static bool g_worldShaderInitialized = false;
+static int32_t g_worldDrawErrorBaseline = 0;
+static bool g_worldDrawSubmitted = false;
 static glm::vec4 g_uiColor(1.0f, 1.0f, 1.0f, 1.0f);
 static int g_frameViewportWidth = 0;
 static int g_frameViewportHeight = 0;
@@ -605,7 +607,7 @@ cbuffer WorldUniforms : register(b1, VRHI_STAGE_SPACE)
 };
 struct VSOutput { float4 position : SV_Position; };
 [shader("vertex")]
-VSOutput main(float3 position : ATTR0)
+VSOutput main(float3 position : POSITION)
 {
     VSOutput output;
     output.position = mul(u_worldViewProj, float4(position, 1.0));
@@ -1122,6 +1124,15 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 			"renderer_vrhi: vhFrame present/resize failed (%ux%u); "
 			"window may be minimized or resized\n", size.x, size.y);
 	}
+	if (g_worldDrawSubmitted) {
+		const int32_t errors = g_vhErrorCounter.load(std::memory_order_relaxed) -
+			g_worldDrawErrorBaseline;
+		if (errors > 0) {
+			VRHI_Printf(PRINT_WARNING,
+				"renderer_vrhi: world draw reported %d VRHI error(s)\n", errors);
+		}
+		g_worldDrawSubmitted = false;
+	}
 	// Never let a later EndFrame reuse a framebuffer from after present.
 	g_frameBackbufferReady = false;
 	g_frameBackbuffer = VRHI_INVALID_HANDLE;
@@ -1469,7 +1480,10 @@ static glm::mat4 VRHI_QuakeViewMatrix(const refdef_t *fd) {
 	flip[0] = glm::vec4(0.0f, 0.0f, -1.0f, 0.0f);
 	flip[1] = glm::vec4(-1.0f, 0.0f, 0.0f, 0.0f);
 	flip[2] = glm::vec4(0.0f, 1.0f, 0.0f, 0.0f);
-	return quakeView * flip;
+	// VRHI uses column-vector matrices.  The Quake camera basis first
+	// produces forward/right/up coordinates, then the coordinate conversion
+	// maps them to OpenGL-style right/up/-forward clip coordinates.
+	return flip * quakeView;
 }
 
 static glm::mat4 VRHI_QuakeProjection(const refdef_t *fd) {
@@ -1477,9 +1491,9 @@ static glm::mat4 VRHI_QuakeProjection(const refdef_t *fd) {
 	const float yScale = 1.0f / std::tan(fd->fov_y * 3.14159265358979323846f / 360.0f);
 	glm::mat4 projection(0.0f);
 	projection[0][0] = xScale;
-	// Vulkan's framebuffer origin is top-left; invert the Quake up axis in
-	// clip space while retaining the zero-to-one depth range.
-	projection[1][1] = -yScale;
+	// VKViewportWithDXCoords supplies a negative viewport height, so positive
+	// clip-space Y maps Quake up toward the top of the framebuffer.
+	projection[1][1] = yScale;
 	projection[2][2] = -VRHI_WORLD_FAR / (VRHI_WORLD_FAR - VRHI_WORLD_NEAR);
 	projection[3][2] = -VRHI_WORLD_FAR * VRHI_WORLD_NEAR /
 		(VRHI_WORLD_FAR - VRHI_WORLD_NEAR);
@@ -1505,6 +1519,8 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		.SetViewClear(VRHI_CLEAR_DEPTH, glm::vec4(0.0f), 1.0f)
 		.SetViewTransform(VRHI_QuakeViewMatrix(fd), VRHI_QuakeProjection(fd))
 		.SetWorldTransform(glm::mat4(1.0f))
+		.SetDebugFlags(VRHI_STATE_DEBUG_LOG_VATTRIB_MISMATCH |
+			VRHI_STATE_DEBUG_LOG_BINDING_MISMATCH)
 		.SetStateFlags(VRHI_STATE_WRITE_RGB | VRHI_STATE_WRITE_A | VRHI_STATE_WRITE_Z |
 			VRHI_STATE_DEPTH_TEST_ENABLE | VRHI_STATE_DEPTH_TEST_LESS |
 			VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES)
@@ -1512,9 +1528,15 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		.SetVertexBuffer(g_worldVertexBuffer, 0, 0, 0, static_cast<uint32_t>(g_worldPositions.size()))
 		.SetIndexBuffer(g_worldIndexBuffer, 0, 0, static_cast<uint32_t>(g_worldIndexes.size()))
 		.DirtyAll();
+	g_worldDrawErrorBaseline = g_vhErrorCounter.load(std::memory_order_relaxed);
 	if (vhSetState(g_worldStateId, g_worldState)) {
 		vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
 		vhDrawIndexed(g_worldStateId, static_cast<uint32_t>(g_worldIndexes.size()));
+		g_worldDrawSubmitted = true;
+	} else {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: world vhSetState failed (vertices=%zu indexes=%zu)\n",
+			g_worldPositions.size(), g_worldIndexes.size());
 	}
 }
 static void VRHI_SetColor(const float *rgba) {
