@@ -89,7 +89,11 @@ set(RENDERER_VRHI_BINARY renderer_vrhi)
 add_library(${RENDERER_VRHI_BINARY} SHARED
     ${SOURCE_DIR}/renderervrhi/vrhi_stub.cpp)
 
-target_include_directories(${RENDERER_VRHI_BINARY} PRIVATE ${SOURCE_DIR})
+target_include_directories(${RENDERER_VRHI_BINARY} PRIVATE
+    ${SOURCE_DIR}
+    ${SOURCE_DIR}/qcommon)
+target_compile_definitions(${RENDERER_VRHI_BINARY} PRIVATE
+    USE_RENDERER_DLOPEN)
 if(IS_DIRECTORY "${VRHI_INCLUDE_DIR}")
     target_include_directories(${RENDERER_VRHI_BINARY} PRIVATE
         "${VRHI_INCLUDE_DIR}")
