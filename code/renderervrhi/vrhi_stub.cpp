@@ -30,6 +30,7 @@
 
 #include <atomic>
 #include <cstdarg>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -55,6 +56,15 @@ static bool g_sdlVideoActive = false;
 static bool g_sdlVideoOwned = false;
 static bool g_inputInitialized = false;
 static bool g_deviceInitialized = false;
+static bool g_uiInitialized = false;
+static vhShader g_uiVertexShader = VRHI_INVALID_HANDLE;
+static vhShader g_uiPixelShader = VRHI_INVALID_HANDLE;
+static vhProgram g_uiProgram;
+static vhState g_uiState;
+static const vhStateId g_uiStateId = 2;
+static glm::vec4 g_uiColor(1.0f, 1.0f, 1.0f, 1.0f);
+static int g_frameViewportWidth = 0;
+static int g_frameViewportHeight = 0;
 static bool g_screenshotCommandRegistered = false;
 static bool g_captureRequest = false;
 static std::string g_captureName;
@@ -554,6 +564,124 @@ static void VRHI_FillConfig(glconfig_t *config) {
 	config->smpActive = qfalse;
 }
 
+// This shader is deliberately a solid-color UI fallback. It draws no texture
+// or world content; the shader handle and texture coordinates remain ignored.
+static const char *VRHI_UIVertexSource = R"(
+cbuffer UIParams : register(b0, VRHI_STAGE_SPACE)
+{
+    float4 ui_rect;
+};
+
+struct VSOutput
+{
+    float4 position : SV_Position;
+};
+
+[shader("vertex")]
+VSOutput main(uint vertexID : SV_VertexID)
+{
+    float2 corners[6] = {
+        float2(0.0, 0.0), float2(1.0, 0.0), float2(0.0, 1.0),
+        float2(0.0, 1.0), float2(1.0, 0.0), float2(1.0, 1.0)
+    };
+    float2 pixel = ui_rect.xy + corners[vertexID] * ui_rect.zw;
+    VSOutput output;
+    output.position = float4(pixel * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    return output;
+}
+)";
+
+static const char *VRHI_UIPixelSource = R"(
+cbuffer UIColor : register(b1, VRHI_STAGE_SPACE)
+{
+    float4 ui_color;
+};
+
+[shader("pixel")]
+float4 main() : SV_Target
+{
+    return ui_color;
+}
+)";
+
+static void VRHI_DestroyUI(void) {
+	if (g_uiVertexShader != VRHI_INVALID_HANDLE) {
+		vhDestroyShader(g_uiVertexShader);
+	}
+	if (g_uiPixelShader != VRHI_INVALID_HANDLE) {
+		vhDestroyShader(g_uiPixelShader);
+	}
+	g_uiVertexShader = VRHI_INVALID_HANDLE;
+	g_uiPixelShader = VRHI_INVALID_HANDLE;
+	g_uiProgram.clear();
+	g_uiState = vhState();
+	g_uiInitialized = false;
+}
+
+static bool VRHI_InitializeUI(void) {
+	if (!g_deviceInitialized) {
+		return false;
+	}
+	if (g_uiInitialized) {
+		return true;
+	}
+
+	std::vector<uint32_t> vertexSpirv;
+	std::vector<uint32_t> pixelSpirv;
+	std::string error;
+	if (!vhCompileShader("VRHI_UIVertex", VRHI_UIVertexSource,
+		VRHI_SHADER_STAGE_VERTEX | VRHI_SHADER_SM_6_0, vertexSpirv, "main",
+		{}, {}, &error)) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: solid-color UI vertex shader compile failed: %s\n",
+			error.c_str());
+		return false;
+	}
+	error.clear();
+	if (!vhCompileShader("VRHI_UIPixel", VRHI_UIPixelSource,
+		VRHI_SHADER_STAGE_PIXEL | VRHI_SHADER_SM_6_0, pixelSpirv, "main",
+		{}, {}, &error)) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: solid-color UI pixel shader compile failed: %s\n",
+			error.c_str());
+		return false;
+	}
+
+	g_uiVertexShader = vhAllocShader();
+	g_uiPixelShader = vhAllocShader();
+	if (g_uiVertexShader == VRHI_INVALID_HANDLE ||
+		g_uiPixelShader == VRHI_INVALID_HANDLE) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: solid-color UI shader allocation failed\n");
+		// Allocation alone does not enqueue a backend resource, so there is
+		// nothing to destroy on this failure path.
+		g_uiVertexShader = VRHI_INVALID_HANDLE;
+		g_uiPixelShader = VRHI_INVALID_HANDLE;
+		return false;
+	}
+
+	const int32_t errorsBefore = g_vhErrorCounter.load(std::memory_order_relaxed);
+	vhCreateShader(g_uiVertexShader, "VRHI_UIVertex", VRHI_SHADER_STAGE_VERTEX,
+		vertexSpirv, "main");
+	vhCreateShader(g_uiPixelShader, "VRHI_UIPixel", VRHI_SHADER_STAGE_PIXEL,
+		pixelSpirv, "main");
+	vhFinish();
+	const int32_t errorsAfter = g_vhErrorCounter.load(std::memory_order_relaxed);
+	if (errorsAfter != errorsBefore) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: solid-color UI shader creation failed (VRHI errors %+d)\n",
+			static_cast<int>(errorsAfter - errorsBefore));
+		VRHI_DestroyUI();
+		return false;
+	}
+
+	g_uiProgram = vhCreateGfxProgram(g_uiVertexShader, g_uiPixelShader);
+	g_uiInitialized = true;
+	VRHI_Printf(PRINT_ALL,
+		"renderer_vrhi: solid-color UI fallback ready (texture/world rendering remains unavailable)\n");
+	return true;
+}
+
 static void VRHI_BeginRegistration(glconfig_t *config) {
 	int requestedWidth;
 	int requestedHeight;
@@ -612,6 +740,9 @@ static void VRHI_BeginRegistration(glconfig_t *config) {
 		VRHI_RefreshSwapchain();
 	}
 
+	// Compile the tiny UI fallback only after vhInit has created a device; a
+	// shader failure leaves clear/present and all no-op callbacks usable.
+	VRHI_InitializeUI();
 	VRHI_FillConfig(config);
 }
 
@@ -622,6 +753,9 @@ static void VRHI_Shutdown(qboolean destroyWindow) {
 			vhFinish();
 		}
 		g_frameState = vhState();
+		g_uiState = vhState();
+		g_frameViewportWidth = 0;
+		g_frameViewportHeight = 0;
 		g_frameBackbufferReady = false;
 		g_frameBackbuffer = VRHI_INVALID_HANDLE;
 		return;
@@ -643,6 +777,8 @@ static void VRHI_Shutdown(qboolean destroyWindow) {
 		// ordering clear and guarantees the clear command queue is drained before
 		// the device or native window is torn down.
 		vhFinish();
+		VRHI_DestroyUI();
+		vhFinish();
 		vhShutdown(false);
 		g_deviceInitialized = false;
 	}
@@ -660,6 +796,10 @@ static void VRHI_Shutdown(qboolean destroyWindow) {
 	g_frameBackbufferReady = false;
 	g_frameBackbuffer = VRHI_INVALID_HANDLE;
 	g_frameState = vhState();
+	g_uiState = vhState();
+	g_frameViewportWidth = 0;
+	g_frameViewportHeight = 0;
+	g_uiColor = glm::vec4(1.0f);
 
 	if (g_sdlVideoActive || g_sdlVideoOwned) {
 		SDL_QuitSubSystem(SDL_INIT_VIDEO);
@@ -692,6 +832,16 @@ static void VRHI_BeginFrame(stereoFrame_t stereoFrame) {
 		.SetViewRect(glm::vec4(0.0f, 0.0f, (float)width, (float)height))
 		.SetViewScissor(glm::vec4(0.0f, 0.0f, (float)width, (float)height))
 		.SetViewClear(VRHI_CLEAR_COLOR, clearColor);
+	g_frameViewportWidth = width;
+	g_frameViewportHeight = height;
+	if (g_uiInitialized) {
+		// Reuse the acquired backbuffer and viewport, but explicitly disable
+		// depth and enable alpha blending for UI overlays.
+		g_uiState = g_frameState;
+		g_uiState.SetStateFlags(VRHI_STATE_WRITE_RGB | VRHI_STATE_WRITE_A |
+			VRHI_STATE_BLEND_ALPHA | VRHI_STATE_CULL_NONE |
+			VRHI_STATE_PT_TRIANGLES).SetProgram(g_uiProgram);
+	}
 	if (!vhSetState(g_frameStateId, g_frameState)) {
 		VRHI_Printf(PRINT_WARNING,
 			"renderer_vrhi: vhSetState failed while preparing the backbuffer\n");
@@ -743,8 +893,9 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 	g_frameBackbuffer = VRHI_INVALID_HANDLE;
 }
 
-// Registration, scene, image, and UI resources are intentionally not part of
-// this first slice. Every callback is nevertheless populated so the client,
+// Registration, scene, image, and textured UI resources are intentionally not
+// part of this first slice. DrawStretchPic provides only the solid-color UI
+// fallback above. Every callback is nevertheless populated so the client,
 // cgame, and UI can safely exercise the renderer without NULL dereferences.
 //
 // The four registration callbacks return stable engine-local qhandles so the
@@ -846,19 +997,43 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 	(void)fd;
 }
 static void VRHI_SetColor(const float *rgba) {
-	(void)rgba;
+	if (rgba == nullptr) {
+		g_uiColor = glm::vec4(1.0f);
+		return;
+	}
+	for (int i = 0; i < 4; ++i) {
+		if (!std::isfinite(rgba[i])) {
+			g_uiColor = glm::vec4(1.0f);
+			return;
+		}
+	}
+	g_uiColor = glm::vec4(rgba[0], rgba[1], rgba[2], rgba[3]);
 }
 static void VRHI_DrawStretchPic(float x, float y, float w, float h,
 	float s1, float t1, float s2, float t2, qhandle_t shader) {
-	(void)x;
-	(void)y;
-	(void)w;
-	(void)h;
 	(void)s1;
 	(void)t1;
 	(void)s2;
 	(void)t2;
 	(void)shader;
+	if (!g_deviceInitialized || !g_uiInitialized || !g_frameBackbufferReady ||
+		g_frameBackbuffer == VRHI_INVALID_HANDLE || g_frameViewportWidth <= 0 ||
+		g_frameViewportHeight <= 0 || !std::isfinite(x) || !std::isfinite(y) ||
+		!std::isfinite(w) || !std::isfinite(h) || w <= 0.0f || h <= 0.0f) {
+		return;
+	}
+
+	// Coordinates are in the current viewport's top-left-origin pixel space;
+	// the vertex shader converts this normalized rectangle to clip space.
+	const glm::vec4 rect(x / (float)g_frameViewportWidth,
+		y / (float)g_frameViewportHeight,
+		w / (float)g_frameViewportWidth,
+		h / (float)g_frameViewportHeight);
+	g_uiState.SetUniform(0, { "ui_rect", { rect } });
+	g_uiState.SetUniform(1, { "ui_color", { g_uiColor } });
+	if (vhSetState(g_uiStateId, g_uiState)) {
+		vhDraw(g_uiStateId, 6);
+	}
 }
 static void VRHI_DrawStretchRaw(int x, int y, int w, int h, int cols,
 	int rows, const byte *data, int client, qboolean dirty) {
@@ -1012,6 +1187,7 @@ extern "C" Q_EXPORT refexport_t *QDECL GetRefAPI(int apiVersion,
 	exports.TakeVideoFrame = VRHI_TakeVideoFrame;
 
 	VRHI_Printf(PRINT_ALL,
-		"renderer_vrhi: loaded (clear/present slice; resources/UI/world are no-op)\n");
+		"renderer_vrhi: loaded (clear/present + solid-color UI fallback; "
+		"textured resources/world are no-op)\n");
 	return &exports;
 }

@@ -5,12 +5,14 @@ copied VRHI release/debug archives; the VRHI submodule is not added to the
 ioquake3 CMake graph.
 
 The current slice owns an SDL `SDL_WINDOW_VULKAN` window, initializes one VRHI
-device and primary swapchain, clears the acquired backbuffer, and presents once
-per engine frame. `Shutdown(qfalse)` flushes while retaining the device/window
-for a video restart; `Shutdown(qtrue)` finishes and destroys VRHI, input, the
-window, and SDL video in that order.
+device and primary swapchain, clears the acquired backbuffer, draws solid-color
+UI rectangles through `DrawStretchPic`, and presents once per engine frame. This
+UI path is a fallback only, not texture or world rendering parity.
+`Shutdown(qfalse)` flushes while retaining the device/window for a video restart;
+`Shutdown(qtrue)` finishes and destroys VRHI, input, the window, and SDL video in
+that order.
 
-Model, skin, shader, image, world, scene, UI, font, cinematic, and
+Model, skin, shader, image, world, scene, textured UI, font, cinematic, and
 video-capture resources are intentionally not implemented yet. Their complete
 refexport callbacks are safe no-ops so the client, cgame, and UI cannot
 dereference a null renderer callback. The renderer-owned `screenshot` command
