@@ -9,7 +9,10 @@
 // ignored-but-bounded UV/time modifiers, the bounded static const
 // generators rgbGen const / alphaGen const, and the stage-local depthWrite
 // flag that the adapter applies as WRITE_Z only for explicitly requesting
-// stages/draws).
+// stages/draws). The same slice also carries the bounded stage-local
+// alphaFunc comparisons GE128/GT0/LT128 (case-insensitive) through to the
+// textured material shaders; unknown comparisons and truncated statements
+// keep the stage usable with alpha testing OFF.
 //
 // Build and run (any C++11-or-later compiler):
 //   clang++ -std=c++17 -O1 -Wall -Wextra -Werror tests/vrhi_shader_script_test.cpp -o vrhi_shader_script_test && ./vrhi_shader_script_test
@@ -690,6 +693,138 @@ void testStageDepthWrite() {
 	}
 }
 
+void testStageAlphaFunc() {
+	// Bounded stage-local alphaFunc: exactly GE128, GT0, and LT128 are
+	// accepted (case-insensitive). The parsed mode lives per stage and never
+	// changes blend classification: a stage with alphaFunc keeps its declared
+	// blend mode (opaque here).
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	const std::string modes = script(
+		"{ map textures/base.tga alphaFunc GE128 }\n"
+		"{ map textures/a.png blendFunc blend alphaFunc GT0 }\n"
+		"{ map textures/b.png alphaFunc LT128 }");
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(modes), modes.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			CHECK_EQ_INT(stages[0].alphaFunc, VRHI_SHADER_ALPHAFUNC_GE128);
+			CHECK_EQ_INT(stages[0].blendMode, VRHI_SHADER_BLEND_OPAQUE);
+			CHECK_EQ_INT(stages[1].alphaFunc, VRHI_SHADER_ALPHAFUNC_GT0);
+			CHECK_EQ_INT(stages[1].blendMode, VRHI_SHADER_BLEND_ALPHA);
+			CHECK_EQ_INT(stages[2].alphaFunc, VRHI_SHADER_ALPHAFUNC_LT128);
+		}
+	}
+	// Keyword and comparison matching are case-insensitive, like every other
+	// directive.
+	const std::string upper = script(
+		"{ map textures/base.tga ALPHAFUNC ge128 }\n"
+		"{ map textures/a.png AlphaFunc Gt0 }\n"
+		"{ map textures/b.png alphafunc LT128 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(upper), upper.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			CHECK_EQ_INT(stages[0].alphaFunc, VRHI_SHADER_ALPHAFUNC_GE128);
+			CHECK_EQ_INT(stages[1].alphaFunc, VRHI_SHADER_ALPHAFUNC_GT0);
+			CHECK_EQ_INT(stages[2].alphaFunc, VRHI_SHADER_ALPHAFUNC_LT128);
+		}
+	}
+	// Default-off: every stage without an explicit alphaFunc keeps alpha
+	// testing disabled, including translucent overlay stages.
+	const std::string noFlag = script(
+		"{ map textures/base.tga }\n{ map textures/glow.tga blendFunc add }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(noFlag), noFlag.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 2u);
+		if (stages.size() == 2) {
+			CHECK_EQ_INT(stages[0].alphaFunc, VRHI_SHADER_ALPHAFUNC_OFF);
+			CHECK_EQ_INT(stages[1].alphaFunc, VRHI_SHADER_ALPHAFUNC_OFF);
+		}
+	}
+	// The mode is stage-local: only the stage that declares alphaFunc gets
+	// it, later stages without the keyword stay OFF.
+	const std::string stageLocal = script(
+		"{ map textures/base.tga alphaFunc GE128 }\n"
+		"{ map textures/overlay.tga blendFunc blend }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(stageLocal), stageLocal.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 2u);
+		if (stages.size() == 2) {
+			CHECK_EQ_INT(stages[0].alphaFunc, VRHI_SHADER_ALPHAFUNC_GE128);
+			CHECK_EQ_INT(stages[1].alphaFunc, VRHI_SHADER_ALPHAFUNC_OFF);
+		}
+	}
+	// Token consumption: alphaFunc consumes exactly two tokens (keyword +
+	// comparison), so a following directive on the same stage still parses
+	// normally and the mode stays set.
+	const std::string mixed = script(
+		"{ map textures/base.tga alphaFunc GE128 blendFunc blend }\n"
+		"{ alphaFunc GT0 map textures/a.png }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(mixed), mixed.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 2u);
+		if (stages.size() == 2) {
+			CHECK_EQ_INT(stages[0].alphaFunc, VRHI_SHADER_ALPHAFUNC_GE128);
+			CHECK_EQ_INT(stages[0].blendMode, VRHI_SHADER_BLEND_ALPHA);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+			CHECK_EQ_INT(stages[1].alphaFunc, VRHI_SHADER_ALPHAFUNC_GT0);
+			CHECK_EQ_STR(stages[1].path, "textures/a.png");
+		}
+	}
+	// Unknown alphaFunc values retain the current safe behavior: the stage
+	// stays usable, its map is resolved, and alpha testing stays OFF instead
+	// of rejecting an otherwise usable stage.
+	const std::string unknown = script(
+		"{ map textures/base.tga alphaFunc GE192 }\n"
+		"{ map textures/a.png alphaFunc custom blendFunc blend }\n"
+		"{ map textures/b.png ALPHAFUNC Ge64 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(unknown), unknown.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			CHECK_EQ_INT(stages[0].alphaFunc, VRHI_SHADER_ALPHAFUNC_OFF);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+			CHECK_EQ_INT(stages[1].alphaFunc, VRHI_SHADER_ALPHAFUNC_OFF);
+			CHECK_EQ_INT(stages[1].blendMode, VRHI_SHADER_BLEND_ALPHA);
+			CHECK_EQ_INT(stages[2].alphaFunc, VRHI_SHADER_ALPHAFUNC_OFF);
+		}
+	}
+	// A truncated alphaFunc at the end of a stage is treated the same way as
+	// an unknown value: the stage stays usable, never borrowing tokens past
+	// the stage, and alpha testing stays OFF.
+	const std::string truncated = script("{ map textures/base.tga alphaFunc }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncated), truncated.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK_EQ_INT(stages[0].alphaFunc, VRHI_SHADER_ALPHAFUNC_OFF);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+		}
+	}
+}
+
 void testConsoleScriptResolution() {
 	// OpenArena defines the in-game console background as a script shader
 	// (scripts/oanew.shader): `console { { map textures/sfx/logo256.tga } }`.
@@ -759,6 +894,7 @@ int main() {
 	testSimpleMultiStageExtraction();
 	testConstGenerators();
 	testStageDepthWrite();
+	testStageAlphaFunc();
 	testConsoleScriptResolution();
 	testPathSafetyHelpers();
 

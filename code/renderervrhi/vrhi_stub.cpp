@@ -135,6 +135,13 @@ struct VRHI_SceneDraw {
 	// depth-test-on/depth-write-off; WRITE_Z is applied only when this flag
 	// is set. Opaque draws keep writing depth as before.
 	bool depthWrite = false;
+	// Bounded per-draw stage alpha-test (`alphaFunc`) mode carried from the
+	// base stage. The textured material pixel shaders discard/cut out
+	// fragments that fail the comparison on the material sample alpha; OFF
+	// (0) never discards, so draws without an explicit alphaFunc render
+	// exactly as before. Blend modes, color/alpha constants, vertex colour
+	// and lightmap behavior are unchanged.
+	uint8_t alphaFunc = VRHI_SHADER_ALPHAFUNC_OFF;
 };
 static std::vector<VRHI_SceneEntity> g_sceneEntities;
 static std::vector<VRHI_ScenePoly> g_scenePolys;
@@ -187,6 +194,13 @@ struct VRHI_WorldBatch {
 	// this flag is set; the opaque base stage keeps the existing
 	// depth-write behavior.
 	uint8_t stageDepthWrite[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+	// Per-stage bounded alpha-test (`alphaFunc`) mode, carried from the
+	// parsed stage data to the draw state. The textured material pixel
+	// shaders discard/cut out fragments that fail the comparison on the
+	// material sample alpha; 0 (OFF) never discards. It never changes blend
+	// classification, constants, vertex colour, or lightmaps.
+	uint8_t stageAlphaFunc[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_ALPHAFUNC_OFF,
+		VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF };
 	// A non-opaque stage zero is a translucent world batch. It is rendered
 	// after opaque batches in back-to-front order with depth writes disabled
 	// unless a stage explicitly declares depthWrite.
@@ -220,6 +234,10 @@ struct VRHI_SceneShaderMaterial {
 	// script stage). The scene draw applies WRITE_Z for its translucent pass
 	// only when this flag is set; opaque draws keep writing depth.
 	uint8_t depthWrite = 0;
+	// Base-stage bounded alpha-test (`alphaFunc`) mode. The textured scene
+	// program discards fragments that fail the comparison on the material
+	// sample alpha; 0 (OFF) never discards, preserving the existing behavior.
+	uint8_t alphaFunc = VRHI_SHADER_ALPHAFUNC_OFF;
 };
 // Minimal, decoded copies of the BSP PVS traversal state. Values are
 // byte-swapped out of the on-disk little-endian form at load time and copied
@@ -1192,6 +1210,7 @@ SamplerState u_diffuseSampler : register(s0, VRHI_STAGE_SPACE);
 cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
 {
     float4 u_materialConst; // rgbGen const tint (rgb), alphaGen const (a); 1,1,1,1 when absent
+    float4 u_alphaTest;     // stage alphaFunc mode: 0 off, 1 GE128, 2 GT0, 3 LT128; 0 when absent
 };
 struct PSInput { float4 position : SV_Position; float2 diffuse : TEXCOORD0; float2 lightmap : TEXCOORD1; float lightmapLayer : TEXCOORD2; float4 color : TEXCOORD3; };
 [shader("pixel")]
@@ -1201,7 +1220,16 @@ float4 main(PSInput input) : SV_Target
     // Bounded static const generators tint only the material sample; vertex
     // colour and blend state are never modified here.
     sample *= u_materialConst;
-    return sample * input.color;
+    float4 result = sample * input.color;
+    // Bounded stage alpha-test (alphaFunc): GE128 discards alpha<0.5, GT0
+    // discards alpha<=0, LT128 discards alpha>=0.5. Off (0) never discards,
+    // so stages without an explicit alphaFunc render exactly as before. Only
+    // the material sample alpha is tested; blend modes, vertex colour and
+    // lightmap behavior are unchanged.
+    if (u_alphaTest.x == 1.0 && result.a < 0.5) discard;
+    else if (u_alphaTest.x == 2.0 && result.a <= 0.0) discard;
+    else if (u_alphaTest.x == 3.0 && result.a >= 0.5) discard;
+    return result;
 }
 )";
 
@@ -1213,6 +1241,7 @@ SamplerState u_lightmapSampler : register(s1, VRHI_STAGE_SPACE);
 cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
 {
     float4 u_materialConst; // rgbGen const tint (rgb), alphaGen const (a); 1,1,1,1 when absent
+    float4 u_alphaTest;     // stage alphaFunc mode: 0 off, 1 GE128, 2 GT0, 3 LT128; 0 when absent
 };
 struct PSInput {
     float4 position : SV_Position;
@@ -1232,7 +1261,16 @@ float4 main(PSInput input) : SV_Target
     if (input.lightmapLayer >= -0.5)
         sample.rgb *= u_lightmap.Sample(u_lightmapSampler,
             float3(saturate(input.lightmap), input.lightmapLayer)).rgb;
-    return sample * input.color;
+    float4 result = sample * input.color;
+    // Bounded stage alpha-test (alphaFunc): GE128 discards alpha<0.5, GT0
+    // discards alpha<=0, LT128 discards alpha>=0.5. Off (0) never discards,
+    // so draws without an explicit alphaFunc render exactly as before. Only
+    // the material sample alpha is tested; blend modes, vertex colour and
+    // lightmap behavior are unchanged.
+    if (u_alphaTest.x == 1.0 && result.a < 0.5) discard;
+    else if (u_alphaTest.x == 2.0 && result.a <= 0.0) discard;
+    else if (u_alphaTest.x == 3.0 && result.a >= 0.5) discard;
+    return result;
 }
 )";
 
@@ -2976,7 +3014,8 @@ static void VRHI_ReportUnresolvedMaterial(const char *shaderName, const char *re
 static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 	uint8_t *blends, int *stageCount, uint8_t *rgbConstFlags,
 	float (*rgbConstColor)[3], uint8_t *alphaConstFlags,
-	float *alphaConstValues, uint8_t *depthWriteFlags = nullptr) {
+	float *alphaConstValues, uint8_t *depthWriteFlags = nullptr,
+	uint8_t *alphaFuncFlags = nullptr) {
 	if (images == nullptr || blends == nullptr || stageCount == nullptr) return false;
 	*stageCount = 0;
 	for (size_t i = 0; i < VRHI_SHADER_MAX_STAGES; ++i) {
@@ -2991,6 +3030,7 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 		if (alphaConstFlags != nullptr) alphaConstFlags[i] = 0;
 		if (alphaConstValues != nullptr) alphaConstValues[i] = 1.0f;
 		if (depthWriteFlags != nullptr) depthWriteFlags[i] = 0;
+		if (alphaFuncFlags != nullptr) alphaFuncFlags[i] = VRHI_SHADER_ALPHAFUNC_OFF;
 	}
 	std::vector<VRHI_ShaderStage> stages;
 	std::string directPath;
@@ -3039,6 +3079,8 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 		if (alphaConstFlags != nullptr) alphaConstFlags[i] = stages[i].alphaGenConst ? 1 : 0;
 		if (alphaConstValues != nullptr) alphaConstValues[i] = stages[i].alphaConst;
 		if (depthWriteFlags != nullptr) depthWriteFlags[i] = stages[i].depthWrite ? 1 : 0;
+		if (alphaFuncFlags != nullptr)
+			alphaFuncFlags[i] = static_cast<uint8_t>(stages[i].alphaFunc);
 	}
 	*stageCount = static_cast<int>(stages.size());
 	if (scriptResolved)
@@ -3633,9 +3675,11 @@ static void VRHI_LoadWorld(const char *name) {
 		uint8_t stageAlphaConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		float stageAlphaConstValue[VRHI_SHADER_MAX_STAGES] = { 1.0f, 1.0f, 1.0f, 1.0f };
 		uint8_t stageDepthWrite[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		uint8_t stageAlphaFunc[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_ALPHAFUNC_OFF,
+			VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF };
 		VRHI_LoadDiffuseStages(shader.shader, stageImages, stageBlend, &stageCount,
 			stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
-			stageDepthWrite);
+			stageDepthWrite, stageAlphaFunc);
 		diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 		if (surface.surfaceType == MST_PATCH) {
 			VRHI_PatchMesh patch;
@@ -3677,6 +3721,7 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageAlphaConst[stage] = stageAlphaConst[stage];
 				batch.stageAlphaConstValue[stage] = stageAlphaConstValue[stage];
 				batch.stageDepthWrite[stage] = stageDepthWrite[stage];
+				batch.stageAlphaFunc[stage] = stageAlphaFunc[stage];
 			}
 			g_worldBatches.push_back(batch);
 			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
@@ -3775,6 +3820,7 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageAlphaConst[stage] = stageAlphaConst[stage];
 				batch.stageAlphaConstValue[stage] = stageAlphaConstValue[stage];
 				batch.stageDepthWrite[stage] = stageDepthWrite[stage];
+				batch.stageAlphaFunc[stage] = stageAlphaFunc[stage];
 			}
 			g_worldBatches.push_back(batch);
 			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
@@ -3845,9 +3891,11 @@ static void VRHI_LoadWorld(const char *name) {
 			uint8_t stageAlphaConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 			float stageAlphaConstValue[VRHI_SHADER_MAX_STAGES] = { 1.0f, 1.0f, 1.0f, 1.0f };
 			uint8_t stageDepthWrite[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+			uint8_t stageAlphaFunc[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_ALPHAFUNC_OFF,
+				VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF };
 			VRHI_LoadDiffuseStages(shader.shader, stageImages, stageBlend, &stageCount,
 				stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
-				stageDepthWrite);
+				stageDepthWrite, stageAlphaFunc);
 			const int diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 			VRHI_InlineBSPModel surfaceModel;
 			if (!VRHI_BuildInlineSurface(vertsData, vertCount, indexesData, indexCount,
@@ -3873,6 +3921,7 @@ static void VRHI_LoadWorld(const char *name) {
 					batch.stageAlphaConst[stage] = stageAlphaConst[stage];
 					batch.stageAlphaConstValue[stage] = stageAlphaConstValue[stage];
 					batch.stageDepthWrite[stage] = stageDepthWrite[stage];
+					batch.stageAlphaFunc[stage] = stageAlphaFunc[stage];
 				}
 			}
 			if (inlineModel.vertices.size() > VRHI_MAX_INLINE_VERTICES - surfaceModel.vertices.size() ||
@@ -4205,7 +4254,7 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	bool translucent = false, uint8_t blendMode = VRHI_SHADER_BLEND_OPAQUE,
 	uint8_t rgbConst = 0, const float *rgbConstColor = nullptr,
 	uint8_t alphaConst = 0, float alphaConstValue = 1.0f,
-	bool depthWrite = false) {
+	bool depthWrite = false, uint8_t alphaFunc = VRHI_SHADER_ALPHAFUNC_OFF) {
 	if (indexCount == 0 || firstIndex > UINT32_MAX || indexCount > UINT32_MAX ||
 		g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) return false;
 	VRHI_SceneDraw draw;
@@ -4225,6 +4274,7 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	draw.alphaConst = alphaConst;
 	draw.alphaConstValue = alphaConstValue;
 	draw.depthWrite = depthWrite;
+	draw.alphaFunc = alphaFunc;
 	g_sceneDraws.push_back(draw);
 	return true;
 }
@@ -4303,10 +4353,12 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 		uint8_t stageAlphaConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		float stageAlphaConstValue[VRHI_SHADER_MAX_STAGES] = { 1.0f, 1.0f, 1.0f, 1.0f };
 		uint8_t stageDepthWrite[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		uint8_t stageAlphaFunc[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_ALPHAFUNC_OFF,
+			VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF };
 		if (!shaderName.empty())
 			VRHI_LoadDiffuseStages(shaderName.c_str(), images, blends, &stageCount,
 				stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
-				stageDepthWrite);
+				stageDepthWrite, stageAlphaFunc);
 		if (stageCount > 0) {
 			material.diffuseImage = images[0];
 			material.blendMode = blends[0];
@@ -4317,6 +4369,7 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 			material.alphaConst = stageAlphaConst[0];
 			material.alphaConstValue = stageAlphaConstValue[0];
 			material.depthWrite = stageDepthWrite[0];
+			material.alphaFunc = stageAlphaFunc[0];
 		}
 		g_sceneShaderDiffuseByHandle.emplace(draw->shader, material);
 		if (material.diffuseImage >= 0) VRHI_UploadWorldDiffuse();
@@ -4334,6 +4387,7 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 	draw->alphaConst = material.alphaConst;
 	draw->alphaConstValue = material.alphaConstValue;
 	draw->depthWrite = material.depthWrite != 0;
+	draw->alphaFunc = material.alphaFunc;
 	return image.texture;
 }
 
@@ -4514,7 +4568,7 @@ static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4
 				batch.diffuseImage, lightmapped, color.a < 0.999f, blendMode,
 				rgbConst, batch.stageRgbConstColor[0],
 				alphaConst, batch.stageAlphaConstValue[0],
-				batch.stageDepthWrite[0] != 0)) {
+				batch.stageDepthWrite[0] != 0, batch.stageAlphaFunc[0])) {
 				g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
 				g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
 				continue;
@@ -5033,6 +5087,14 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 					batch.stageRgbConst[stage] ? batch.stageRgbConstColor[stage][2] : 1.0f,
 					batch.stageAlphaConst[stage] ? batch.stageAlphaConstValue[stage] : 1.0f);
 				g_worldState.SetUniform(0, { "u_materialConst", { materialConst } });
+				// Bounded stage alpha-test (alphaFunc) mode for this stage,
+				// always written (0 when off) so the per-draw uniform never
+				// carries a stale comparison from an earlier draw. Only the
+				// material sample alpha is tested in the pixel shader; blend
+				// modes, constants, vertex colour and lightmaps are unchanged.
+				const glm::vec4 alphaTest(
+					static_cast<float>(batch.stageAlphaFunc[stage]), 0.0f, 0.0f, 0.0f);
+				g_worldState.SetUniform(1, { "u_alphaTest", { alphaTest } });
 			}
 			if (vhSetState(g_worldStateId, g_worldState)) {
 				if (!submitted) vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
@@ -5141,6 +5203,14 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 					draw.rgbConst ? draw.rgbConstColor[2] : 1.0f,
 					draw.alphaConst ? draw.alphaConstValue : 1.0f);
 				g_worldState.SetUniform(0, { "u_materialConst", { materialConst } });
+				// Bounded stage alpha-test (alphaFunc) mode carried on the
+				// scene draw, always written (0 when off) so the per-draw
+				// uniform never carries a stale comparison from an earlier
+				// draw. Only the material sample alpha is tested; blend modes,
+				// vertex colour and lightmaps are unchanged.
+				const glm::vec4 alphaTest(
+					static_cast<float>(draw.alphaFunc), 0.0f, 0.0f, 0.0f);
+				g_worldState.SetUniform(1, { "u_alphaTest", { alphaTest } });
 			}
 			if (vhSetState(g_worldStateId, g_worldState)) {
 				if (!submitted) vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);

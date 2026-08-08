@@ -61,6 +61,19 @@ input buffer, so no FS storage can be referenced after FS_FreeFile.
 // and applies WRITE_Z only to stages/draws that explicitly declared
 // depthWrite. Opaque draws keep their existing depth-write behavior, so a
 // shader without the keyword renders exactly as before.
+//
+// The bounded stage-local `alphaFunc` slice extends the same simple
+// multi-stage parser with exactly three Quake3 alpha-test comparisons,
+// matched case-insensitively: `GE128`, `GT0`, and `LT128`. The parsed mode is
+// carried through the world, inline-BSP, and scene shader-cache/draw paths so
+// the textured material pixel shaders can discard/cut out fragments that fail
+// the comparison on the material sample alpha. Every other `alphaFunc` value
+// (and a truncated statement at the end of a stage) retains the current safe
+// behavior: the stage stays usable and alpha testing stays OFF, exactly as
+// before this slice existed, so an otherwise usable stage is never rejected.
+// The slice never changes alpha-blend modes, the bounded color/alpha const
+// generators, vertex colour, or lightmap behavior. The conservative first-stage
+// helper still treats `alphaFunc` as unsupported and rejects such shaders.
 ===========================================================================
 */
 #ifndef __VRHI_SHADER_SCRIPT_H
@@ -96,6 +109,19 @@ enum VRHI_ShaderBlendMode {
 	// alpha, distinct from plain additive (GL_ONE GL_ONE).
 	VRHI_SHADER_BLEND_ALPHA_ADDITIVE = 6
 };
+// Bounded Quake3 stage alpha-test (`alphaFunc`) comparisons accepted by the
+// simple multi-stage parser. Exactly GE128, GT0, and LT128 are supported
+// (case-insensitive); every other value keeps the OFF (no discard) behavior.
+enum VRHI_ShaderAlphaFunc {
+	// No alpha testing: the stage renders exactly as before this slice.
+	VRHI_SHADER_ALPHAFUNC_OFF = 0,
+	// `alphaFunc GE128`: discard fragments whose alpha < 128/255.
+	VRHI_SHADER_ALPHAFUNC_GE128 = 1,
+	// `alphaFunc GT0`: discard fragments whose alpha <= 0.
+	VRHI_SHADER_ALPHAFUNC_GT0 = 2,
+	// `alphaFunc LT128`: discard fragments whose alpha >= 128/255.
+	VRHI_SHADER_ALPHAFUNC_LT128 = 3
+};
 struct VRHI_ShaderStage {
 	std::string path;
 	int blendMode = VRHI_SHADER_BLEND_OPAQUE;
@@ -115,6 +141,10 @@ struct VRHI_ShaderStage {
 	// depth-write-off; WRITE_Z is applied only when this flag is set. Opaque
 	// draws keep their existing depth-write behavior.
 	bool depthWrite = false;
+	// Bounded stage-local alpha-test (`alphaFunc`) mode: exactly GE128, GT0,
+	// and LT128 (case-insensitive) are accepted; any other value keeps this
+	// OFF so the stage renders with no discard, exactly as before this slice.
+	int alphaFunc = VRHI_SHADER_ALPHAFUNC_OFF;
 };
 
 // Strict bounds, independent of the legacy qfiles.h limits so malformed or
@@ -602,6 +632,28 @@ inline bool VRHI_ParseSimpleShaderBlock(
 				// still parses normally.
 				stage.depthWrite = true;
 				j += 1;
+				continue;
+			}
+			if (keyword == "alphafunc") {
+				// Bounded stage-local alpha-test: exactly GE128, GT0, and
+				// LT128 are accepted case-insensitively (Quake3 comparisons).
+				// Unknown values retain the current safe behavior: the stage
+				// stays usable and alpha testing stays OFF, exactly as before
+				// this slice, so an otherwise usable stage is never rejected.
+				// A truncated statement at the end of the stage is treated the
+				// same way (consume the bare keyword, keep OFF) and never
+				// borrows tokens past the stage. With a comparison present the
+				// statement consumes exactly two tokens so a following
+				// directive (map, blendFunc, ...) still parses normally.
+				if (j + 1 < stageEnd) {
+					const std::string arg = VRHI_ShaderLowerASCII(tokens[j + 1].text);
+					if (arg == "ge128") stage.alphaFunc = VRHI_SHADER_ALPHAFUNC_GE128;
+					else if (arg == "gt0") stage.alphaFunc = VRHI_SHADER_ALPHAFUNC_GT0;
+					else if (arg == "lt128") stage.alphaFunc = VRHI_SHADER_ALPHAFUNC_LT128;
+					j += 2;
+				} else {
+					j += 1;
+				}
 				continue;
 			}
 			const std::size_t consumed = VRHI_ShaderAllowlistedStatement(tokens, j, stageEnd);
