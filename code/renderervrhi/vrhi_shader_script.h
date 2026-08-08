@@ -43,13 +43,25 @@ is intentionally NOT a shader/material parser:
 Every bound is a compile-time constant below. The parser copies only bounded
 strings into caller-owned containers and never retains a pointer into the
 input buffer, so no FS storage can be referenced after FS_FreeFile.
+//
+// The bounded static const-generator slice (`rgbGen const r g b` and
+// `alphaGen const a`) extends only the simple multi-stage parser: constants
+// are accepted when every value is finite and inside the defined safe range
+// (VRHI_SCRIPT_GENCONST_* below), preserved per stage, and carried through the
+// world/scene material and draw state so the pixel shader can tint the
+// material sample without touching vertex colour, lightmaps, or blend
+// classification. Every other generator keeps the existing dynamic fallback.
+// The conservative first-stage helper still requires identity only.
 ===========================================================================
 */
 #ifndef __VRHI_SHADER_SCRIPT_H
 #define __VRHI_SHADER_SCRIPT_H
 
 #include <cctype>
+#include <cerrno>
+#include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <unordered_map>
@@ -78,6 +90,16 @@ enum VRHI_ShaderBlendMode {
 struct VRHI_ShaderStage {
 	std::string path;
 	int blendMode = VRHI_SHADER_BLEND_OPAQUE;
+	// Bounded static const generators. rgbGen const r g b tints the stage
+	// texture RGB; alphaGen const a scales the stage texture alpha (both match
+	// the GL1 constant-colour modulate semantics). Only finite constants inside
+	// the defined safe range are accepted by the simple-stage parser; every
+	// other generator keeps the existing dynamic fallback (flags stay false,
+	// the stage renders with identity colour).
+	bool rgbGenConst = false;
+	float rgbConst[3] = { 1.0f, 1.0f, 1.0f };
+	bool alphaGenConst = false;
+	float alphaConst = 1.0f;
 };
 
 // Strict bounds, independent of the legacy qfiles.h limits so malformed or
@@ -87,6 +109,16 @@ static const std::size_t VRHI_SCRIPT_MAX_QPATH = 64;
 static const std::size_t VRHI_SCRIPT_MAX_TEXT_BYTES = 8u * 1024u * 1024u;
 static const std::size_t VRHI_SCRIPT_MAX_TOKENS = 131072;
 static const std::size_t VRHI_SCRIPT_MAX_TOKEN_BYTES = 1024;
+
+// Bounded static const-generator range (rgbGen const / alphaGen const). The
+// GL1 renderer stores the generator as a byte (255 * value), so [0,1] is the
+// round-trip-safe domain for every component: the rgbGen const components and
+// the alphaGen const value must all be inside [0,1] to match the GL1
+// byte-colour semantics exactly. Non-finite, malformed, or out-of-range
+// constants are not accepted and keep the dynamic fallback.
+static const float VRHI_SCRIPT_GENCONST_MIN = 0.0f;
+static const float VRHI_SCRIPT_GENCONST_RGB_MAX = 1.0f;
+static const float VRHI_SCRIPT_GENCONST_ALPHA_MAX = 1.0f;
 
 struct VRHI_ShaderScriptToken {
 	std::string text;
@@ -104,6 +136,24 @@ inline std::string VRHI_ShaderLowerASCII(const std::string &text) {
 inline bool VRHI_ShaderTokenIs(const VRHI_ShaderScriptToken &token,
 	const char *value) {
 	return VRHI_ShaderLowerASCII(token.text) == value;
+}
+
+// Parses one token as a finite numeric constant inside [minValue, maxValue].
+// Returns false for empty, non-numeric, partially consumed (trailing junk),
+// non-finite, or out-of-range tokens, so the const-generator slice accepts
+// only exact in-range constants. Locale behaviour mirrors the original
+// renderer's atof-based ParseVector path.
+inline bool VRHI_ShaderParseFiniteConstant(const std::string &text,
+	float minValue, float maxValue, float *value) {
+	if (value == nullptr || text.empty()) return false;
+	char *end = nullptr;
+	errno = 0;
+	const float parsed = std::strtof(text.c_str(), &end);
+	if (end == text.c_str() || *end != '\0' || errno == ERANGE ||
+		!std::isfinite(parsed) || parsed < minValue || parsed > maxValue)
+		return false;
+	*value = parsed;
+	return true;
 }
 
 // Tokenizes bounded shader-script text into single tokens. Returns false for
@@ -438,11 +488,53 @@ inline bool VRHI_ParseSimpleShaderBlock(
 				continue;
 			}
 			if (keyword == "rgbgen" || keyword == "alphagen") {
-				// Static fallback for dynamic colour/alpha generators. Require
-				// the keyword's first argument so a truncated statement still
-				// rejects safely; remaining generator parameters are bounded
-				// tokens and are ignored below.
+				// Bounded static const generators (`rgbGen const r g b`,
+				// `alphaGen const a`) are preserved when every constant is
+				// finite and inside the defined safe range. Every other
+				// generator (wave, entity, vertex, ...) keeps the existing
+				// dynamic fallback: the keyword and its first argument are
+				// consumed, remaining generator parameters are bounded tokens
+				// and are ignored, and the stage keeps identity colour.
+				// Malformed or truncated const statements still reject the
+				// whole shader (never borrowing tokens past the stage end).
 				if (j + 1 >= stageEnd) return false;
+				const bool isAlphaGen = keyword == "alphagen";
+				if (VRHI_ShaderTokenIs(tokens[j + 1], "const")) {
+					const std::size_t argCount = isAlphaGen ? 1 : 3;
+					if (j + 1 + argCount >= stageEnd) return false;
+					float values[3] = { 1.0f, 1.0f, 1.0f };
+					bool valid = true;
+					for (std::size_t k = 0; k < argCount; ++k) {
+						if (!VRHI_ShaderParseFiniteConstant(tokens[j + 2 + k].text,
+							VRHI_SCRIPT_GENCONST_MIN,
+							isAlphaGen ? VRHI_SCRIPT_GENCONST_ALPHA_MAX
+								: VRHI_SCRIPT_GENCONST_RGB_MAX,
+							&values[k])) {
+							valid = false;
+							break;
+						}
+					}
+					if (valid) {
+						if (isAlphaGen) {
+							stage.alphaGenConst = true;
+							stage.alphaConst = values[0];
+						} else {
+							stage.rgbGenConst = true;
+							stage.rgbConst[0] = values[0];
+							stage.rgbConst[1] = values[1];
+							stage.rgbConst[2] = values[2];
+						}
+					}
+					// Both accepted and rejected const statements consume the
+					// whole declared argument count (2 + argCount tokens). A
+					// syntactically complete but invalid or out-of-range const
+					// statement must not leave keyword-looking argument tokens
+					// (for example `rgbGen const 1 1 map`) behind to be re-parsed
+					// as stage directives; it simply keeps the dynamic fallback
+					// tint while the stage stays accepted.
+					j += 2 + argCount;
+					continue;
+				}
 				j += 2;
 				continue;
 			}

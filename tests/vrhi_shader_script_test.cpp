@@ -5,8 +5,9 @@
 // allowlist (blendFunc GL_ONE GL_ZERO, rgbGen/alphaGen identity, depthWrite,
 // depthFunc lequal/less), malformed statements, and multi-map shaders, plus
 // the bounded multi-stage slice (VRHI_ParseShaderScriptStages: at most four
-// direct-image/static-first-frame stages, common transparent blend modes, and
-// ignored-but-bounded UV/time modifiers).
+// direct-image/static-first-frame stages, common transparent blend modes,
+// ignored-but-bounded UV/time modifiers, and the bounded static const
+// generators rgbGen const / alphaGen const).
 //
 // Build and run (any C++11-or-later compiler):
 //   clang++ -std=c++17 -O1 -Wall -Wextra -Werror tests/vrhi_shader_script_test.cpp -o vrhi_shader_script_test && ./vrhi_shader_script_test
@@ -462,6 +463,150 @@ void testPathSafetyHelpers() {
 	CHECK(!VRHI_ResolveDirectImagePath("textures/foo/bar.tgax", &resolved));
 }
 
+void testConstGenerators() {
+	// Bounded static const generators (rgbGen const / alphaGen const) are
+	// accepted by the simple multi-stage slice and preserved in stage data.
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	const std::string tinted = script(
+		"{ map textures/base.tga rgbGen const 0.5 0.75 1.0 alphaGen const 0.25 }\n"
+		"{ map textures/glow.tga blendFunc add rgbGen const 0.2 0.4 0.8 }\n");
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(tinted), tinted.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 2u);
+		if (stages.size() == 2) {
+			CHECK(stages[0].rgbGenConst);
+			CHECK(stages[0].alphaGenConst);
+			CHECK(stages[0].rgbConst[0] > 0.49f && stages[0].rgbConst[0] < 0.51f);
+			CHECK(stages[0].rgbConst[1] > 0.74f && stages[0].rgbConst[1] < 0.76f);
+			CHECK(stages[0].rgbConst[2] > 0.99f && stages[0].rgbConst[2] <= 1.01f);
+			CHECK(stages[0].alphaConst > 0.24f && stages[0].alphaConst < 0.26f);
+			CHECK_EQ_INT(stages[0].blendMode, VRHI_SHADER_BLEND_OPAQUE);
+			CHECK(stages[1].rgbGenConst);
+			CHECK(!stages[1].alphaGenConst);
+			CHECK(stages[1].rgbConst[0] > 0.19f && stages[1].rgbConst[0] < 0.21f);
+			CHECK(stages[1].rgbConst[1] > 0.39f && stages[1].rgbConst[1] < 0.41f);
+			CHECK(stages[1].rgbConst[2] > 0.79f && stages[1].rgbConst[2] < 0.81f);
+			CHECK_EQ_INT(stages[1].blendMode, VRHI_SHADER_BLEND_ADDITIVE);
+		}
+	}
+	// The accepted range matches the GL1 byte-colour semantics exactly:
+	// every rgbGen const component and the alphaGen const value must be
+	// inside [0,1], boundaries inclusive.
+	const std::string boundary = script(
+		"{ map textures/base.tga rgbGen const 0 1 1 alphaGen const 1 }\n");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(boundary), boundary.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(stages[0].rgbGenConst);
+			CHECK(stages[0].alphaGenConst);
+			CHECK(stages[0].rgbConst[0] == 0.0f);
+			CHECK(stages[0].rgbConst[1] == 1.0f);
+			CHECK(stages[0].rgbConst[2] == 1.0f);
+			CHECK(stages[0].alphaConst == 1.0f);
+		}
+	}
+	// Out-of-range, non-finite, or non-numeric constants are not part of the
+	// bounded slice: the stage stays accepted with the dynamic fallback
+	// (identity colour, flags false) instead of rejecting the material.
+	// Split across two scripts (the parser caps every shader at four stages).
+	const std::string fallbacksA = script(
+		"{ map textures/base.tga rgbGen const -0.5 0 0 depthWrite }\n"
+		"{ map textures/a.png blendFunc blend alphaGen const 2 tcMod scroll 0.1 0.1 }\n"
+		"{ map textures/b.png blendFunc blend rgbGen const 9 9 9 depthWrite }\n");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(fallbacksA), fallbacksA.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			for (std::size_t i = 0; i < stages.size(); ++i) {
+				CHECK(!stages[i].rgbGenConst);
+				CHECK(!stages[i].alphaGenConst);
+			}
+		}
+	}
+	const std::string fallbacksB = script(
+		"{ map textures/c.png blendFunc blend rgbGen const nan 0 0 depthWrite }\n"
+		"{ map textures/d.png blendFunc blend alphaGen const inf depthWrite }\n"
+		"{ map textures/e.png blendFunc blend rgbGen const abc def ghi depthWrite }\n");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(fallbacksB), fallbacksB.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			for (std::size_t i = 0; i < stages.size(); ++i) {
+				CHECK(!stages[i].rgbGenConst);
+				CHECK(!stages[i].alphaGenConst);
+			}
+		}
+	}
+	// A syntactically complete const statement with invalid/out-of-range
+	// values consumes its whole declared argument count, so keyword-looking
+	// argument tokens (for example `rgbGen const 1 1 map`) cannot be
+	// re-parsed as stage directives: the stage stays accepted with the
+	// dynamic fallback (flags false, identity tint) instead of rejecting the
+	// material, stealing a map token, or misreading a blend keyword.
+	const std::string keywordValues = script(
+		"{ map textures/base.tga rgbGen const 1 1 map }\n"
+		"{ map textures/a.png blendFunc blend rgbGen const wave 0 1 depthWrite }\n"
+		"{ map textures/b.png blendFunc blend alphaGen const blendFunc }\n");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(keywordValues), keywordValues.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+			CHECK(!stages[0].rgbGenConst);
+			CHECK(!stages[0].alphaGenConst);
+			CHECK_EQ_STR(stages[1].path, "textures/a.png");
+			CHECK(!stages[1].rgbGenConst);
+			CHECK(!stages[1].alphaGenConst);
+			CHECK_EQ_STR(stages[2].path, "textures/b.png");
+			CHECK(!stages[2].rgbGenConst);
+			CHECK(!stages[2].alphaGenConst);
+		}
+	}
+	// Truncated const statements at stage end reject the whole shader; the
+	// parser never borrows tokens past the stage boundary.
+	const std::string truncated = script("{ map textures/base.tga rgbGen const 0.5 0.5 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncated), truncated.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 0u);
+	const std::string truncatedAlpha = script("{ map textures/base.tga alphaGen const }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncatedAlpha), truncatedAlpha.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 0u);
+	// The conservative first-stage opaque helper keeps rejecting const
+	// generators: only identity matches the fixed opaque diffuse pass.
+	CHECK_EQ_STR(candidateBody(
+		"{ map textures/foo/bar.tga rgbGen const 0.5 0.5 0.5 }", nullptr), "");
+	// A dynamic generator followed by a const one on the same stage keeps the
+	// const slice intact (wave falls back, the const is preserved).
+	const std::string mixed = script(
+		"{ map textures/base.tga rgbGen wave sin 0.5 0.5 0 1 rgbGen const 0.5 0.5 0.5 }\n");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(mixed), mixed.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) CHECK(stages[0].rgbGenConst);
+	}
+}
+
 void testConsoleScriptResolution() {
 	// OpenArena defines the in-game console background as a script shader
 	// (scripts/oanew.shader): `console { { map textures/sfx/logo256.tga } }`.
@@ -529,6 +674,7 @@ int main() {
 	testWantedFilteringAndNames();
 	testBlockLevelBoundaries();
 	testSimpleMultiStageExtraction();
+	testConstGenerators();
 	testConsoleScriptResolution();
 	testPathSafetyHelpers();
 

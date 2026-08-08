@@ -121,6 +121,15 @@ struct VRHI_SceneDraw {
 	// second scene-local texture table.
 	int diffuseImage = -1;
 	bool lightmapped = false;
+	// Bounded static material tint carried from the base stage's rgbGen
+	// const / alphaGen const generators. Flags are 0 when the stage has no
+	// const generator (identity tint). Applied in the pixel shader only to
+	// the material sample; vertex colour, lightmaps, and blend state are
+	// never modified.
+	uint8_t rgbConst = 0;
+	float rgbConstColor[3] = { 1.0f, 1.0f, 1.0f };
+	uint8_t alphaConst = 0;
+	float alphaConstValue = 1.0f;
 };
 static std::vector<VRHI_SceneEntity> g_sceneEntities;
 static std::vector<VRHI_ScenePoly> g_scenePolys;
@@ -158,6 +167,15 @@ struct VRHI_WorldBatch {
 	int stageImages[VRHI_SHADER_MAX_STAGES] = { -1, -1, -1, -1 };
 	uint8_t stageBlend[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_BLEND_OPAQUE,
 		VRHI_SHADER_BLEND_OPAQUE, VRHI_SHADER_BLEND_OPAQUE, VRHI_SHADER_BLEND_OPAQUE };
+	// Per-stage bounded static const generators (rgbGen const / alphaGen
+	// const) carried from the parsed stage data to the material tint in the
+	// pixel shader. Flags are 0 for stages without a const generator.
+	uint8_t stageRgbConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+	float stageRgbConstColor[VRHI_SHADER_MAX_STAGES][3] = {
+		{ 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f },
+		{ 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f } };
+	uint8_t stageAlphaConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+	float stageAlphaConstValue[VRHI_SHADER_MAX_STAGES] = { 1.0f, 1.0f, 1.0f, 1.0f };
 	// A non-opaque stage zero is a translucent world batch. It is rendered
 	// after opaque batches in back-to-front order with depth writes disabled.
 	bool translucent = false;
@@ -181,6 +199,11 @@ struct VRHI_UITexture {
 struct VRHI_SceneShaderMaterial {
 	int diffuseImage = -1;
 	uint8_t blendMode = VRHI_SHADER_BLEND_OPAQUE;
+	// Base-stage bounded static const generators; flags 0 mean identity tint.
+	uint8_t rgbConst = 0;
+	float rgbConstColor[3] = { 1.0f, 1.0f, 1.0f };
+	uint8_t alphaConst = 0;
+	float alphaConstValue = 1.0f;
 };
 // Minimal, decoded copies of the BSP PVS traversal state. Values are
 // byte-swapped out of the on-disk little-endian form at load time and copied
@@ -1150,11 +1173,19 @@ float4 main(PSInput input) : SV_Target
 static const char *VRHI_WorldOverlayPixelSource = R"(
 Texture2D<float4> u_diffuse : register(t0, VRHI_STAGE_SPACE);
 SamplerState u_diffuseSampler : register(s0, VRHI_STAGE_SPACE);
+cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
+{
+    float4 u_materialConst; // rgbGen const tint (rgb), alphaGen const (a); 1,1,1,1 when absent
+};
 struct PSInput { float4 position : SV_Position; float2 diffuse : TEXCOORD0; float2 lightmap : TEXCOORD1; float lightmapLayer : TEXCOORD2; float4 color : TEXCOORD3; };
 [shader("pixel")]
 float4 main(PSInput input) : SV_Target
 {
-    return u_diffuse.Sample(u_diffuseSampler, input.diffuse) * input.color;
+    float4 sample = u_diffuse.Sample(u_diffuseSampler, input.diffuse);
+    // Bounded static const generators tint only the material sample; vertex
+    // colour and blend state are never modified here.
+    sample *= u_materialConst;
+    return sample * input.color;
 }
 )";
 
@@ -1163,6 +1194,10 @@ Texture2D<float4> u_diffuse : register(t0, VRHI_STAGE_SPACE);
 SamplerState u_diffuseSampler : register(s0, VRHI_STAGE_SPACE);
 Texture2DArray<float4> u_lightmap : register(t1, VRHI_STAGE_SPACE);
 SamplerState u_lightmapSampler : register(s1, VRHI_STAGE_SPACE);
+cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
+{
+    float4 u_materialConst; // rgbGen const tint (rgb), alphaGen const (a); 1,1,1,1 when absent
+};
 struct PSInput {
     float4 position : SV_Position;
     float2 diffuse : TEXCOORD0;
@@ -1174,6 +1209,10 @@ struct PSInput {
 float4 main(PSInput input) : SV_Target
 {
     float4 sample = u_diffuse.Sample(u_diffuseSampler, input.diffuse);
+    // Bounded static const generators tint only the material sample; vertex
+    // colour, lightmaps, and blend state are never modified here.
+    sample.rgb *= u_materialConst.rgb;
+    sample.a *= u_materialConst.a;
     if (input.lightmapLayer >= -0.5)
         sample.rgb *= u_lightmap.Sample(u_lightmapSampler,
             float3(saturate(input.lightmap), input.lightmapLayer)).rgb;
@@ -2919,10 +2958,23 @@ static void VRHI_ReportUnresolvedMaterial(const char *shaderName, const char *re
 }
 
 static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
-	uint8_t *blends, int *stageCount) {
+	uint8_t *blends, int *stageCount, uint8_t *rgbConstFlags,
+	float (*rgbConstColor)[3], uint8_t *alphaConstFlags,
+	float *alphaConstValues) {
 	if (images == nullptr || blends == nullptr || stageCount == nullptr) return false;
 	*stageCount = 0;
-	for (size_t i = 0; i < VRHI_SHADER_MAX_STAGES; ++i) { images[i] = -1; blends[i] = VRHI_SHADER_BLEND_OPAQUE; }
+	for (size_t i = 0; i < VRHI_SHADER_MAX_STAGES; ++i) {
+		images[i] = -1;
+		blends[i] = VRHI_SHADER_BLEND_OPAQUE;
+		if (rgbConstFlags != nullptr) rgbConstFlags[i] = 0;
+		if (rgbConstColor != nullptr) {
+			rgbConstColor[i][0] = 1.0f;
+			rgbConstColor[i][1] = 1.0f;
+			rgbConstColor[i][2] = 1.0f;
+		}
+		if (alphaConstFlags != nullptr) alphaConstFlags[i] = 0;
+		if (alphaConstValues != nullptr) alphaConstValues[i] = 1.0f;
+	}
 	std::vector<VRHI_ShaderStage> stages;
 	std::string directPath;
 	vrhi_image::DecodeResult directDecoded;
@@ -2961,6 +3013,14 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 			return false;
 		}
 		blends[i] = static_cast<uint8_t>(stages[i].blendMode);
+		if (rgbConstFlags != nullptr) rgbConstFlags[i] = stages[i].rgbGenConst ? 1 : 0;
+		if (rgbConstColor != nullptr) {
+			rgbConstColor[i][0] = stages[i].rgbConst[0];
+			rgbConstColor[i][1] = stages[i].rgbConst[1];
+			rgbConstColor[i][2] = stages[i].rgbConst[2];
+		}
+		if (alphaConstFlags != nullptr) alphaConstFlags[i] = stages[i].alphaGenConst ? 1 : 0;
+		if (alphaConstValues != nullptr) alphaConstValues[i] = stages[i].alphaConst;
 	}
 	*stageCount = static_cast<int>(stages.size());
 	if (scriptResolved)
@@ -2974,7 +3034,8 @@ static bool VRHI_LoadDiffuseTGA(const char *shaderName, int *imageIndex) {
 	uint8_t blends[VRHI_SHADER_MAX_STAGES];
 	int count = 0;
 	if (imageIndex != nullptr) *imageIndex = -1;
-	if (!VRHI_LoadDiffuseStages(shaderName, images, blends, &count)) return false;
+	if (!VRHI_LoadDiffuseStages(shaderName, images, blends, &count,
+		nullptr, nullptr, nullptr, nullptr)) return false;
 	if (imageIndex != nullptr) *imageIndex = images[0];
 	return true;
 }
@@ -3558,7 +3619,14 @@ static void VRHI_LoadWorld(const char *name) {
 		int stageImages[VRHI_SHADER_MAX_STAGES] = { -1, -1, -1, -1 };
 		uint8_t stageBlend[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		int stageCount = 0;
-		VRHI_LoadDiffuseStages(shader.shader, stageImages, stageBlend, &stageCount);
+		uint8_t stageRgbConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		float stageRgbConstColor[VRHI_SHADER_MAX_STAGES][3] = {
+			{ 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f },
+			{ 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f } };
+		uint8_t stageAlphaConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		float stageAlphaConstValue[VRHI_SHADER_MAX_STAGES] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		VRHI_LoadDiffuseStages(shader.shader, stageImages, stageBlend, &stageCount,
+			stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue);
 		diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 		if (surface.surfaceType == MST_PATCH) {
 			VRHI_PatchMesh patch;
@@ -3593,6 +3661,12 @@ static void VRHI_LoadWorld(const char *name) {
 			for (int stage = 0; stage < stageCount; ++stage) {
 				batch.stageImages[stage] = stageImages[stage];
 				batch.stageBlend[stage] = stageBlend[stage];
+				batch.stageRgbConst[stage] = stageRgbConst[stage];
+				batch.stageRgbConstColor[stage][0] = stageRgbConstColor[stage][0];
+				batch.stageRgbConstColor[stage][1] = stageRgbConstColor[stage][1];
+				batch.stageRgbConstColor[stage][2] = stageRgbConstColor[stage][2];
+				batch.stageAlphaConst[stage] = stageAlphaConst[stage];
+				batch.stageAlphaConstValue[stage] = stageAlphaConstValue[stage];
 			}
 			g_worldBatches.push_back(batch);
 			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
@@ -3684,6 +3758,12 @@ static void VRHI_LoadWorld(const char *name) {
 			for (int stage = 0; stage < stageCount; ++stage) {
 				batch.stageImages[stage] = stageImages[stage];
 				batch.stageBlend[stage] = stageBlend[stage];
+				batch.stageRgbConst[stage] = stageRgbConst[stage];
+				batch.stageRgbConstColor[stage][0] = stageRgbConstColor[stage][0];
+				batch.stageRgbConstColor[stage][1] = stageRgbConstColor[stage][1];
+				batch.stageRgbConstColor[stage][2] = stageRgbConstColor[stage][2];
+				batch.stageAlphaConst[stage] = stageAlphaConst[stage];
+				batch.stageAlphaConstValue[stage] = stageAlphaConstValue[stage];
 			}
 			g_worldBatches.push_back(batch);
 			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
@@ -4068,7 +4148,9 @@ static VRHI_WorldVertex VRHI_SceneVertex(const glm::vec3 &position,
 
 static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	size_t indexCount, int diffuseImage = -1, bool lightmapped = false,
-	bool translucent = false, uint8_t blendMode = VRHI_SHADER_BLEND_OPAQUE) {
+	bool translucent = false, uint8_t blendMode = VRHI_SHADER_BLEND_OPAQUE,
+	uint8_t rgbConst = 0, const float *rgbConstColor = nullptr,
+	uint8_t alphaConst = 0, float alphaConstValue = 1.0f) {
 	if (indexCount == 0 || firstIndex > UINT32_MAX || indexCount > UINT32_MAX ||
 		g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) return false;
 	VRHI_SceneDraw draw;
@@ -4079,6 +4161,14 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	draw.lightmapped = lightmapped;
 	draw.blendMode = blendMode;
 	draw.translucent = translucent || blendMode != VRHI_SHADER_BLEND_OPAQUE;
+	draw.rgbConst = rgbConst;
+	if (rgbConstColor != nullptr) {
+		draw.rgbConstColor[0] = rgbConstColor[0];
+		draw.rgbConstColor[1] = rgbConstColor[1];
+		draw.rgbConstColor[2] = rgbConstColor[2];
+	}
+	draw.alphaConst = alphaConst;
+	draw.alphaConstValue = alphaConstValue;
 	g_sceneDraws.push_back(draw);
 	return true;
 }
@@ -4150,11 +4240,24 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 		int images[VRHI_SHADER_MAX_STAGES];
 		uint8_t blends[VRHI_SHADER_MAX_STAGES];
 		int stageCount = 0;
+		uint8_t stageRgbConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		float stageRgbConstColor[VRHI_SHADER_MAX_STAGES][3] = {
+			{ 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f },
+			{ 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f } };
+		uint8_t stageAlphaConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		float stageAlphaConstValue[VRHI_SHADER_MAX_STAGES] = { 1.0f, 1.0f, 1.0f, 1.0f };
 		if (!shaderName.empty())
-			VRHI_LoadDiffuseStages(shaderName.c_str(), images, blends, &stageCount);
+			VRHI_LoadDiffuseStages(shaderName.c_str(), images, blends, &stageCount,
+				stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue);
 		if (stageCount > 0) {
 			material.diffuseImage = images[0];
 			material.blendMode = blends[0];
+			material.rgbConst = stageRgbConst[0];
+			material.rgbConstColor[0] = stageRgbConstColor[0][0];
+			material.rgbConstColor[1] = stageRgbConstColor[0][1];
+			material.rgbConstColor[2] = stageRgbConstColor[0][2];
+			material.alphaConst = stageAlphaConst[0];
+			material.alphaConstValue = stageAlphaConstValue[0];
 		}
 		g_sceneShaderDiffuseByHandle.emplace(draw->shader, material);
 		if (material.diffuseImage >= 0) VRHI_UploadWorldDiffuse();
@@ -4165,6 +4268,12 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 	const VRHI_WorldDiffuseImage &image =
 		g_worldDiffuseImages[static_cast<size_t>(material.diffuseImage)];
 	applyMaterial(material.blendMode, image.hasTransparency);
+	draw->rgbConst = material.rgbConst;
+	draw->rgbConstColor[0] = material.rgbConstColor[0];
+	draw->rgbConstColor[1] = material.rgbConstColor[1];
+	draw->rgbConstColor[2] = material.rgbConstColor[2];
+	draw->alphaConst = material.alphaConst;
+	draw->alphaConstValue = material.alphaConstValue;
 	return image.texture;
 }
 
@@ -4339,8 +4448,12 @@ static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4
 			for (uint32_t index : scratchIndexes) g_sceneIndexes.push_back(baseVertex + index);
 			const uint8_t blendMode = batch.stageCount > 0
 				? batch.stageBlend[0] : VRHI_SHADER_BLEND_OPAQUE;
+			const uint8_t rgbConst = batch.stageCount > 0 ? batch.stageRgbConst[0] : 0;
+			const uint8_t alphaConst = batch.stageCount > 0 ? batch.stageAlphaConst[0] : 0;
 			if (!VRHI_AppendSceneDraw(entity.customShader, firstIndex, scratchIndexes.size(),
-				batch.diffuseImage, lightmapped, color.a < 0.999f, blendMode)) {
+				batch.diffuseImage, lightmapped, color.a < 0.999f, blendMode,
+				rgbConst, batch.stageRgbConstColor[0],
+				alphaConst, batch.stageAlphaConstValue[0])) {
 				g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
 				g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
 				continue;
@@ -4843,6 +4956,21 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 						.SetSampler(1, { "u_lightmapSampler", 1, VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
 							VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP });
 			}
+			// Per-draw material tint from the bounded static const generators;
+			// identity (1,1,1,1) when the stage has none. The uniform is set
+			// only for the programs that declare u_materialConst: the diffuse
+			// pixel shader (useDiffuse) and the overlay pixel shader. The solid
+			// and lightmap fallback programs never receive it. Only the material
+			// sample is tinted, never vertex colour, lightmaps, or the blend
+			// classification.
+			if (materialStage && (useDiffuse || overlay)) {
+				const glm::vec4 materialConst(
+					batch.stageRgbConst[stage] ? batch.stageRgbConstColor[stage][0] : 1.0f,
+					batch.stageRgbConst[stage] ? batch.stageRgbConstColor[stage][1] : 1.0f,
+					batch.stageRgbConst[stage] ? batch.stageRgbConstColor[stage][2] : 1.0f,
+					batch.stageAlphaConst[stage] ? batch.stageAlphaConstValue[stage] : 1.0f);
+				g_worldState.SetUniform(0, { "u_materialConst", { materialConst } });
+			}
 			if (vhSetState(g_worldStateId, g_worldState)) {
 				if (!submitted) vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
 				vhDrawIndexed(g_worldStateId, batch.indexCount, 1, batch.firstIndex);
@@ -4930,6 +5058,20 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 					.SetSampler(0, { "u_lightmapSampler", 0,
 						VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
 						VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP });
+			}
+			// Per-draw material tint carried on the scene draw (identity when
+			// the base stage has no const generator). Only the textured scene
+			// program (the shared diffuse pixel shader) declares
+			// u_materialConst; the lightmap and solid fallback programs never
+			// receive it. The diffuse program tints only the material sample,
+			// never vertex colour, lightmaps, or blend state.
+			if (textured) {
+				const glm::vec4 materialConst(
+					draw.rgbConst ? draw.rgbConstColor[0] : 1.0f,
+					draw.rgbConst ? draw.rgbConstColor[1] : 1.0f,
+					draw.rgbConst ? draw.rgbConstColor[2] : 1.0f,
+					draw.alphaConst ? draw.alphaConstValue : 1.0f);
+				g_worldState.SetUniform(0, { "u_materialConst", { materialConst } });
 			}
 			if (vhSetState(g_worldStateId, g_worldState)) {
 				if (!submitted) vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
