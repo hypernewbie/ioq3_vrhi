@@ -1,0 +1,3 @@
+[submodule "code/thirdparty/vrhi"]
+	path = code/thirdparty/vrhi
+	url = https://github.com/hypernewbie/vrhi.git
