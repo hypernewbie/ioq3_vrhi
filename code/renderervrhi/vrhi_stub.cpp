@@ -62,7 +62,9 @@ static bool g_deviceInitialized = false;
 static bool g_uiInitialized = false;
 static vhShader g_uiVertexShader = VRHI_INVALID_HANDLE;
 static vhShader g_uiPixelShader = VRHI_INVALID_HANDLE;
+static vhShader g_uiTexturedPixelShader = VRHI_INVALID_HANDLE;
 static vhProgram g_uiProgram;
+static vhProgram g_uiTexturedProgram;
 static vhState g_uiState;
 static const vhStateId g_uiStateId = 2;
 static vhShader g_worldVertexShader = VRHI_INVALID_HANDLE;
@@ -98,6 +100,13 @@ struct VRHI_WorldBatch {
 	uint32_t indexCount = 0;
 	int diffuseImage = -1;
 };
+struct VRHI_UITexture {
+	std::string path;
+	int width = 0;
+	int height = 0;
+	std::vector<byte> pixels;
+	vhTexture texture = VRHI_INVALID_HANDLE;
+};
 // Minimal, decoded copies of the BSP PVS traversal state. Values are
 // byte-swapped out of the on-disk little-endian form at load time and copied
 // out of the FS buffer, so no pointer into FS data is retained. Only the
@@ -120,6 +129,9 @@ static std::vector<VRHI_WorldVertex> g_worldVertices;
 static std::vector<uint32_t> g_worldIndexes;
 static std::vector<VRHI_WorldBatch> g_worldBatches;
 static std::vector<VRHI_WorldDiffuseImage> g_worldDiffuseImages;
+static std::vector<VRHI_UITexture> g_uiTextures;
+static std::unordered_map<qhandle_t, size_t> g_uiTextureByHandle;
+static std::unordered_map<qhandle_t, bool> g_uiTextureAttempts;
 static std::vector<byte> g_worldLightmapPixels;
 // BSP PVS cull state (CPU copies, see VRHI_WorldPlane/Node/Leaf above).
 static std::vector<VRHI_WorldPlane> g_worldPlanes;
@@ -144,8 +156,11 @@ static int g_worldLightmapLayers = 0;
 static bool g_worldLightmapAvailable = false;
 static bool g_worldLoaded = false;
 static bool g_worldShaderInitialized = false;
+static void VRHI_UploadUITextures(void);
 static int32_t g_worldDrawErrorBaseline = 0;
 static bool g_worldDrawSubmitted = false;
+static int32_t g_uiDrawErrorBaseline = 0;
+static bool g_uiDrawSubmitted = false;
 static glm::vec4 g_uiColor(1.0f, 1.0f, 1.0f, 1.0f);
 static int g_frameViewportWidth = 0;
 static int g_frameViewportHeight = 0;
@@ -179,6 +194,11 @@ static const int VRHI_MAX_WORLD_LEAFS = 65536;
 static const int VRHI_MAX_WORLD_LEAFSURFACES = 262144;
 static const int VRHI_MAX_WORLD_CLUSTERS = 65536;
 static const size_t VRHI_MAX_WORLD_VIS_BYTES = 16u * 1024u * 1024u;
+// UI registrations retain decoded direct-TGA pixels so a video restart can
+// destroy and safely re-upload GPU textures without rereading untrusted data.
+static const int VRHI_MAX_UI_TEXTURES = 1024;
+static const int VRHI_MAX_UI_TEXTURE_DIMENSION = 2048;
+static const size_t VRHI_MAX_UI_TEXTURE_BYTES = 64u * 1024u * 1024u;
 
 // Keep the generated qpath within MAX_QPATH while allowing the command to
 // accept only a basename.  The prefix and suffix are fixed and never come
@@ -759,17 +779,20 @@ float4 main(PSInput input) : SV_Target
 }
 )";
 
-// This shader is deliberately a solid-color UI fallback. It draws no texture
-// or world content; the shader handle and texture coordinates remain ignored.
+// UI uses a procedural six-vertex rectangle. The solid program remains the
+// explicit fallback for unsupported handles; the textured program shares the
+// vertex shader so DrawStretchPic's UV rectangle is preserved exactly.
 static const char *VRHI_UIVertexSource = R"(
 cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
 {
     float4 ui_rect;
+    float4 ui_uv;
 };
 
 struct VSOutput
 {
     float4 position : SV_Position;
+    float2 texcoord : TEXCOORD0;
 };
 
 [shader("vertex")]
@@ -782,6 +805,7 @@ VSOutput main(uint vertexID : SV_VertexID)
     float2 pixel = ui_rect.xy + corners[vertexID] * ui_rect.zw;
     VSOutput output;
     output.position = float4(pixel * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    output.texcoord = ui_uv.xy + corners[vertexID] * (ui_uv.zw - ui_uv.xy);
     return output;
 }
 )";
@@ -796,6 +820,27 @@ cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
 float4 main() : SV_Target
 {
     return ui_color;
+}
+)";
+
+static const char *VRHI_UITexturedPixelSource = R"(
+Texture2D<float4> ui_texture : register(t0, VRHI_STAGE_SPACE);
+SamplerState ui_sampler : register(s0, VRHI_STAGE_SPACE);
+cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
+{
+    float4 ui_color;
+};
+
+struct PSInput
+{
+    float4 position : SV_Position;
+    float2 texcoord : TEXCOORD0;
+};
+
+[shader("pixel")]
+float4 main(PSInput input) : SV_Target
+{
+    return ui_texture.Sample(ui_sampler, input.texcoord) * ui_color;
 }
 )";
 
@@ -1107,16 +1152,42 @@ static bool VRHI_UploadWorldGeometry(void) {
 	return true;
 }
 
+static void VRHI_DestroyUITextures(bool clearData) {
+	if (g_deviceInitialized) {
+		vhFinish();
+	}
+	for (VRHI_UITexture &image : g_uiTextures) {
+		if (image.texture != VRHI_INVALID_HANDLE) {
+			vhDestroyTexture(image.texture);
+			image.texture = VRHI_INVALID_HANDLE;
+		}
+	}
+	if (g_deviceInitialized) {
+		vhFinish();
+	}
+	if (clearData) {
+		g_uiTextures.clear();
+		g_uiTextureByHandle.clear();
+		g_uiTextureAttempts.clear();
+	}
+}
+
 static void VRHI_DestroyUI(void) {
+	VRHI_DestroyUITextures(true);
 	if (g_uiVertexShader != VRHI_INVALID_HANDLE) {
 		vhDestroyShader(g_uiVertexShader);
 	}
 	if (g_uiPixelShader != VRHI_INVALID_HANDLE) {
 		vhDestroyShader(g_uiPixelShader);
 	}
+	if (g_uiTexturedPixelShader != VRHI_INVALID_HANDLE) {
+		vhDestroyShader(g_uiTexturedPixelShader);
+	}
 	g_uiVertexShader = VRHI_INVALID_HANDLE;
 	g_uiPixelShader = VRHI_INVALID_HANDLE;
+	g_uiTexturedPixelShader = VRHI_INVALID_HANDLE;
 	g_uiProgram.clear();
+	g_uiTexturedProgram.clear();
 	g_uiState = vhState();
 	g_uiInitialized = false;
 }
@@ -1131,13 +1202,13 @@ static bool VRHI_InitializeUI(void) {
 
 	std::vector<uint32_t> vertexSpirv;
 	std::vector<uint32_t> pixelSpirv;
+	std::vector<uint32_t> texturedPixelSpirv;
 	std::string error;
 	if (!vhCompileShader("VRHI_UIVertex", VRHI_UIVertexSource,
 		VRHI_SHADER_STAGE_VERTEX | VRHI_SHADER_SM_6_0, vertexSpirv, "main",
 		{}, {}, &error)) {
 		VRHI_Printf(PRINT_WARNING,
-			"renderer_vrhi: solid-color UI vertex shader compile failed: %s\n",
-			error.c_str());
+			"renderer_vrhi: UI vertex shader compile failed: %s\n", error.c_str());
 		return false;
 	}
 	error.clear();
@@ -1149,23 +1220,25 @@ static bool VRHI_InitializeUI(void) {
 			error.c_str());
 		return false;
 	}
+	std::string texturedError;
+	const bool texturedCompiled = vhCompileShader("VRHI_UITexturedPixel",
+		VRHI_UITexturedPixelSource,
+		VRHI_SHADER_STAGE_PIXEL | VRHI_SHADER_SM_6_0, texturedPixelSpirv, "main",
+		{}, {}, &texturedError);
+	if (!texturedCompiled) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: textured UI pixel shader unavailable; direct TGAs use solid fallback: %s\n",
+			texturedError.c_str());
+	}
 
 	g_uiVertexShader = vhAllocShader();
 	g_uiPixelShader = vhAllocShader();
+	if (texturedCompiled) g_uiTexturedPixelShader = vhAllocShader();
 	if (g_uiVertexShader == VRHI_INVALID_HANDLE ||
-		g_uiPixelShader == VRHI_INVALID_HANDLE) {
-		VRHI_Printf(PRINT_WARNING,
-			"renderer_vrhi: solid-color UI shader allocation failed\n");
-		// Release whichever IDs were allocated. No create command has been
-		// submitted yet, so this cannot destroy a backend shader resource.
-		if (g_uiVertexShader != VRHI_INVALID_HANDLE) {
-			vhDestroyShader(g_uiVertexShader);
-		}
-		if (g_uiPixelShader != VRHI_INVALID_HANDLE) {
-			vhDestroyShader(g_uiPixelShader);
-		}
-		g_uiVertexShader = VRHI_INVALID_HANDLE;
-		g_uiPixelShader = VRHI_INVALID_HANDLE;
+		g_uiPixelShader == VRHI_INVALID_HANDLE ||
+		(texturedCompiled && g_uiTexturedPixelShader == VRHI_INVALID_HANDLE)) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: UI shader allocation failed\n");
+		VRHI_DestroyUI();
 		return false;
 	}
 
@@ -1174,20 +1247,29 @@ static bool VRHI_InitializeUI(void) {
 		vertexSpirv, "main");
 	vhCreateShader(g_uiPixelShader, "VRHI_UIPixel", VRHI_SHADER_STAGE_PIXEL,
 		pixelSpirv, "main");
+	if (texturedCompiled) {
+		vhCreateShader(g_uiTexturedPixelShader, "VRHI_UITexturedPixel",
+			VRHI_SHADER_STAGE_PIXEL, texturedPixelSpirv, "main");
+	}
 	vhFinish();
 	const int32_t errorsAfter = g_vhErrorCounter.load(std::memory_order_relaxed);
 	if (errorsAfter != errorsBefore) {
 		VRHI_Printf(PRINT_WARNING,
-			"renderer_vrhi: solid-color UI shader creation failed (VRHI errors %+d)\n",
+			"renderer_vrhi: UI shader creation failed (VRHI errors %+d)\n",
 			static_cast<int>(errorsAfter - errorsBefore));
 		VRHI_DestroyUI();
 		return false;
 	}
 
 	g_uiProgram = vhCreateGfxProgram(g_uiVertexShader, g_uiPixelShader);
+	if (texturedCompiled) {
+		g_uiTexturedProgram = vhCreateGfxProgram(g_uiVertexShader,
+			g_uiTexturedPixelShader);
+	}
 	g_uiInitialized = true;
 	VRHI_Printf(PRINT_ALL,
-		"renderer_vrhi: solid-color UI fallback ready (texture/world rendering remains unavailable)\n");
+		"renderer_vrhi: UI ready (direct-TGA textures=%s, solid fallback=yes)\n",
+		!g_uiTexturedProgram.empty() ? "yes" : "no");
 	return true;
 }
 
@@ -1249,9 +1331,10 @@ static void VRHI_BeginRegistration(glconfig_t *config) {
 		VRHI_RefreshSwapchain();
 	}
 
-	// Compile the tiny UI fallback only after vhInit has created a device; a
-	// shader failure leaves clear/present and all no-op callbacks usable.
+	// Compile UI programs only after vhInit has created a device; a shader
+	// failure leaves clear/present and solid-color fallback callbacks usable.
 	VRHI_InitializeUI();
+	VRHI_UploadUITextures();
 	VRHI_InitializeWorldShader();
 	if (g_worldLoaded) VRHI_UploadWorldGeometry();
 	VRHI_CreateWorldDepth(g_windowWidth, g_windowHeight);
@@ -1264,6 +1347,7 @@ static void VRHI_Shutdown(qboolean destroyWindow) {
 			// Keep the device and SDL window alive for a subsequent registration,
 			// but release map/video resources before the swapchain is reused.
 			VRHI_DestroyWorldResources(true);
+			VRHI_DestroyUITextures(false);
 			vhFinish();
 		}
 		g_frameState = vhState();
@@ -1292,7 +1376,11 @@ static void VRHI_Shutdown(qboolean destroyWindow) {
 		// the device or native window is torn down.
 		vhFinish();
 		VRHI_DestroyWorldResources(true);
-		VRHI_DestroyUI();
+	}
+	// Also clear decoded UI data when registration failed before a device was
+	// created; final shutdown must not rely on DLL unload for CPU ownership.
+	VRHI_DestroyUI();
+	if (g_deviceInitialized) {
 		vhFinish();
 		vhShutdown(false);
 		g_deviceInitialized = false;
@@ -1415,15 +1503,25 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 		}
 		g_worldDrawSubmitted = false;
 	}
+	if (g_uiDrawSubmitted) {
+		const int32_t errors = g_vhErrorCounter.load(std::memory_order_relaxed) -
+			g_uiDrawErrorBaseline;
+		if (errors > 0) {
+			VRHI_Printf(PRINT_WARNING,
+				"renderer_vrhi: UI draw reported %d VRHI error(s)\n", errors);
+		}
+		g_uiDrawSubmitted = false;
+	}
 	// Never let a later EndFrame reuse a framebuffer from after present.
 	g_frameBackbufferReady = false;
 	g_frameBackbuffer = VRHI_INVALID_HANDLE;
 }
 
-// Entity, patch, and textured UI resources remain outside this slice.
-// DrawStretchPic provides the existing solid-color UI fallback while the first
-// BSP model and its bounded direct-TGA diffuse batches are rendered by the
-// static world path above. Every callback is
+// Entity, patch, and non-direct material resources remain outside this slice.
+// DrawStretchPic supports bounded direct-TGA UI textures and retains a
+// solid-color fallback for missing/unsupported handles, while the first BSP
+// model and its bounded direct-TGA diffuse batches are rendered by the static
+// world path above. Every callback is
 // nevertheless populated so the client, cgame, and UI can safely exercise the
 // renderer without NULL dereferences.
 //
@@ -1431,9 +1529,9 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 // client, cgame, and UI see successful registrations (qhandle_t 0 means
 // failure). The handle policy mirrors the GL renderers: each handle space is
 // independent, the first handle is 1, the same name always resolves to the
-// same handle, and NULL/empty names fail with 0. Registration callbacks keep
-// only this name->handle mapping; BSP diffuse image data is owned separately by
-// the bounded world loader.
+// same handle, and NULL/empty names fail with 0. Model/skin/general
+// shader-script/JPG/PNG/PK3 material semantics remain unsupported; direct type
+// 2/10 24/32-bit TGA data is the sole uploaded UI material.
 static qhandle_t VRHI_RegisterName(
 	std::unordered_map<std::string, qhandle_t> &handles, const char *name,
 	const char *kind) {
@@ -1461,6 +1559,9 @@ static std::unordered_map<std::string, qhandle_t> g_modelHandles;
 static std::unordered_map<std::string, qhandle_t> g_skinHandles;
 static std::unordered_map<std::string, qhandle_t> g_shaderHandles;
 
+static bool VRHI_RegisterDirectUITexture(qhandle_t handle, const char *name);
+static void VRHI_UploadUITextures(void);
+
 static qhandle_t VRHI_RegisterModel(const char *name) {
 	return VRHI_RegisterName(g_modelHandles, name, "RegisterModel");
 }
@@ -1468,12 +1569,18 @@ static qhandle_t VRHI_RegisterSkin(const char *name) {
 	return VRHI_RegisterName(g_skinHandles, name, "RegisterSkin");
 }
 static qhandle_t VRHI_RegisterShader(const char *name) {
-	return VRHI_RegisterName(g_shaderHandles, name, "RegisterShader");
+	const qhandle_t handle = VRHI_RegisterName(g_shaderHandles, name,
+		"RegisterShader");
+	if (handle != 0) VRHI_RegisterDirectUITexture(handle, name);
+	return handle;
 }
 static qhandle_t VRHI_RegisterShaderNoMip(const char *name) {
 	// RegisterShader and RegisterShaderNoMip share one handle space, mirroring
 	// the GL renderers where both paths resolve through the same shader table.
-	return VRHI_RegisterName(g_shaderHandles, name, "RegisterShaderNoMip");
+	const qhandle_t handle = VRHI_RegisterName(g_shaderHandles, name,
+		"RegisterShaderNoMip");
+	if (handle != 0) VRHI_RegisterDirectUITexture(handle, name);
+	return handle;
 }
 static bool VRHI_ValidLump(const lump_t &lump, size_t fileSize,
 	const char *name) {
@@ -1643,23 +1750,69 @@ static int VRHI_ReadLeafSurface(const byte *lumpData, int index) {
 	return LittleLong(disk);
 }
 
-static bool VRHI_LoadDiffuseTGA(const char *shaderName, int *imageIndex) {
-	if (imageIndex != nullptr) *imageIndex = -1;
-	if (shaderName == nullptr || g_ri.FS_ReadFile == nullptr) return false;
-	size_t shaderLength = 0;
-	while (shaderLength < MAX_QPATH && shaderName[shaderLength] != '\0') ++shaderLength;
-	if (shaderLength == 0 || shaderLength >= MAX_QPATH ||
-		shaderName[0] == '/' || shaderName[0] == '\\') return false;
-	std::string path(shaderName, shaderLength);
+static bool VRHI_ResolveDirectTGAPath(const char *name, std::string *resolved) {
+	if (resolved != nullptr) resolved->clear();
+	if (name == nullptr || resolved == nullptr) return false;
+	size_t length = 0;
+	while (length < MAX_QPATH && name[length] != '\0') ++length;
+	if (length == 0 || length >= MAX_QPATH || name[0] == '/' || name[0] == '\\') return false;
+	std::string path(name, length);
 	if (path.find("..") != std::string::npos) return false;
-	const size_t extension = path.size() >= 4 ? path.size() - 4 : 0;
-	if (path.size() < 4 || (path[extension] != '.' ||
-		(path[extension + 1] != 't' && path[extension + 1] != 'T') ||
-		(path[extension + 2] != 'g' && path[extension + 2] != 'G') ||
-		(path[extension + 3] != 'a' && path[extension + 3] != 'A'))) {
+	const size_t slash = path.find_last_of("/\\");
+	const size_t dot = path.find_last_of('.');
+	const bool hasExtension = dot != std::string::npos &&
+		(slash == std::string::npos || dot > slash) && dot + 1 < path.size();
+	const bool isTGA = path.size() >= 4 &&
+		(path[path.size() - 4] == '.') &&
+		(path[path.size() - 3] == 't' || path[path.size() - 3] == 'T') &&
+		(path[path.size() - 2] == 'g' || path[path.size() - 2] == 'G') &&
+		(path[path.size() - 1] == 'a' || path[path.size() - 1] == 'A');
+	// Explicit JPG/PNG (and shader-script-like extensions) are never rewritten
+	// to "*.jpg.tga"; only a bare shader name or an explicit .tga is eligible.
+	if (hasExtension && !isTGA) return false;
+	if (!isTGA) {
 		if (path.size() + 4 >= MAX_QPATH) return false;
 		path += ".tga";
 	}
+	*resolved = std::move(path);
+	return true;
+}
+
+static bool VRHI_DecodeDirectTGA(const char *name, int maxDimension,
+	size_t maxBytes, std::string *pathOut, vrhi_tga::DecodeResult *decodedOut) {
+	if (pathOut != nullptr) pathOut->clear();
+	if (decodedOut != nullptr) *decodedOut = vrhi_tga::DecodeResult();
+	std::string path;
+	if (!VRHI_ResolveDirectTGAPath(name, &path) ||
+		g_ri.FS_ReadFile == nullptr || g_ri.FS_FreeFile == nullptr ||
+		decodedOut == nullptr) return false;
+	void *fileData = nullptr;
+	const long fileSizeLong = g_ri.FS_ReadFile(path.c_str(), &fileData);
+	if (fileData == nullptr || fileSizeLong < vrhi_tga::TGA_HEADER_BYTES) {
+		if (fileData != nullptr) g_ri.FS_FreeFile(fileData);
+		return false;
+	}
+	bool ok = false;
+	try {
+		ok = vrhi_tga::Decode(static_cast<const byte *>(fileData),
+			static_cast<size_t>(fileSizeLong), maxDimension, maxBytes, decodedOut);
+	} catch (...) {
+		// A bounded input can still fail allocation; preserve the renderer's
+		// solid/lightmap fallback instead of allowing a hostile TGA to escape.
+		ok = false;
+	}
+	g_ri.FS_FreeFile(fileData);
+	if (!ok) return false;
+	if (pathOut != nullptr) *pathOut = std::move(path);
+	return true;
+}
+
+static bool VRHI_LoadDiffuseTGA(const char *shaderName, int *imageIndex) {
+	if (imageIndex != nullptr) *imageIndex = -1;
+	std::string path;
+	vrhi_tga::DecodeResult decoded;
+	if (!VRHI_DecodeDirectTGA(shaderName, VRHI_MAX_WORLD_DIFFUSE_DIMENSION,
+		VRHI_MAX_WORLD_DIFFUSE_BYTES, &path, &decoded)) return false;
 	for (size_t i = 0; i < g_worldDiffuseImages.size(); ++i) {
 		if (g_worldDiffuseImages[i].path == path) {
 			if (imageIndex != nullptr) *imageIndex = static_cast<int>(i);
@@ -1667,46 +1820,86 @@ static bool VRHI_LoadDiffuseTGA(const char *shaderName, int *imageIndex) {
 		}
 	}
 	if (g_worldDiffuseImages.size() >= VRHI_MAX_WORLD_DIFFUSE_IMAGES) return false;
-	void *fileData = nullptr;
-	const long fileSizeLong = g_ri.FS_ReadFile(path.c_str(), &fileData);
-	if (fileData == nullptr || fileSizeLong < 18) {
-		if (fileData != nullptr && g_ri.FS_FreeFile != nullptr) g_ri.FS_FreeFile(fileData);
-		return false;
-	}
-	const size_t fileSize = static_cast<size_t>(fileSizeLong);
-	const byte *bytes = static_cast<const byte *>(fileData);
-	// Bounded decode of uncompressed (type 2) and RLE (type 10) 24/32-bit
-	// true-color TGAs. Any malformed, oversized, or unsupported file returns
-	// false here and keeps the existing lightmap/solid fallback.
-	vrhi_tga::DecodeResult decoded;
-	if (!vrhi_tga::Decode(bytes, fileSize, VRHI_MAX_WORLD_DIFFUSE_DIMENSION,
-		VRHI_MAX_WORLD_DIFFUSE_BYTES, &decoded)) {
-		VRHI_Printf(PRINT_DEVELOPER,
-			"renderer_vrhi: diffuse '%s' unsupported; expected type 2/10 (RLE) 24/32-bit TGA within caps\n",
-			path.c_str());
-		g_ri.FS_FreeFile(fileData);
-		return false;
-	}
 	const size_t pixelBytes = decoded.rgba.size();
-	// Keep the aggregate cap independent of the number of shader references.
 	size_t existingBytes = 0;
 	for (const VRHI_WorldDiffuseImage &image : g_worldDiffuseImages) existingBytes += image.pixels.size();
-	if (pixelBytes > VRHI_MAX_WORLD_DIFFUSE_BYTES - existingBytes) {
-		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: diffuse '%s' skipped; aggregate TGA memory cap reached\n", path.c_str());
-		g_ri.FS_FreeFile(fileData);
-		return false;
-	}
+	if (pixelBytes > VRHI_MAX_WORLD_DIFFUSE_BYTES ||
+		existingBytes > VRHI_MAX_WORLD_DIFFUSE_BYTES - pixelBytes) return false;
 	VRHI_WorldDiffuseImage image;
 	image.path = path;
 	image.width = decoded.width;
 	image.height = decoded.height;
 	image.pixels = std::move(decoded.rgba);
-	g_ri.FS_FreeFile(fileData);
 	g_worldDiffuseImages.push_back(std::move(image));
 	const int index = static_cast<int>(g_worldDiffuseImages.size() - 1);
 	if (imageIndex != nullptr) *imageIndex = index;
 	VRHI_Printf(PRINT_ALL, "renderer_vrhi: decoded BSP diffuse '%s' (%dx%d, %zu bytes)\n",
 		path.c_str(), decoded.width, decoded.height, pixelBytes);
+	return true;
+}
+
+static void VRHI_UploadUITextures(void) {
+	if (!g_deviceInitialized || g_uiTexturedProgram.empty()) return;
+	for (VRHI_UITexture &image : g_uiTextures) {
+		if (image.texture != VRHI_INVALID_HANDLE || image.pixels.empty()) continue;
+		vhTexture texture = vhAllocTexture();
+		if (texture == VRHI_INVALID_HANDLE) {
+			VRHI_Printf(PRINT_WARNING, "renderer_vrhi: UI TGA '%s' allocation failed; solid fallback\n", image.path.c_str());
+			continue;
+		}
+		vhMem *data = new vhMem(image.pixels.size());
+		std::memcpy(data->data(), image.pixels.data(), data->size());
+		const int32_t errorsBefore = g_vhErrorCounter.load(std::memory_order_relaxed);
+		vhCreateTexture2D(texture, image.path.c_str(), glm::ivec2(image.width, image.height), 1,
+			nvrhi::Format::RGBA8_UNORM, VRHI_TEXTURE_NONE | VRHI_SAMPLER_NONE, data);
+		vhFinish();
+		if (g_vhErrorCounter.load(std::memory_order_relaxed) != errorsBefore) {
+			VRHI_Printf(PRINT_WARNING, "renderer_vrhi: UI TGA '%s' upload failed; solid fallback\n", image.path.c_str());
+			vhDestroyTexture(texture);
+			vhFinish();
+			continue;
+		}
+		image.texture = texture;
+		VRHI_Printf(PRINT_ALL, "renderer_vrhi: uploaded UI TGA '%s' (%dx%d, %zu bytes)\n",
+			image.path.c_str(), image.width, image.height, image.pixels.size());
+	}
+}
+
+static bool VRHI_RegisterDirectUITexture(qhandle_t handle, const char *name) {
+	if (handle == 0 || g_uiTextureAttempts.find(handle) != g_uiTextureAttempts.end()) return false;
+	g_uiTextureAttempts.emplace(handle, true);
+	if (g_uiTextures.size() >= VRHI_MAX_UI_TEXTURES) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: UI shader '%s' skipped; texture count cap reached\n",
+			name != nullptr ? name : "(null)");
+		return false;
+	}
+	std::string path;
+	vrhi_tga::DecodeResult decoded;
+	if (!VRHI_DecodeDirectTGA(name, VRHI_MAX_UI_TEXTURE_DIMENSION,
+		VRHI_MAX_UI_TEXTURE_BYTES, &path, &decoded)) {
+		VRHI_Printf(PRINT_DEVELOPER,
+			"renderer_vrhi: UI shader '%s' uses solid-color fallback (only direct type 2/10 24/32-bit TGA is supported)\n",
+			name != nullptr ? name : "(null)");
+		return false;
+	}
+	size_t existingBytes = 0;
+	for (const VRHI_UITexture &image : g_uiTextures) existingBytes += image.pixels.size();
+	if (decoded.rgba.size() > VRHI_MAX_UI_TEXTURE_BYTES ||
+		existingBytes > VRHI_MAX_UI_TEXTURE_BYTES - decoded.rgba.size()) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: UI TGA '%s' skipped; aggregate memory cap reached; solid fallback\n",
+			path.c_str());
+		return false;
+	}
+	VRHI_UITexture image;
+	image.path = std::move(path);
+	image.width = decoded.width;
+	image.height = decoded.height;
+	image.pixels = std::move(decoded.rgba);
+	g_uiTextures.push_back(std::move(image));
+	g_uiTextureByHandle.emplace(handle, g_uiTextures.size() - 1);
+	VRHI_Printf(PRINT_ALL, "renderer_vrhi: registered UI TGA '%s' for shader handle %d\n",
+		g_uiTextures.back().path.c_str(), static_cast<int>(handle));
+	VRHI_UploadUITextures();
 	return true;
 }
 
@@ -2350,11 +2543,6 @@ static void VRHI_SetColor(const float *rgba) {
 }
 static void VRHI_DrawStretchPic(float x, float y, float w, float h,
 	float s1, float t1, float s2, float t2, qhandle_t shader) {
-	(void)s1;
-	(void)t1;
-	(void)s2;
-	(void)t2;
-	(void)shader;
 	if (!g_deviceInitialized || !g_uiInitialized || !g_frameBackbufferReady ||
 		g_frameBackbuffer == VRHI_INVALID_HANDLE || g_frameViewportWidth <= 0 ||
 		g_frameViewportHeight <= 0 || !std::isfinite(x) || !std::isfinite(y) ||
@@ -2368,10 +2556,37 @@ static void VRHI_DrawStretchPic(float x, float y, float w, float h,
 		y / (float)g_frameViewportHeight,
 		w / (float)g_frameViewportWidth,
 		h / (float)g_frameViewportHeight);
-	g_uiState.SetUniform(0, { "ui_rect", { rect } });
-	g_uiState.SetUniform(1, { "ui_color", { g_uiColor } });
+	const bool validUV = std::isfinite(s1) && std::isfinite(t1) &&
+		std::isfinite(s2) && std::isfinite(t2);
+	const std::unordered_map<qhandle_t, size_t>::const_iterator found =
+		g_uiTextureByHandle.find(shader);
+	const bool textured = validUV && !g_uiTexturedProgram.empty() &&
+		found != g_uiTextureByHandle.end() &&
+		found->second < g_uiTextures.size() &&
+		g_uiTextures[found->second].texture != VRHI_INVALID_HANDLE;
+	const glm::vec4 uv(s1, t1, s2, t2);
+	g_uiState.SetProgram(textured ? g_uiTexturedProgram : g_uiProgram)
+		.SetUniform(0, { "ui_rect", { rect } })
+		.SetUniform(1, { "ui_uv", { uv } })
+		.SetUniform(2, { "ui_color", { g_uiColor } });
+	g_uiState.SetTextures({}).SetSamplers({});
+	if (textured) {
+		const vhTexture texture = g_uiTextures[found->second].texture;
+		g_uiState.SetTexture(0, { "ui_texture", 0, texture })
+			.SetSampler(0, { "ui_sampler", 0,
+				VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
+				VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP });
+	}
+	if (!g_uiDrawSubmitted) {
+		g_uiDrawErrorBaseline = g_vhErrorCounter.load(std::memory_order_relaxed);
+	}
 	if (vhSetState(g_uiStateId, g_uiState)) {
 		vhDraw(g_uiStateId, 6);
+		g_uiDrawSubmitted = true;
+	} else {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: UI draw vhSetState failed (shader=%d textured=%s)\n",
+			static_cast<int>(shader), textured ? "yes" : "no");
 	}
 }
 static void VRHI_DrawStretchRaw(int x, int y, int w, int h, int cols,
@@ -2546,6 +2761,6 @@ extern "C" Q_EXPORT refexport_t *QDECL GetRefAPI(int apiVersion,
 	exports.TakeVideoFrame = VRHI_TakeVideoFrame;
 
 	VRHI_Printf(PRINT_ALL,
-		"renderer_vrhi: loaded (clear/present + solid-color UI + lightmapped/TGA PVS-culled BSP world)\n");
+		"renderer_vrhi: loaded (clear/present + direct-TGA/solid-fallback UI + lightmapped/TGA PVS-culled BSP world)\n");
 	return &exports;
 }

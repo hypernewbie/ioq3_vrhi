@@ -5,9 +5,11 @@ copied VRHI release/debug archives; the VRHI submodule is not added to the
 ioquake3 CMake graph.
 
 The current slice owns an SDL `SDL_WINDOW_VULKAN` window, initializes one VRHI
-device and primary swapchain, clears the acquired backbuffer, draws solid-color
-UI rectangles through `DrawStretchPic`, and presents once per engine frame. This
-UI path is a fallback only, not texture rendering parity.
+device and primary swapchain, clears the acquired backbuffer, draws direct
+uncompressed/RLE type 2/10 24/32-bit TGA UI textures through `DrawStretchPic`
+(including s1/t1/s2/t2 UVs multiplied by `SetColor`), and presents once per
+engine frame. Missing, malformed, unsupported, or non-TGA material names use a
+solid-color fallback.
 
 The static BSP world path is deliberately scoped to planar and triangle-soup
 surfaces. It preserves BSP lightmap UVs and indices, uploads raw 128x128 RGB
@@ -36,17 +38,20 @@ renderers.
 `Shutdown(qtrue)` finishes and destroys VRHI, input, the window, and SDL video in
 that order.
 
-Model, skin, general shader/image registration, scene, textured UI, font,
-cinematic, and video-capture resources are intentionally not implemented yet;
-only the scoped static BSP geometry/lightmap/direct-TGA diffuse path above is
-present. Every refexport callback is populated so the client, cgame, and UI
-cannot dereference a null renderer callback: model, skin, and shader
-registration returns stable nonzero engine-local handles with the same
-name-to-handle semantics as the GL renderers, while the remaining unsupported
-callbacks are safe no-ops. The renderer-owned `screenshot` command arms a
-backbuffer capture ticket for the final clear/world/UI frame; EndFrame
-synchronously reads the bound backbuffer and writes a validated 24-bit BGR TGA
-when VRHI supports the readback. The diffuse TGA decoder lives in
+Model, skin, general shader-script/JPG/PNG/PK3 material stages, scene entities,
+patches, fonts, cinematics, and video-capture resources are intentionally not
+implemented. Shader registration only admits direct uncompressed/RLE type 2/10
+24/32-bit TGA names (a bare shader name resolves to `.tga`, or an explicit
+`.tga` suffix); all other material semantics remain unsupported and use the
+solid UI fallback. Every refexport callback is populated so the client, cgame,
+and UI cannot dereference a null renderer callback. Model, skin, and unsupported
+material registrations retain stable name-to-handle mappings; eligible UI TGA
+pixels are retained under bounded caps for video restart while their VRHI
+textures are destroyed and re-uploaded at the next registration, and final
+shutdown destroys both GPU and CPU resources. The renderer-owned `screenshot`
+command arms a backbuffer capture ticket for the final clear/world/UI frame;
+EndFrame synchronously reads the bound backbuffer and writes a validated 24-bit
+BGR TGA when VRHI supports the readback. The diffuse TGA decoder lives in
 `vrhi_tga_decode.h` and is exercised standalone by
 `tests/vrhi_tga_decode_test.cpp` (any C++17 compiler; no engine or third-party
 dependencies). Resize/minimize failures are reported as warnings and are not
