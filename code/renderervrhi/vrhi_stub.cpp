@@ -29,6 +29,7 @@
 #endif
 
 #include <atomic>
+#include <cctype>
 #include <cstdarg>
 #include <cmath>
 #include <cstdio>
@@ -92,6 +93,7 @@ struct VRHI_WorldDiffuseImage {
 	std::string path;
 	int width = 0;
 	int height = 0;
+	bool scriptResolved = false;
 	std::vector<byte> pixels;
 	vhTexture texture = VRHI_INVALID_HANDLE;
 };
@@ -129,6 +131,10 @@ static std::vector<VRHI_WorldVertex> g_worldVertices;
 static std::vector<uint32_t> g_worldIndexes;
 static std::vector<VRHI_WorldBatch> g_worldBatches;
 static std::vector<VRHI_WorldDiffuseImage> g_worldDiffuseImages;
+// Script results are map-scoped. Values are copied qpaths, never pointers into
+// FS_ListFiles/FS_ReadFile storage; an empty value is a cached miss.
+static std::unordered_map<std::string, std::string> g_worldShaderScriptPaths;
+static bool g_worldShaderScriptsScanned = false;
 static std::vector<VRHI_UITexture> g_uiTextures;
 static std::unordered_map<qhandle_t, size_t> g_uiTextureByHandle;
 static std::unordered_map<qhandle_t, bool> g_uiTextureAttempts;
@@ -184,6 +190,14 @@ static const int VRHI_MAX_WORLD_LIGHTMAP_LAYERS = 1024;
 static const int VRHI_MAX_WORLD_DIFFUSE_IMAGES = 256;
 static const int VRHI_MAX_WORLD_DIFFUSE_DIMENSION = 2048;
 static const size_t VRHI_MAX_WORLD_DIFFUSE_BYTES = 64u * 1024u * 1024u;
+// Shader scripts are an intentionally small first-stage lookup, not a full
+// Quake shader parser. Every list, file, aggregate text, and token stream is
+// bounded before parsing or retaining a candidate path.
+static const int VRHI_MAX_SHADER_FILES = 256;
+static const size_t VRHI_MAX_SHADER_FILE_BYTES = 512u * 1024u;
+static const size_t VRHI_MAX_SHADER_TEXT_BYTES = 8u * 1024u * 1024u;
+static const size_t VRHI_MAX_SHADER_TOKENS = 131072;
+static const size_t VRHI_MAX_SHADER_TOKEN_BYTES = 1024;
 // PVS cull state is a bounded, decoded CPU copy of the BSP node/leaf/plane/
 // leafsurface/visibility lumps. Normal Quake 3 maps stay far below these caps;
 // exceeding a cap disables culling (all-visible fallback) instead of allocating
@@ -919,6 +933,8 @@ static void VRHI_DestroyWorldResources(bool clearGeometry) {
 		g_worldIndexes.clear();
 		g_worldBatches.clear();
 		g_worldDiffuseImages.clear();
+		g_worldShaderScriptPaths.clear();
+		g_worldShaderScriptsScanned = false;
 		g_worldLoaded = false;
 	}
 	if (g_deviceInitialized) {
@@ -1105,8 +1121,9 @@ static bool VRHI_UploadWorldDiffuse(void) {
 		}
 		image.texture = texture;
 		anyUploaded = true;
-		VRHI_Printf(PRINT_ALL, "renderer_vrhi: uploaded BSP diffuse '%s' (%dx%d, %zu bytes)\n",
-			image.path.c_str(), image.width, image.height, image.pixels.size());
+		VRHI_Printf(PRINT_ALL, "renderer_vrhi: uploaded %sBSP diffuse '%s' (%dx%d, %zu bytes)\n",
+			image.scriptResolved ? "script-resolved " : "", image.path.c_str(),
+			image.width, image.height, image.pixels.size());
 	}
 	return anyUploaded;
 }
@@ -1343,10 +1360,12 @@ static void VRHI_BeginRegistration(glconfig_t *config) {
 
 static void VRHI_Shutdown(qboolean destroyWindow) {
 	if (!destroyWindow) {
+		// Keep the device and SDL window alive for a subsequent registration,
+		// but release map/video resources before the swapchain is reused. The
+		// unconditional CPU cleanup also clears script caches if registration
+		// failed before a device was created.
+		VRHI_DestroyWorldResources(true);
 		if (g_deviceInitialized) {
-			// Keep the device and SDL window alive for a subsequent registration,
-			// but release map/video resources before the swapchain is reused.
-			VRHI_DestroyWorldResources(true);
 			VRHI_DestroyUITextures(false);
 			vhFinish();
 		}
@@ -1375,10 +1394,11 @@ static void VRHI_Shutdown(qboolean destroyWindow) {
 		// ordering clear and guarantees the clear command queue is drained before
 		// the device or native window is torn down.
 		vhFinish();
-		VRHI_DestroyWorldResources(true);
 	}
-	// Also clear decoded UI data when registration failed before a device was
-	// created; final shutdown must not rely on DLL unload for CPU ownership.
+	// Also clear decoded world/script and UI data when registration failed
+	// before a device was created; final shutdown must not rely on DLL unload
+	// for CPU ownership.
+	VRHI_DestroyWorldResources(true);
 	VRHI_DestroyUI();
 	if (g_deviceInitialized) {
 		vhFinish();
@@ -1778,6 +1798,272 @@ static bool VRHI_ResolveDirectTGAPath(const char *name, std::string *resolved) {
 	return true;
 }
 
+struct VRHI_ShaderScriptToken {
+	std::string text;
+};
+
+static std::string VRHI_LowerASCII(const std::string &text) {
+	std::string lower = text;
+	for (char &ch : lower) {
+		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+	}
+	return lower;
+}
+
+static bool VRHI_ShaderTokenIs(const VRHI_ShaderScriptToken &token,
+	const char *value) {
+	return VRHI_LowerASCII(token.text) == value;
+}
+
+static bool VRHI_TokenizeShaderScript(const byte *data, size_t size,
+	std::vector<VRHI_ShaderScriptToken> *tokens) {
+	if (data == nullptr || tokens == nullptr) return false;
+	tokens->clear();
+	size_t cursor = 0;
+	while (cursor < size) {
+		const unsigned char ch = data[cursor];
+		if (std::isspace(ch) || ch == '\0') {
+			++cursor;
+			continue;
+		}
+		if (ch == '/' && cursor + 1 < size && data[cursor + 1] == '/') {
+			cursor += 2;
+			while (cursor < size && data[cursor] != '\n') ++cursor;
+			continue;
+		}
+		if (ch == '/' && cursor + 1 < size && data[cursor + 1] == '*') {
+			cursor += 2;
+			bool closed = false;
+			while (cursor + 1 < size) {
+				if (data[cursor] == '*' && data[cursor + 1] == '/') {
+					cursor += 2;
+					closed = true;
+					break;
+				}
+				++cursor;
+			}
+			if (!closed) return false;
+			continue;
+		}
+		if (tokens->size() >= VRHI_MAX_SHADER_TOKENS) return false;
+		VRHI_ShaderScriptToken token;
+		if (ch == '{' || ch == '}') {
+			token.text.assign(1, static_cast<char>(ch));
+			++cursor;
+		} else if (ch == '"') {
+			++cursor;
+			while (cursor < size && data[cursor] != '"') {
+				if (data[cursor] == '\\' && cursor + 1 < size) ++cursor;
+				if (cursor >= size || token.text.size() >= VRHI_MAX_SHADER_TOKEN_BYTES) return false;
+				token.text.push_back(static_cast<char>(data[cursor++]));
+			}
+			if (cursor >= size) return false;
+			++cursor;
+		} else {
+			while (cursor < size && !std::isspace(data[cursor]) &&
+				data[cursor] != '{' && data[cursor] != '}') {
+				if (token.text.size() >= VRHI_MAX_SHADER_TOKEN_BYTES) return false;
+				token.text.push_back(static_cast<char>(data[cursor++]));
+			}
+		}
+		tokens->push_back(std::move(token));
+	}
+	return true;
+}
+
+static bool VRHI_ShaderPathIsSafe(const std::string &path) {
+	if (path.empty() || path.size() >= MAX_QPATH || path[0] == '/' ||
+		path[0] == '\\' || path.find(':') != std::string::npos) return false;
+	size_t begin = 0;
+	while (begin <= path.size()) {
+		const size_t end = path.find('/', begin);
+		const std::string part = path.substr(begin,
+			end == std::string::npos ? std::string::npos : end - begin);
+		if (part.empty() || part == "." || part == "..") return false;
+		if (end == std::string::npos) break;
+		begin = end + 1;
+	}
+	return true;
+}
+
+static bool VRHI_ResolveShaderScriptFile(const char *fileName,
+	std::string *resolved) {
+	if (resolved != nullptr) resolved->clear();
+	if (fileName == nullptr || resolved == nullptr) return false;
+	size_t length = 0;
+	while (length < MAX_QPATH && fileName[length] != '\0') ++length;
+	if (length == 0 || length >= MAX_QPATH) return false;
+	const std::string name(fileName, length);
+	if (!VRHI_ShaderPathIsSafe(name) || name.find('\\') != std::string::npos) return false;
+	const std::string lower = VRHI_LowerASCII(name);
+	if (lower.size() < 7 || lower.compare(lower.size() - 7, 7, ".shader") != 0 ||
+		name.size() + 8 >= MAX_QPATH) return false;
+	*resolved = "scripts/" + name;
+	return true;
+}
+
+static bool VRHI_ShaderTokenIsUnsupported(const VRHI_ShaderScriptToken &token) {
+	const std::string lower = VRHI_LowerASCII(token.text);
+	static const char *unsupported[] = {
+		"blendfunc", "blend", "deform", "fogparms", "foggen",
+		"alphafunc", "alphagen", "rgbgen", "tcgen", "tcmod",
+		"animmap", "videomap", "normalmap", "specularmap", "depthwrite",
+		"depthfunc", "polygonoffset", "portal", "skyparms"
+	};
+	for (const char *value : unsupported) {
+		if (lower == value) return true;
+	}
+	return false;
+}
+
+static bool VRHI_ParseShaderBlock(const std::vector<VRHI_ShaderScriptToken> &tokens,
+	size_t begin, size_t end, std::string *candidate) {
+	if (candidate != nullptr) candidate->clear();
+	if (candidate == nullptr || begin >= end || end > tokens.size()) return false;
+	bool found = false;
+	for (size_t i = begin; i < end;) {
+		if (tokens[i].text != "{") {
+			if (VRHI_ShaderTokenIsUnsupported(tokens[i])) return false;
+			++i;
+			continue;
+		}
+		const size_t stageBegin = ++i;
+		int depth = 1;
+		while (i < end && depth > 0) {
+			if (tokens[i].text == "{") ++depth;
+			else if (tokens[i].text == "}") --depth;
+			++i;
+		}
+		if (depth != 0) return false;
+		const size_t stageEnd = i - 1;
+		for (size_t j = stageBegin; j < stageEnd; ++j) {
+			if (VRHI_ShaderTokenIsUnsupported(tokens[j])) return false;
+			if (!VRHI_ShaderTokenIs(tokens[j], "map") &&
+				!VRHI_ShaderTokenIs(tokens[j], "clampmap")) continue;
+			if (j + 1 >= stageEnd) return false;
+			const std::string &texture = tokens[++j].text;
+			if (!texture.empty() && texture[0] == '$') continue;
+			if (!VRHI_ShaderPathIsSafe(texture) ||
+				texture.find('\\') != std::string::npos) return false;
+			std::string path;
+			if (found || !VRHI_ResolveDirectTGAPath(texture.c_str(), &path)) return false;
+			*candidate = std::move(path);
+			found = true;
+		}
+	}
+	return found;
+}
+
+static bool VRHI_ParseShaderScript(const byte *data, size_t size,
+	const std::unordered_map<std::string, bool> &wanted,
+	std::unordered_map<std::string, std::string> *results) {
+	std::vector<VRHI_ShaderScriptToken> tokens;
+	if (!VRHI_TokenizeShaderScript(data, size, &tokens) || results == nullptr) return false;
+	for (size_t i = 0; i < tokens.size();) {
+		const std::string shaderName = VRHI_LowerASCII(tokens[i++].text);
+		if (i >= tokens.size() || tokens[i].text != "{") continue;
+		const size_t bodyBegin = ++i;
+		int depth = 1;
+		while (i < tokens.size() && depth > 0) {
+			if (tokens[i].text == "{") ++depth;
+			else if (tokens[i].text == "}") --depth;
+			++i;
+		}
+		if (depth != 0) return false;
+		const size_t bodyEnd = i - 1;
+		if (wanted.find(shaderName) == wanted.end()) continue;
+		std::string path;
+		if (VRHI_ParseShaderBlock(tokens, bodyBegin, bodyEnd, &path)) {
+			results->emplace(shaderName, std::move(path));
+		}
+	}
+	return true;
+}
+
+static void VRHI_ScanShaderScripts(const std::vector<std::string> &shaderNames) {
+	g_worldShaderScriptPaths.clear();
+	g_worldShaderScriptsScanned = true;
+	std::unordered_map<std::string, bool> wanted;
+	char **fileList = nullptr;
+	void *activeFileData = nullptr;
+	try {
+		for (const std::string &name : shaderNames) {
+			if (!name.empty()) {
+				const std::string lower = VRHI_LowerASCII(name);
+				wanted.emplace(lower, true);
+				g_worldShaderScriptPaths.emplace(lower, std::string());
+			}
+		}
+		if (g_ri.FS_ListFiles == nullptr || g_ri.FS_FreeFileList == nullptr ||
+			g_ri.FS_ReadFile == nullptr || g_ri.FS_FreeFile == nullptr) return;
+		int fileCount = 0;
+		fileList = g_ri.FS_ListFiles("scripts", ".shader", &fileCount);
+		if (fileList == nullptr) return;
+		if (fileCount < 0 || fileCount > VRHI_MAX_SHADER_FILES) {
+			VRHI_Printf(PRINT_WARNING,
+				"renderer_vrhi: shader script scan skipped; file count cap exceeded (%d)\n",
+				fileCount);
+			g_ri.FS_FreeFileList(fileList);
+			return;
+		}
+		size_t totalText = 0;
+		for (int i = 0; i < fileCount; ++i) {
+			std::string qpath;
+			if (!VRHI_ResolveShaderScriptFile(fileList[i], &qpath)) continue;
+			activeFileData = nullptr;
+			const long fileSizeLong = g_ri.FS_ReadFile(qpath.c_str(), &activeFileData);
+			if (activeFileData == nullptr || fileSizeLong < 0) {
+				if (activeFileData != nullptr) g_ri.FS_FreeFile(activeFileData);
+				activeFileData = nullptr;
+				continue;
+			}
+			bool parsed = false;
+			try {
+				const size_t fileSize = static_cast<size_t>(fileSizeLong);
+				if (fileSize <= VRHI_MAX_SHADER_FILE_BYTES &&
+					totalText <= VRHI_MAX_SHADER_TEXT_BYTES - fileSize) {
+					totalText += fileSize;
+					std::unordered_map<std::string, std::string> parsedResults;
+					parsed = VRHI_ParseShaderScript(static_cast<const byte *>(activeFileData),
+						fileSize, wanted, &parsedResults);
+					if (parsed) {
+						for (auto &result : parsedResults) {
+							auto found = g_worldShaderScriptPaths.find(result.first);
+							if (found != g_worldShaderScriptPaths.end() && found->second.empty()) {
+								found->second = std::move(result.second);
+							}
+						}
+					}
+				} else {
+					VRHI_Printf(PRINT_WARNING,
+						"renderer_vrhi: shader script scan text cap reached at '%s'\n",
+						qpath.c_str());
+				}
+			} catch (...) {
+				parsed = false;
+			}
+			g_ri.FS_FreeFile(activeFileData);
+			activeFileData = nullptr;
+		}
+		g_ri.FS_FreeFileList(fileList);
+		fileList = nullptr;
+	} catch (...) {
+		if (activeFileData != nullptr && g_ri.FS_FreeFile != nullptr) {
+			g_ri.FS_FreeFile(activeFileData);
+			activeFileData = nullptr;
+		}
+		if (fileList != nullptr && g_ri.FS_FreeFileList != nullptr) {
+			g_ri.FS_FreeFileList(fileList);
+			fileList = nullptr;
+		}
+		// Keep a complete miss cache after allocation or malformed-input failure.
+		g_worldShaderScriptPaths.clear();
+		for (const std::string &name : shaderNames) {
+			if (!name.empty()) g_worldShaderScriptPaths.emplace(VRHI_LowerASCII(name), std::string());
+		}
+	}
+}
+
 static bool VRHI_DecodeDirectTGA(const char *name, int maxDimension,
 	size_t maxBytes, std::string *pathOut, vrhi_tga::DecodeResult *decodedOut) {
 	if (pathOut != nullptr) pathOut->clear();
@@ -1811,10 +2097,26 @@ static bool VRHI_LoadDiffuseTGA(const char *shaderName, int *imageIndex) {
 	if (imageIndex != nullptr) *imageIndex = -1;
 	std::string path;
 	vrhi_tga::DecodeResult decoded;
+	bool scriptResolved = false;
 	if (!VRHI_DecodeDirectTGA(shaderName, VRHI_MAX_WORLD_DIFFUSE_DIMENSION,
-		VRHI_MAX_WORLD_DIFFUSE_BYTES, &path, &decoded)) return false;
+		VRHI_MAX_WORLD_DIFFUSE_BYTES, &path, &decoded)) {
+		std::string shaderKey;
+		if (shaderName != nullptr) {
+			size_t length = 0;
+			while (length < MAX_QPATH && shaderName[length] != '\0') ++length;
+			if (length > 0 && length < MAX_QPATH) shaderKey = VRHI_LowerASCII(
+				std::string(shaderName, length));
+		}
+		const auto found = g_worldShaderScriptPaths.find(shaderKey);
+		if (!g_worldShaderScriptsScanned || found == g_worldShaderScriptPaths.end() ||
+			found->second.empty() || !VRHI_DecodeDirectTGA(found->second.c_str(),
+				VRHI_MAX_WORLD_DIFFUSE_DIMENSION, VRHI_MAX_WORLD_DIFFUSE_BYTES,
+				&path, &decoded)) return false;
+		scriptResolved = true;
+	}
 	for (size_t i = 0; i < g_worldDiffuseImages.size(); ++i) {
 		if (g_worldDiffuseImages[i].path == path) {
+			if (scriptResolved) g_worldDiffuseImages[i].scriptResolved = true;
 			if (imageIndex != nullptr) *imageIndex = static_cast<int>(i);
 			return true;
 		}
@@ -1829,12 +2131,14 @@ static bool VRHI_LoadDiffuseTGA(const char *shaderName, int *imageIndex) {
 	image.path = path;
 	image.width = decoded.width;
 	image.height = decoded.height;
+	image.scriptResolved = scriptResolved;
 	image.pixels = std::move(decoded.rgba);
 	g_worldDiffuseImages.push_back(std::move(image));
 	const int index = static_cast<int>(g_worldDiffuseImages.size() - 1);
 	if (imageIndex != nullptr) *imageIndex = index;
-	VRHI_Printf(PRINT_ALL, "renderer_vrhi: decoded BSP diffuse '%s' (%dx%d, %zu bytes)\n",
-		path.c_str(), decoded.width, decoded.height, pixelBytes);
+	VRHI_Printf(PRINT_ALL, "renderer_vrhi: decoded %sBSP diffuse '%s' (%dx%d, %zu bytes)\n",
+		scriptResolved ? "script-resolved " : "", path.c_str(), decoded.width,
+		decoded.height, pixelBytes);
 	return true;
 }
 
@@ -2059,6 +2363,23 @@ static void VRHI_LoadWorld(const char *name) {
 	const int vertCount = vertsLump.filelen / static_cast<int>(sizeof(drawVert_t));
 	const int indexCount = indexesLump.filelen / static_cast<int>(sizeof(int));
 	const int shaderCount = shadersLump.filelen / static_cast<int>(sizeof(dshader_t));
+	std::vector<std::string> bspShaderNames;
+	try {
+		bspShaderNames.reserve(static_cast<size_t>(shaderCount));
+		for (int shaderIndex = 0; shaderIndex < shaderCount; ++shaderIndex) {
+			const dshader_t shader = VRHI_ReadShader(shadersData, shaderIndex);
+			size_t length = 0;
+			while (length < MAX_QPATH && shader.shader[length] != '\0') ++length;
+			if (length > 0 && length < MAX_QPATH) {
+				bspShaderNames.emplace_back(shader.shader, length);
+			}
+		}
+	} catch (...) {
+		bspShaderNames.clear();
+	}
+	// Resolve all BSP shader-script candidates once for this map. Surface
+	// batches only consult this copied cache; they never rescan scripts.
+	VRHI_ScanShaderScripts(bspShaderNames);
 	const size_t lightmapLayerBytes = static_cast<size_t>(LIGHTMAP_WIDTH) *
 		LIGHTMAP_HEIGHT * 3;
 	const bool lightmapLumpValid = lightmapsLump.filelen > 0 &&
@@ -2122,8 +2443,9 @@ static void VRHI_LoadWorld(const char *name) {
 			surface.lightmapNum >= 0 && surface.lightmapNum < g_worldLightmapLayers
 			? surface.lightmapNum : -1;
 		int diffuseImage = -1;
-		// Only direct uncompressed/RLE TGA references are attempted. Shader scripts,
-		// JPG/PNG and all stage/deform semantics intentionally use the old path.
+		// Direct TGA remains first. If it misses, this map-scoped cache contains
+		// only a first-stage script map/clampmap TGA candidate; all other shader
+		// semantics retain the lightmap/solid fallback.
 		VRHI_LoadDiffuseTGA(shader.shader, &diffuseImage);
 		const uint32_t surfaceFirstIndex = static_cast<uint32_t>(g_worldIndexes.size());
 		int surfaceTriangles = 0;

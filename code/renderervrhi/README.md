@@ -29,10 +29,15 @@ culling only skips indexed ranges per batch. When visibility is absent or
 malformed, or the camera leaf cannot be resolved, the renderer falls back to
 drawing every batch. Per-frame visible cluster/batch/index counts are reported at
 developer level, or every frame at `PRINT_ALL` with `r_vrhi_cullDebug 1`.
-Shader-script parsing, JPG/PNG, PK3 material stages, area/door masking, patches,
-entities, and corresponding renderer parity are not implemented, so visual
-coverage remains limited and maps may differ substantially from the GL
-renderers.
+A bounded first-stage shader-script diffuse lookup is supported for BSP maps:
+`scripts/*.shader` is scanned once per map, matching BSP shader names and taking
+the first non-special `map`/`clampmap` TGA stage into a copied cache. This is
+not full Quake shader/material parity; JPG/PNG, deform, fog, blend, additional
+stage/material semantics, PK3 material stages, patches, area/door masking,
+entities, and corresponding renderer parity remain unsupported and fall back to
+the existing lightmap/solid path. Script file count, per-file/aggregate text,
+token, candidate image, and decoded image memory are bounded, so malformed or
+oversized input is rejected safely.
 
 `Shutdown(qfalse)` flushes while retaining the device/window for a video restart;
 `Shutdown(qtrue)` finishes and destroys VRHI, input, the window, and SDL video in
@@ -42,7 +47,8 @@ Model, skin, general shader-script/JPG/PNG/PK3 material stages, scene entities,
 patches, fonts, cinematics, and video-capture resources are intentionally not
 implemented. Shader registration only admits direct uncompressed/RLE type 2/10
 24/32-bit TGA names (a bare shader name resolves to `.tga`, or an explicit
-`.tga` suffix); all other material semantics remain unsupported and use the
+`.tga` suffix); the BSP-only first-stage script lookup does not change UI
+registration, and all other material semantics remain unsupported and use the
 solid UI fallback. Every refexport callback is populated so the client, cgame,
 and UI cannot dereference a null renderer callback. Model, skin, and unsupported
 material registrations retain stable name-to-handle mappings; eligible UI TGA
