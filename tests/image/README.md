@@ -71,8 +71,10 @@ hashes and logs are retained for later calibration.
 
 For the `vrhi` renderer the capture is the renderer-owned backbuffer readback
 implemented in `code/renderervrhi` (see `code/renderervrhi/README.md`); the
-runner inserts one `wait` between `screenshot` and `quit` so the renderer's
-EndFrame services the capture ticket. VRHI runs therefore report
+runner inserts two `wait` commands between `screenshot` and `quit` so the
+renderer's EndFrame services the capture ticket before shutdown (Cbuf_Execute
+runs twice per engine frame, so one wait is not enough to guarantee a frame
+boundary). VRHI runs therefore report
 `authoritative_capture: true` in the report. GL runs remain a
 plumbing/repeatability test, not a final-present or OpenGL-versus-VRHI
 correctness oracle.

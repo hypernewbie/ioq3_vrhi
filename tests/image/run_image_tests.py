@@ -283,13 +283,13 @@ def build_command(engine: Path, home: Path, renderer: str, scene: Scene) -> list
     actions.extend("wait" for _ in range(scene.waits))
     waits = "; ".join(actions)
     if renderer == "vrhi":
-        # renderer_vrhi services its capture ticket in EndFrame.  Keep the
-        # OpenGL action string byte-for-byte unchanged. The command buffer is
-        # executed before CL_Frame; two waits are required so EndFrame can
-        # service the ticket before quit is executed on the following pass.
-        active_action = (
-            f"{waits}; screenshot {scene.screenshot}; wait; wait; quit"
-        )
+        # renderer_vrhi services its capture ticket in EndFrame. Keep the
+        # OpenGL action string byte-for-byte unchanged. Cbuf_Execute runs twice
+        # per engine frame, so a single wait can be consumed by the same frame
+        # that processes "screenshot" and let "quit" shut the renderer down
+        # before EndFrame runs. Two waits guarantee at least one EndFrame
+        # between the capture ticket and quit in either alignment.
+        active_action = f"{waits}; screenshot {scene.screenshot}; wait; wait; quit"
     else:
         active_action = ACTIVE_ACTION_TEMPLATE.format(
             waits=waits,

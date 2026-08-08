@@ -57,6 +57,9 @@ class RunnerConfigTests(unittest.TestCase):
         )
         command = build_command(Path("ioquake3.exe"), Path("home"), "vrhi", scene)
         action = command[command.index("activeAction") + 1]
+        # Cbuf_Execute runs twice per engine frame, so a single wait can be
+        # consumed by the same frame that processes "screenshot". Two waits
+        # guarantee an EndFrame between the capture ticket and quit.
         self.assertIn("screenshot unit-vrhi; wait; wait; quit", action)
         self.assertNotIn("screenshot unit-vrhi; wait; quit", action)
         self.assertNotIn("screenshot unit-vrhi; quit", action)
