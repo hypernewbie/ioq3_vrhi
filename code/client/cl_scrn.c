@@ -23,6 +23,9 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "client.h"
 
+#include <errno.h>
+#include <limits.h>
+
 qboolean	scr_initialized;		// ready to draw
 
 cvar_t		*cl_timegraph;
@@ -107,11 +110,27 @@ SCR_BenchEnvInt
 */
 static int SCR_BenchEnvInt( const char *name, int def ) {
 	const char *value = getenv( name );
+	char *end;
+	long parsed;
 
+	// Keep hostile or accidental environment values from wrapping an int or
+	// making the engine run an effectively unbounded benchmark. The harness
+	// uses ordinary small counts; values outside this explicit bound fall back
+	// to the safe default and are clamped again by SCR_BenchInit for negatives.
 	if( !value || !*value ) {
 		return def;
 	}
-	return atoi( value );
+	errno = 0;
+	end = NULL;
+	parsed = strtol( value, &end, 10 );
+	if( errno == ERANGE || end == value || !end || *end != '\0' ||
+		parsed < (long)-1000000 || parsed > (long)1000000 ) {
+		return def;
+	}
+	if( parsed < (long)INT_MIN || parsed > (long)INT_MAX ) {
+		return def;
+	}
+	return (int)parsed;
 }
 
 /*
