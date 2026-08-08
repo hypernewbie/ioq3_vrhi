@@ -287,6 +287,8 @@ class EngineOptionsTests(unittest.TestCase):
         self.assertEqual(prefix[prefix.index("fs_basepath") + 1],
                          str(Path("assets").resolve()))
         self.assertEqual(prefix[prefix.index("com_basegame") + 1], "baseoa")
+        self.assertEqual(prefix[prefix.index("com_hunkMegs") + 1], "512")
+        self.assertEqual(prefix[prefix.index("com_zoneMegs") + 1], "64")
         self.assertEqual(prefix[prefix.index("fs_homepath") + 1],
                          str(Path("home/trial-1")))
 

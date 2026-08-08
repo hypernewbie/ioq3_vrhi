@@ -23,6 +23,9 @@ BASE_GAME_DEFAULT = "baseoa"
 NO_AUDIO_CVARS = ("s_initsound", "0", "s_volume", "0")
 WINDOWED_CVARS = ("r_fullscreen", "0")
 VSYNC_OFF_CVARS = ("r_swapInterval", "0")
+# Real-engine trials load the full pinned content set; the stock hunk is
+# too small for OpenArena, so raise it (same values the image tests use).
+MEMORY_CVARS = ("com_hunkMegs", "512", "com_zoneMegs", "64")
 FIXED_TIMING_CVARS = (
     "sv_cheats", "1",
     "com_maxfps", "0",
@@ -121,6 +124,7 @@ class EngineOptions:
         if root is not None:
             args += ["+set", "fs_basepath", str(root),
                      "+set", "com_basegame", self.basegame]
+            args += ["+set"] + list(MEMORY_CVARS)
         if home is not None:
             args += ["+set", "fs_homepath", str(home)]
         if self.no_audio:

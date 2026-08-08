@@ -105,7 +105,7 @@ command line — never in `workloads.json`:
 
 | Flag | Effect |
 | ---- | ------ |
-| `--asset-root DIR` | Pinned asset root containing the base game directory. Adds `+set fs_basepath DIR` and `+set com_basegame baseoa` to every trial command. Fail-fast validation that `DIR/baseoa` exists. |
+| `--asset-root DIR` | Pinned asset root containing the base game directory. Adds `+set fs_basepath DIR`, `+set com_basegame baseoa`, and raises the memory pools (`com_hunkMegs 512`, `com_zoneMegs 64`, same values the image tests use) to every trial command. Fail-fast validation that `DIR/baseoa` exists. |
 | `--basegame NAME` | Base game directory inside `--asset-root` (default `baseoa`). |
 | `--home-root DIR` | Parent for per-trial isolated `fs_homepath` directories (default `<run root>/homes`, itself under `temp/benchmark`). |
 | `--hidden` | Hide the engine window (Windows: no console window plus periodic hiding of the SDL window; no-op on POSIX). |
