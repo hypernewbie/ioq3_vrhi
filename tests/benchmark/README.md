@@ -15,11 +15,11 @@ policies. It only:
 6. writes raw JSONL plus a summary report under `temp/benchmark/` (ignored).
 
 **No GL2/VRHI equivalence is claimed.** This harness reports raw timings
-only; it is not a correctness or parity oracle. The engine does not emit
-JSONL timings yet: both manifest backends are marked `jsonl_support: false`,
-so real runs are expected to time out with zero samples until that
-instrumentation lands. The harness itself is validated by unit tests and
-fake backends (see `test_runner.py`).
+only; it is not a correctness or parity oracle. Both manifest backends
+(`opengl2`, `vrhi`) declare `jsonl_support: true`: the engine emits a
+finite JSONL stream (exactly `warmup + samples` sample lines, then a
+normal quit) when `IOQ3_BENCH_JSONL` is set. The harness itself is
+validated by unit tests and fake backends (see `test_runner.py`).
 
 ## The backend contract
 
@@ -126,9 +126,10 @@ on the command line (`--engine`), never in the manifest.
 
 ## Limitations
 
-- The engine does not emit JSONL timings yet; real backends are marked
-  `jsonl_support: false` and their trials will fail until instrumentation
-  lands. The harness and protocol are validated with fake backends.
+- The engine's JSONL stream is finite and self-terminating: it emits
+  exactly `warmup + samples` sample lines (startup and re-entered frames
+  are skipped), then requests a normal quit. A backend that hangs, buffers
+  its stdout, or exits early still fails the trial.
 - Backends must flush stdout after every JSONL line; the harness cannot
   unblock a backend that buffers its output.
 - A trial's samples are kept even when the backend exits non-zero (a

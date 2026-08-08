@@ -305,5 +305,38 @@ class OrderPlanningTests(unittest.TestCase):
             plan_order(["a"], 2, "zigzag", 1)
 
 
+class CommittedManifestTests(unittest.TestCase):
+    """Guard the committed workloads.json against regressions.
+
+    The engine's finite JSONL contract (SCR_BenchAfterEndFrame) emits only
+    producer_seconds and finalize_seconds per sample, so the manifest must
+    keep declaring both real backends as jsonl_support and gpu_seconds as
+    optional.
+    """
+
+    def load_committed(self) -> object:
+        return load_manifest(
+            Path(__file__).resolve().parent / "workloads.json"
+        )
+
+    def test_committed_manifest_declares_jsonl_support(self) -> None:
+        manifest = self.load_committed()
+        by_name = {b.name: b for b in manifest.backends}
+        self.assertEqual(set(by_name), {"opengl2", "vrhi"})
+        self.assertTrue(by_name["opengl2"].jsonl_support)
+        self.assertTrue(by_name["vrhi"].jsonl_support)
+
+    def test_committed_manifest_fields_match_engine_contract(self) -> None:
+        manifest = self.load_committed()
+        self.assertEqual(
+            manifest.fields,
+            {
+                "producer_seconds": True,
+                "finalize_seconds": True,
+                "gpu_seconds": False,
+            },
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

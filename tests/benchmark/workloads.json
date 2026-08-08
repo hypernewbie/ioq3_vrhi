@@ -19,15 +19,15 @@
   "backends": [
     {
       "name": "opengl2",
-      "description": "OpenGL 2 backend. JSONL timing instrumentation is not implemented in the engine yet.",
+      "description": "OpenGL 2 backend. Emits JSONL timing samples to stdout when IOQ3_BENCH_JSONL is set.",
       "args": ["+set", "cl_renderer", "opengl2"],
-      "jsonl_support": false
+      "jsonl_support": true
     },
     {
       "name": "vrhi",
-      "description": "VRHI backend. JSONL timing instrumentation is not implemented in the engine yet.",
+      "description": "VRHI backend. Emits JSONL timing samples to stdout when IOQ3_BENCH_JSONL is set.",
       "args": ["+set", "cl_renderer", "vrhi"],
-      "jsonl_support": false
+      "jsonl_support": true
     }
   ],
   "workloads": [

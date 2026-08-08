@@ -11,6 +11,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import benchmark_config as config  # noqa: E402
+import benchmark_protocol as protocol  # noqa: E402
 from run_benchmark import run_trial  # noqa: E402
 
 # Emits warmup + samples lines, but never more than 5 total (so an
@@ -28,6 +29,22 @@ for i in range(total):
         "gpu_seconds": 0.009,
     }), flush=True)
     time.sleep(0.005)
+"""
+
+# Mirrors the engine's finite JSONL contract (SCR_BenchAfterEndFrame in
+# code/client/cl_scrn.c): exactly warmup+samples lines of the shape
+# {"event":"sample","producer_seconds":...,"finalize_seconds":...}
+# (no gpu_seconds), flushed, then a clean exit.
+FAKE_ENGINE = r"""
+import json, os, sys
+warmup = int(os.environ.get("IOQ3_BENCH_WARMUP", "0"))
+samples = int(os.environ.get("IOQ3_BENCH_SAMPLES", "1"))
+for i in range(warmup + samples):
+    print(json.dumps({
+        "event": "sample",
+        "producer_seconds": round(0.010 + i * 0.001, 9),
+        "finalize_seconds": 0.002,
+    }), flush=True)
 """
 
 FAKE_HANG = "import time; time.sleep(60)\n"
@@ -161,6 +178,47 @@ class TrialRunnerTests(unittest.TestCase):
         self.assertIsNone(outcome["error"])
         self.assertEqual(outcome["warmup_count"], 0)
         self.assertEqual(outcome["measured_count"], 3)
+
+    def test_finite_engine_contract_clean_termination(self) -> None:
+        # A backend that emits exactly warmup+samples lines and then quits
+        # cleanly (the engine's finite JSONL contract) must be a fully
+        # successful trial: no error, no warning, exit code 0.
+        backend = config.Backend(name="engine", args=("-c", FAKE_ENGINE))
+        outcome = self.run_trial(
+            warmup=3, samples=5, backend=backend, label="engine"
+        )
+        self.assertIsNone(outcome["error"])
+        self.assertIsNone(outcome["warning"])
+        self.assertEqual(outcome["exit_code"], 0)
+        self.assertFalse(outcome["timed_out"])
+        self.assertEqual(outcome["warmup_count"], 3)
+        self.assertEqual(outcome["measured_count"], 5)
+        self.assertEqual(outcome["extra_count"], 0)
+        phases = [phase for phase, _ in outcome["entries"]]
+        self.assertEqual(phases, ["warmup"] * 3 + ["sample"] * 5)
+        measured = [s for p, s in outcome["entries"] if p == "sample"]
+        self.assertTrue(all(s.gpu_seconds is None for s in measured))
+
+    def test_finite_engine_contract_line_shape(self) -> None:
+        # Every engine line carries exactly {event, producer_seconds,
+        # finalize_seconds} with finite, non-negative values and never a
+        # gpu_seconds key; each must parse as a protocol sample.
+        backend = config.Backend(name="engine", args=("-c", FAKE_ENGINE))
+        outcome = self.run_trial(
+            warmup=1, samples=2, backend=backend, label="engine-shape"
+        )
+        lines = Path(outcome["stdout"]).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 3)
+        for line in lines:
+            result = protocol.parse_timing_line(line)
+            self.assertEqual(result.kind, "sample")
+            self.assertEqual(
+                set(result.sample.raw),
+                {"event", "producer_seconds", "finalize_seconds"},
+            )
+            self.assertIsNone(result.sample.gpu_seconds)
+            self.assertGreaterEqual(result.sample.producer_seconds, 0.0)
+            self.assertGreaterEqual(result.sample.finalize_seconds, 0.0)
 
 
 if __name__ == "__main__":

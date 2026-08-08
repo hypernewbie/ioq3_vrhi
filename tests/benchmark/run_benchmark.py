@@ -15,8 +15,7 @@ Deliberate boundaries:
 - No visible-window policy lives here; backend commands own their window
   behavior (e.g. windowless modes).
 - This harness does NOT claim OpenGL-versus-VRHI equivalence. It reports
-  raw timings only. The engine does not emit JSONL timings yet, so running
-  the real backends is expected to fail until that instrumentation lands.
+  raw timings only.
 """
 
 from __future__ import annotations
@@ -444,8 +443,8 @@ def main() -> int:
         if not backend.jsonl_support:
             print(
                 f"[bench] WARNING: backend {backend.name!r} is marked "
-                "jsonl_support=false; the engine does not emit JSONL timings "
-                "yet, so its trials will likely time out with zero samples."
+                "jsonl_support=false; its trials may time out with zero "
+                "samples."
             )
 
     run_root = args.run_root.expanduser().resolve() / (
