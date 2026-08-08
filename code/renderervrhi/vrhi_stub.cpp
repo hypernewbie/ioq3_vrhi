@@ -80,16 +80,42 @@ static vhState g_worldState;
 static const vhStateId g_worldStateId = 3;
 static vhBuffer g_worldVertexBuffer = VRHI_INVALID_HANDLE;
 static vhBuffer g_worldIndexBuffer = VRHI_INVALID_HANDLE;
-static vhTexture g_worldDepthTexture = VRHI_INVALID_HANDLE;
-static vhTexture g_worldLightmapTexture = VRHI_INVALID_HANDLE;
-static nvrhi::Format g_worldDepthFormat = nvrhi::Format::UNKNOWN;
-static std::vector<glm::vec3> g_worldPositions;
 struct VRHI_WorldVertex {
 	glm::vec3 position;
 	glm::vec2 diffuse;
 	glm::vec2 lightmap;
 	float lightmapLayer;
+	glm::vec4 color;
 };
+// Scene submissions are retained between ClearScene and RenderScene. The
+// generated geometry uses a separate bounded upload so static BSP buffers are
+// never rewritten by transient entities/polys.
+struct VRHI_SceneEntity {
+	refEntity_t entity;
+};
+struct VRHI_ScenePoly {
+	qhandle_t shader = 0;
+	uint32_t firstVertex = 0;
+	uint32_t numVerts = 0;
+};
+struct VRHI_SceneDraw {
+	uint32_t firstIndex = 0;
+	uint32_t indexCount = 0;
+	qhandle_t shader = 0;
+};
+static std::vector<VRHI_SceneEntity> g_sceneEntities;
+static std::vector<VRHI_ScenePoly> g_scenePolys;
+static std::vector<polyVert_t> g_scenePolyVerts;
+static std::vector<VRHI_WorldVertex> g_sceneVertices;
+static std::vector<uint32_t> g_sceneIndexes;
+static std::vector<VRHI_SceneDraw> g_sceneDraws;
+static vhBuffer g_sceneVertexBuffer = VRHI_INVALID_HANDLE;
+static vhBuffer g_sceneIndexBuffer = VRHI_INVALID_HANDLE;
+static bool g_sceneBuffersCreated = false;
+static vhTexture g_worldDepthTexture = VRHI_INVALID_HANDLE;
+static vhTexture g_worldLightmapTexture = VRHI_INVALID_HANDLE;
+static nvrhi::Format g_worldDepthFormat = nvrhi::Format::UNKNOWN;
+static std::vector<glm::vec3> g_worldPositions;
 struct VRHI_WorldDiffuseImage {
 	std::string path;
 	int width = 0;
@@ -164,6 +190,10 @@ static bool g_worldLightmapAvailable = false;
 static bool g_worldLoaded = false;
 static bool g_worldShaderInitialized = false;
 static void VRHI_UploadUITextures(void);
+static bool VRHI_FiniteVec3(const float *v);
+static bool VRHI_FiniteEntity(const refEntity_t &entity);
+static void VRHI_DestroySceneResources(bool clearSubmissions);
+static void VRHI_ResetSceneSubmissions(void);
 static int32_t g_worldDrawErrorBaseline = 0;
 static bool g_worldDrawSubmitted = false;
 static int32_t g_uiDrawErrorBaseline = 0;
@@ -230,6 +260,13 @@ static const int VRHI_MAX_PATCH_BLOCKS = 4096;
 static const int VRHI_MAX_UI_TEXTURES = 1024;
 static const int VRHI_MAX_UI_TEXTURE_DIMENSION = 2048;
 static const size_t VRHI_MAX_UI_TEXTURE_BYTES = 64u * 1024u * 1024u;
+// Scene input and generated geometry are fixed-capacity per-scene storage.
+// Add calls drop submissions at these limits rather than growing each frame.
+static const size_t VRHI_MAX_SCENE_ENTITIES = 4096u;
+static const size_t VRHI_MAX_SCENE_POLYS = 4096u;
+static const size_t VRHI_MAX_SCENE_POLY_VERTICES = 65536u;
+static const size_t VRHI_MAX_SCENE_VERTICES = 131072u;
+static const size_t VRHI_MAX_SCENE_INDEXES = 393216u;
 
 // Keep the generated qpath within MAX_QPATH while allowing the command to
 // accept only a basename.  The prefix and suffix are fixed and never come
@@ -746,25 +783,35 @@ struct VSOutput {
     float2 diffuse : TEXCOORD0;
     float2 lightmap : TEXCOORD1;
     float lightmapLayer : TEXCOORD2;
+    float4 color : TEXCOORD3;
 };
 [shader("vertex")]
 VSOutput main(float3 position : POSITION, float2 diffuse : TEXCOORD0,
-    float2 lightmap : TEXCOORD1, float lightmapLayer : TEXCOORD2)
+    float2 lightmap : TEXCOORD1, float lightmapLayer : TEXCOORD2,
+    float4 color : TEXCOORD3)
 {
     VSOutput output;
     output.position = mul(u_worldViewProj, float4(position, 1.0));
     output.diffuse = diffuse;
     output.lightmap = lightmap;
     output.lightmapLayer = lightmapLayer;
+    output.color = color;
     return output;
 }
 )";
 
 static const char *VRHI_WorldSolidPixelSource = R"(
+struct PSInput {
+    float4 position : SV_Position;
+    float2 diffuse : TEXCOORD0;
+    float2 lightmap : TEXCOORD1;
+    float lightmapLayer : TEXCOORD2;
+    float4 color : TEXCOORD3;
+};
 [shader("pixel")]
-float4 main() : SV_Target
+float4 main(PSInput input) : SV_Target
 {
-    return float4(0.24, 0.42, 0.22, 1.0);
+    return float4(0.24, 0.42, 0.22, 1.0) * input.color;
 }
 )";
 
@@ -776,15 +823,16 @@ struct PSInput {
     float2 diffuse : TEXCOORD0;
     float2 lightmap : TEXCOORD1;
     float lightmapLayer : TEXCOORD2;
+    float4 color : TEXCOORD3;
 };
 [shader("pixel")]
 float4 main(PSInput input) : SV_Target
 {
     const float4 solid = float4(0.24, 0.42, 0.22, 1.0);
     if (input.lightmapLayer < -0.5)
-        return solid;
+        return solid * input.color;
     return float4(u_lightmap.Sample(u_lightmapSampler,
-        float3(saturate(input.lightmap), input.lightmapLayer)).rgb, 1.0);
+        float3(saturate(input.lightmap), input.lightmapLayer)).rgb, 1.0) * input.color;
 }
 )";
 
@@ -798,6 +846,7 @@ struct PSInput {
     float2 diffuse : TEXCOORD0;
     float2 lightmap : TEXCOORD1;
     float lightmapLayer : TEXCOORD2;
+    float4 color : TEXCOORD3;
 };
 [shader("pixel")]
 float4 main(PSInput input) : SV_Target
@@ -806,7 +855,7 @@ float4 main(PSInput input) : SV_Target
     if (input.lightmapLayer >= -0.5)
         color *= u_lightmap.Sample(u_lightmapSampler,
             float3(saturate(input.lightmap), input.lightmapLayer)).rgb;
-    return float4(color, 1.0);
+    return float4(color, 1.0) * input.color;
 }
 )";
 
@@ -876,6 +925,7 @@ float4 main(PSInput input) : SV_Target
 )";
 
 static void VRHI_DestroyWorldResources(bool clearGeometry) {
+	VRHI_DestroySceneResources(clearGeometry);
 	if (g_deviceInitialized) {
 		vhFinish();
 	}
@@ -1167,7 +1217,7 @@ static bool VRHI_UploadWorldGeometry(void) {
 	std::memcpy(indexes->data(), g_worldIndexes.data(), indexes->size());
 	const int32_t errorsBefore = g_vhErrorCounter.load(std::memory_order_relaxed);
 	vhCreateVertexBuffer(g_worldVertexBuffer, "VRHI_WorldVertices", vertices,
-		"float3 float2 float2 float", g_worldVertices.size());
+		"float3 float2 float2 float float4", g_worldVertices.size());
 	vhCreateIndexBuffer(g_worldIndexBuffer, "VRHI_WorldIndexes", indexes,
 		g_worldIndexes.size(), VRHI_BUFFER_INDEX32);
 	vhFinish();
@@ -1184,6 +1234,47 @@ static bool VRHI_UploadWorldGeometry(void) {
 	VRHI_Printf(PRINT_ALL, "renderer_vrhi: uploaded world geometry (%zu vertices, %zu indexes)\n",
 		g_worldVertices.size(), g_worldIndexes.size());
 	return true;
+}
+
+static void VRHI_DestroySceneResources(bool clearSubmissions) {
+	if (g_deviceInitialized) vhFinish();
+	if (g_sceneVertexBuffer != VRHI_INVALID_HANDLE) {
+		vhDestroyBuffer(g_sceneVertexBuffer);
+		g_sceneVertexBuffer = VRHI_INVALID_HANDLE;
+	}
+	if (g_sceneIndexBuffer != VRHI_INVALID_HANDLE) {
+		vhDestroyBuffer(g_sceneIndexBuffer);
+		g_sceneIndexBuffer = VRHI_INVALID_HANDLE;
+	}
+	g_sceneBuffersCreated = false;
+	if (g_deviceInitialized) vhFinish();
+	if (clearSubmissions) VRHI_ResetSceneSubmissions();
+}
+
+static void VRHI_ResetSceneSubmissions(void) {
+	g_sceneEntities.clear();
+	g_scenePolys.clear();
+	g_scenePolyVerts.clear();
+	g_sceneVertices.clear();
+	g_sceneIndexes.clear();
+	g_sceneDraws.clear();
+}
+
+static void VRHI_ReserveSceneStorage(void) {
+	// reserve is performed once before the first scene and all Add calls are
+	// capped, so a hostile cgame cannot cause unbounded per-frame allocation.
+	if (g_sceneEntities.capacity() < VRHI_MAX_SCENE_ENTITIES)
+		g_sceneEntities.reserve(VRHI_MAX_SCENE_ENTITIES);
+	if (g_scenePolys.capacity() < VRHI_MAX_SCENE_POLYS)
+		g_scenePolys.reserve(VRHI_MAX_SCENE_POLYS);
+	if (g_scenePolyVerts.capacity() < VRHI_MAX_SCENE_POLY_VERTICES)
+		g_scenePolyVerts.reserve(VRHI_MAX_SCENE_POLY_VERTICES);
+	if (g_sceneVertices.capacity() < VRHI_MAX_SCENE_VERTICES)
+		g_sceneVertices.reserve(VRHI_MAX_SCENE_VERTICES);
+	if (g_sceneIndexes.capacity() < VRHI_MAX_SCENE_INDEXES)
+		g_sceneIndexes.reserve(VRHI_MAX_SCENE_INDEXES);
+	if (g_sceneDraws.capacity() < VRHI_MAX_SCENE_ENTITIES + VRHI_MAX_SCENE_POLYS)
+		g_sceneDraws.reserve(VRHI_MAX_SCENE_ENTITIES + VRHI_MAX_SCENE_POLYS);
 }
 
 static void VRHI_DestroyUITextures(bool clearData) {
@@ -1554,11 +1645,13 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 	g_frameBackbuffer = VRHI_INVALID_HANDLE;
 }
 
-// Entity and non-direct material resources remain outside this slice.
-// DrawStretchPic supports bounded direct image UI textures and retains a
-// solid-color fallback for missing/unsupported handles, while the first BSP
-// model and its bounded image diffuse batches are rendered by the static
-// world path above. Every callback is
+// RT_SPRITE/RT_BEAM and AddPolyToScene are retained in bounded CPU scene
+// storage and uploaded after the static BSP world. DrawStretchPic supports
+// bounded direct image UI textures and retains a solid-color fallback for
+// missing/unsupported handles, while the first BSP model and its bounded image
+// diffuse batches are rendered by the static world path above. RT_MODEL (MD3
+// and inline BSP submodels) and complex effect/material stages remain explicit
+// safe no-ops. Every callback is
 // nevertheless populated so the client, cgame, and UI can safely exercise the
 // renderer without NULL dereferences.
 //
@@ -2318,6 +2411,7 @@ static bool VRHI_TessellatePatch(const byte *vertsData, int vertCount,
 						vertex.diffuse = glm::vec2(0.0f);
 						vertex.lightmap = glm::vec2(0.0f);
 						vertex.lightmapLayer = -1.0f;
+						vertex.color = glm::vec4(1.0f);
 						for (int row = 0; row < 3; ++row) {
 							for (int column = 0; column < 3; ++column) {
 								const drawVert_t &control = controls[static_cast<size_t>(controlY + row) *
@@ -2627,6 +2721,7 @@ static void VRHI_LoadWorld(const char *name) {
 					vertex.lightmap.y >= 0.0f && vertex.lightmap.y <= 1.0f;
 				vertex.diffuse = diffuseImage >= 0 ? vertex.diffuse : glm::vec2(0.0f);
 				vertex.lightmapLayer = validLightmapUV ? static_cast<float>(surfaceLightmapLayer) : -1.0f;
+				vertex.color = glm::vec4(1.0f);
 				g_worldVertices.push_back(vertex);
 				g_worldPositions.push_back(vertex.position);
 			}
@@ -2708,6 +2803,7 @@ static void VRHI_LoadWorld(const char *name) {
 						: glm::vec2(0.0f);
 					worldVertex.lightmapLayer = validLightmapUV
 						? static_cast<float>(surfaceLightmapLayer) : -1.0f;
+					worldVertex.color = glm::vec4(1.0f);
 					g_worldVertices.push_back(worldVertex);
 					g_worldPositions.push_back(worldVertex.position);
 				} else local = found->second;
@@ -2748,16 +2844,67 @@ static void VRHI_SetWorldVisData(const byte *vis) {
 	(void)vis;
 }
 static void VRHI_EndRegistration(void) {}
-static void VRHI_ClearScene(void) {}
+static void VRHI_ClearScene(void) {
+	VRHI_ReserveSceneStorage();
+	g_sceneEntities.clear();
+	g_scenePolys.clear();
+	g_scenePolyVerts.clear();
+	g_sceneVertices.clear();
+	g_sceneIndexes.clear();
+	g_sceneDraws.clear();
+}
 static void VRHI_AddRefEntityToScene(const refEntity_t *entity) {
-	(void)entity;
+	if (entity == nullptr || !VRHI_FiniteEntity(*entity)) {
+		VRHI_Printf(PRINT_DEVELOPER, "renderer_vrhi: dropped non-finite refEntity\n");
+		return;
+	}
+	if (entity->reType < 0 || entity->reType >= RT_MAX_REF_ENTITY_TYPE) return;
+	// RT_MODEL/rail/lightning/portal remain explicit safe no-ops: this bounded
+	// renderer has no MD3 parser or shader/material stage evaluator. Inline BSP
+	// submodels are likewise not transformed here; only static model 0 is loaded.
+	if (entity->reType != RT_SPRITE && entity->reType != RT_BEAM) {
+		// Report each unsupported type once per renderer lifetime instead of
+		// once per entity per frame; model entities dominate real scenes and
+		// would otherwise flood developer-mode console output.
+		static bool reported[RT_MAX_REF_ENTITY_TYPE] = {};
+		if (!reported[entity->reType]) {
+			reported[entity->reType] = true;
+			VRHI_Printf(PRINT_DEVELOPER,
+				"renderer_vrhi: unsupported refEntity type %d dropped (RT_MODEL and complex effects are safe no-ops)\n",
+				static_cast<int>(entity->reType));
+		}
+		return;
+	}
+	VRHI_ReserveSceneStorage();
+	if (g_sceneEntities.size() >= VRHI_MAX_SCENE_ENTITIES) return;
+	VRHI_SceneEntity submission;
+	submission.entity = *entity;
+	g_sceneEntities.push_back(submission);
 }
 static void VRHI_AddPolyToScene(qhandle_t shader, int numVerts,
 	const polyVert_t *verts, int num) {
-	(void)shader;
-	(void)numVerts;
-	(void)verts;
-	(void)num;
+	if (verts == nullptr || numVerts < 3 || num <= 0 ||
+		static_cast<size_t>(numVerts) > VRHI_MAX_SCENE_POLY_VERTICES ||
+		static_cast<size_t>(num) > VRHI_MAX_SCENE_POLYS ||
+		static_cast<size_t>(numVerts) > VRHI_MAX_SCENE_POLY_VERTICES /
+			static_cast<size_t>(num)) return;
+	VRHI_ReserveSceneStorage();
+	for (int polyIndex = 0; polyIndex < num; ++polyIndex) {
+		if (g_scenePolys.size() >= VRHI_MAX_SCENE_POLYS ||
+			g_scenePolyVerts.size() > VRHI_MAX_SCENE_POLY_VERTICES -
+				static_cast<size_t>(numVerts)) return;
+		const polyVert_t *source = verts + static_cast<size_t>(polyIndex) * numVerts;
+		for (int i = 0; i < numVerts; ++i) {
+			if (!VRHI_FiniteVec3(source[i].xyz) || !std::isfinite(source[i].st[0]) ||
+				!std::isfinite(source[i].st[1])) return;
+		}
+		VRHI_ScenePoly submission;
+		submission.shader = shader;
+		submission.firstVertex = static_cast<uint32_t>(g_scenePolyVerts.size());
+		submission.numVerts = static_cast<uint32_t>(numVerts);
+		g_scenePolyVerts.insert(g_scenePolyVerts.end(), source, source + numVerts);
+		g_scenePolys.push_back(submission);
+	}
 }
 static int VRHI_LightForPoint(vec3_t point, vec3_t ambientLight,
 	vec3_t directedLight, vec3_t lightDir) {
@@ -2819,6 +2966,166 @@ static glm::mat4 VRHI_QuakeProjection(const refdef_t *fd) {
 		(VRHI_WORLD_FAR - VRHI_WORLD_NEAR);
 	projection[2][3] = -1.0f;
 	return projection;
+}
+
+static bool VRHI_FiniteVec3(const float *v) {
+	return v != nullptr && std::isfinite(v[0]) && std::isfinite(v[1]) &&
+		std::isfinite(v[2]);
+}
+
+static bool VRHI_FiniteEntity(const refEntity_t &entity) {
+	if (!VRHI_FiniteVec3(entity.origin) || !VRHI_FiniteVec3(entity.oldorigin) ||
+		!std::isfinite(entity.radius) || !std::isfinite(entity.rotation)) return false;
+	for (int i = 0; i < 3; ++i) {
+		if (!VRHI_FiniteVec3(entity.axis[i])) return false;
+	}
+	return true;
+}
+
+static VRHI_WorldVertex VRHI_SceneVertex(const glm::vec3 &position,
+	const glm::vec2 &uv, const glm::vec4 &color) {
+	VRHI_WorldVertex vertex;
+	vertex.position = position;
+	vertex.diffuse = uv;
+	vertex.lightmap = glm::vec2(0.0f);
+	vertex.lightmapLayer = -1.0f;
+	vertex.color = color;
+	return vertex;
+}
+
+static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
+	size_t indexCount) {
+	if (indexCount == 0 || firstIndex > UINT32_MAX || indexCount > UINT32_MAX ||
+		g_sceneDraws.size() >= VRHI_MAX_SCENE_ENTITIES + VRHI_MAX_SCENE_POLYS) return false;
+	VRHI_SceneDraw draw;
+	draw.firstIndex = static_cast<uint32_t>(firstIndex);
+	draw.indexCount = static_cast<uint32_t>(indexCount);
+	draw.shader = shader;
+	g_sceneDraws.push_back(draw);
+	return true;
+}
+
+static vhTexture VRHI_SceneTexture(qhandle_t shader) {
+	const std::unordered_map<qhandle_t, size_t>::const_iterator found =
+		g_uiTextureByHandle.find(shader);
+	if (found == g_uiTextureByHandle.end() || found->second >= g_uiTextures.size())
+		return VRHI_INVALID_HANDLE;
+	return g_uiTextures[found->second].texture;
+}
+
+static bool VRHI_AppendSceneQuad(const glm::vec3 corners[4],
+	const glm::vec4 &color, qhandle_t shader) {
+	if (g_sceneDraws.size() >= VRHI_MAX_SCENE_ENTITIES + VRHI_MAX_SCENE_POLYS ||
+		g_sceneVertices.size() > VRHI_MAX_SCENE_VERTICES - 4 ||
+		g_sceneIndexes.size() > VRHI_MAX_SCENE_INDEXES - 6) return false;
+	const uint32_t firstVertex = static_cast<uint32_t>(g_sceneVertices.size());
+	const uint32_t firstIndex = static_cast<uint32_t>(g_sceneIndexes.size());
+	const glm::vec2 uv[4] = { glm::vec2(0.0f, 0.0f), glm::vec2(1.0f, 0.0f),
+		glm::vec2(1.0f, 1.0f), glm::vec2(0.0f, 1.0f) };
+	for (int i = 0; i < 4; ++i) g_sceneVertices.push_back(VRHI_SceneVertex(corners[i], uv[i], color));
+	const uint32_t indexes[6] = { 0, 1, 2, 0, 2, 3 };
+	for (uint32_t index : indexes) g_sceneIndexes.push_back(firstVertex + index);
+	return VRHI_AppendSceneDraw(shader, firstIndex, 6);
+}
+
+static bool VRHI_BuildSceneGeometry(const refdef_t *fd) {
+	VRHI_ReserveSceneStorage();
+	g_sceneVertices.clear();
+	g_sceneIndexes.clear();
+	g_sceneDraws.clear();
+	if (fd == nullptr || !VRHI_FiniteVec3(fd->vieworg) ||
+		!VRHI_FiniteVec3(fd->viewaxis[0]) || !VRHI_FiniteVec3(fd->viewaxis[1]) ||
+		!VRHI_FiniteVec3(fd->viewaxis[2])) return false;
+	const glm::vec3 viewForward(fd->viewaxis[0][0], fd->viewaxis[0][1], fd->viewaxis[0][2]);
+	const glm::vec3 viewRight(fd->viewaxis[1][0], fd->viewaxis[1][1], fd->viewaxis[1][2]);
+	const glm::vec3 viewUp(fd->viewaxis[2][0], fd->viewaxis[2][1], fd->viewaxis[2][2]);
+	for (const VRHI_SceneEntity &submission : g_sceneEntities) {
+		const refEntity_t &entity = submission.entity;
+		const qhandle_t shader = entity.customShader;
+		glm::vec4 color(entity.shaderRGBA[0] / 255.0f, entity.shaderRGBA[1] / 255.0f,
+			entity.shaderRGBA[2] / 255.0f, entity.shaderRGBA[3] / 255.0f);
+		if (color == glm::vec4(0.0f)) color = glm::vec4(1.0f);
+		if (entity.reType == RT_SPRITE) {
+			if (!(entity.radius > 0.0f) || !std::isfinite(entity.radius)) continue;
+			const float angle = entity.rotation * 3.14159265358979323846f / 180.0f;
+			const float c = std::cos(angle), s = std::sin(angle);
+			const glm::vec3 left = (c * viewRight - s * viewUp) * entity.radius;
+			const glm::vec3 up = (c * viewUp + s * viewRight) * entity.radius;
+			const glm::vec3 center(entity.origin[0], entity.origin[1], entity.origin[2]);
+			const glm::vec3 corners[4] = { center - left - up, center + left - up,
+				center + left + up, center - left + up };
+			VRHI_AppendSceneQuad(corners, color, shader);
+		} else if (entity.reType == RT_BEAM) {
+			const glm::vec3 start(entity.origin[0], entity.origin[1], entity.origin[2]);
+			const glm::vec3 end(entity.oldorigin[0], entity.oldorigin[1], entity.oldorigin[2]);
+			const glm::vec3 direction = end - start;
+			const float lengthSquared = glm::dot(direction, direction);
+			if (!std::isfinite(lengthSquared) || lengthSquared <= 1.0e-8f) continue;
+			glm::vec3 side = glm::cross(direction, viewForward);
+			float sideLength = glm::dot(side, side);
+			if (!std::isfinite(sideLength) || sideLength <= 1.0e-8f) {
+				side = glm::cross(direction, viewRight);
+				sideLength = glm::dot(side, side);
+			}
+			if (sideLength <= 1.0e-8f || !std::isfinite(sideLength)) continue;
+			const float width = entity.frame > 0 ? glm::clamp(entity.frame * 0.5f, 0.25f, 4096.0f) : 4.0f;
+			side *= width / std::sqrt(sideLength);
+			const glm::vec3 corners[4] = { start - side, end - side, end + side, start + side };
+			VRHI_AppendSceneQuad(corners, color, shader);
+		}
+	}
+	for (const VRHI_ScenePoly &poly : g_scenePolys) {
+		if (poly.numVerts < 3 || poly.firstVertex > g_scenePolyVerts.size() ||
+			poly.numVerts > g_scenePolyVerts.size() - poly.firstVertex) continue;
+		if (g_sceneVertices.size() > VRHI_MAX_SCENE_VERTICES - poly.numVerts ||
+			poly.numVerts - 2 > (VRHI_MAX_SCENE_INDEXES - g_sceneIndexes.size()) / 3) continue;
+		const uint32_t firstVertex = static_cast<uint32_t>(g_sceneVertices.size());
+		const uint32_t firstIndex = static_cast<uint32_t>(g_sceneIndexes.size());
+		for (uint32_t i = 0; i < poly.numVerts; ++i) {
+			const polyVert_t &source = g_scenePolyVerts[poly.firstVertex + i];
+			const glm::vec4 color(source.modulate[0] / 255.0f, source.modulate[1] / 255.0f,
+				source.modulate[2] / 255.0f, source.modulate[3] / 255.0f);
+			g_sceneVertices.push_back(VRHI_SceneVertex(glm::vec3(source.xyz[0], source.xyz[1], source.xyz[2]),
+				glm::vec2(source.st[0], source.st[1]), color));
+		}
+		for (uint32_t i = 1; i + 1 < poly.numVerts; ++i) {
+			g_sceneIndexes.push_back(firstVertex);
+			g_sceneIndexes.push_back(firstVertex + i);
+			g_sceneIndexes.push_back(firstVertex + i + 1);
+		}
+		VRHI_AppendSceneDraw(poly.shader, firstIndex, (poly.numVerts - 2) * 3);
+	}
+	return !g_sceneIndexes.empty();
+}
+
+static bool VRHI_EnsureSceneBuffers(void) {
+	if (!g_deviceInitialized || g_sceneVertices.empty() || g_sceneIndexes.empty()) return false;
+	if (g_sceneVertexBuffer == VRHI_INVALID_HANDLE) g_sceneVertexBuffer = vhAllocBuffer();
+	if (g_sceneIndexBuffer == VRHI_INVALID_HANDLE) g_sceneIndexBuffer = vhAllocBuffer();
+	if (g_sceneVertexBuffer == VRHI_INVALID_HANDLE || g_sceneIndexBuffer == VRHI_INVALID_HANDLE) return false;
+	if (!g_sceneBuffersCreated) {
+		const int32_t errorsBefore = g_vhErrorCounter.load(std::memory_order_relaxed);
+		vhCreateVertexBuffer(g_sceneVertexBuffer, "VRHI_SceneVertices", nullptr,
+			"float3 float2 float2 float float4", VRHI_MAX_SCENE_VERTICES);
+		vhCreateIndexBuffer(g_sceneIndexBuffer, "VRHI_SceneIndexes", nullptr,
+			VRHI_MAX_SCENE_INDEXES, VRHI_BUFFER_INDEX32);
+		vhFinish();
+		if (g_vhErrorCounter.load(std::memory_order_relaxed) != errorsBefore) {
+			VRHI_Printf(PRINT_WARNING, "renderer_vrhi: scene buffer creation failed\n");
+			vhDestroyBuffer(g_sceneVertexBuffer);
+			vhDestroyBuffer(g_sceneIndexBuffer);
+			g_sceneVertexBuffer = g_sceneIndexBuffer = VRHI_INVALID_HANDLE;
+			return false;
+		}
+		g_sceneBuffersCreated = true;
+	}
+	vhMem *vertices = new vhMem(g_sceneVertices.size() * sizeof(VRHI_WorldVertex));
+	std::memcpy(vertices->data(), g_sceneVertices.data(), vertices->size());
+	vhMem *indexes = new vhMem(g_sceneIndexes.size() * sizeof(uint32_t));
+	std::memcpy(indexes->data(), g_sceneIndexes.data(), indexes->size());
+	vhUpdateVertexBuffer(g_sceneVertexBuffer, vertices, 0, g_sceneVertices.size());
+	vhUpdateIndexBuffer(g_sceneIndexBuffer, indexes, 0, g_sceneIndexes.size());
+	return true;
 }
 
 // Walks the decoded BSP node tree from the root to the leaf containing point.
@@ -2950,17 +3257,19 @@ static int VRHI_CullDebugEnabled(void) {
 
 static void VRHI_RenderScene(const refdef_t *fd) {
 	if (fd == nullptr || (fd->rdflags & (RDF_NOWORLDMODEL | RDF_HYPERSPACE)) != 0 ||
-		!g_deviceInitialized || !g_frameBackbufferReady || !g_worldLoaded ||
-		!g_worldShaderInitialized || g_worldVertexBuffer == VRHI_INVALID_HANDLE ||
-		g_worldIndexBuffer == VRHI_INVALID_HANDLE || g_worldDepthTexture == VRHI_INVALID_HANDLE ||
+		!g_deviceInitialized || !g_frameBackbufferReady ||
+		!g_worldShaderInitialized || g_worldDepthTexture == VRHI_INVALID_HANDLE ||
 		fd->width <= 0 || fd->height <= 0 || !std::isfinite(fd->fov_x) ||
-		!std::isfinite(fd->fov_y) || fd->fov_x <= 0.0f || fd->fov_y <= 0.0f) return;
+		!std::isfinite(fd->fov_y) || fd->fov_x <= 0.0f || fd->fov_y <= 0.0f ||
+		!VRHI_FiniteVec3(fd->vieworg) || !VRHI_FiniteVec3(fd->viewaxis[0]) ||
+		!VRHI_FiniteVec3(fd->viewaxis[1]) || !VRHI_FiniteVec3(fd->viewaxis[2])) return;
 	if (!VRHI_CreateWorldDepth(g_frameViewportWidth, g_frameViewportHeight)) return;
 	// Resolve the camera leaf/cluster and stamp the visible surface batches.
 	// A failure to cull (no/malformed visibility, camera outside the tree)
 	// falls back to drawing every batch, preserving the previous output.
 	const glm::vec3 vieworg(fd->vieworg[0], fd->vieworg[1], fd->vieworg[2]);
-	const bool cullActive = VRHI_MarkVisibleWorldBatches(vieworg);
+	const bool cullActive = g_worldLoaded && g_worldVertexBuffer != VRHI_INVALID_HANDLE &&
+		g_worldIndexBuffer != VRHI_INVALID_HANDLE && VRHI_MarkVisibleWorldBatches(vieworg);
 	if (cullActive != g_worldCullActive) {
 		VRHI_Printf(PRINT_ALL,
 			"renderer_vrhi: world cull %s (leaf=%d cluster=%d)\n",
@@ -3006,11 +3315,16 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		.SetStateFlags(VRHI_STATE_WRITE_RGB | VRHI_STATE_WRITE_A | VRHI_STATE_WRITE_Z |
 			VRHI_STATE_DEPTH_TEST_ENABLE | VRHI_STATE_DEPTH_TEST_LESS |
 			VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES)
-		.SetVertexBuffer(g_worldVertexBuffer, 0, 0, 0, static_cast<uint32_t>(g_worldVertices.size()))
-		.SetIndexBuffer(g_worldIndexBuffer, 0, 0, static_cast<uint32_t>(g_worldIndexes.size()))
 		.SetTextures({})
 		.SetSamplers({})
 		.DirtyAll();
+	if (g_worldLoaded && g_worldVertexBuffer != VRHI_INVALID_HANDLE &&
+		g_worldIndexBuffer != VRHI_INVALID_HANDLE) {
+		g_worldState.SetVertexBuffer(g_worldVertexBuffer, 0, 0, 0,
+			static_cast<uint32_t>(g_worldVertices.size()))
+			.SetIndexBuffer(g_worldIndexBuffer, 0, 0,
+				static_cast<uint32_t>(g_worldIndexes.size()));
+	}
 	const vhState worldBaseState = g_worldState;
 	g_worldDrawErrorBaseline = g_vhErrorCounter.load(std::memory_order_relaxed);
 	bool submitted = false;
@@ -3056,11 +3370,49 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 				useLightmap ? "yes" : "no");
 		}
 	}
+	if (VRHI_BuildSceneGeometry(fd) && VRHI_EnsureSceneBuffers()) {
+		VRHI_Printf(PRINT_DEVELOPER,
+			"renderer_vrhi: scene submissions: entities=%zu polys=%zu draws=%zu vertices=%zu indexes=%zu\n",
+			g_sceneEntities.size(), g_scenePolys.size(), g_sceneDraws.size(),
+			g_sceneVertices.size(), g_sceneIndexes.size());
+		for (const VRHI_SceneDraw &draw : g_sceneDraws) {
+			const vhTexture texture = VRHI_SceneTexture(draw.shader);
+			const bool textured = texture != VRHI_INVALID_HANDLE &&
+				g_worldDiffusePixelShader != VRHI_INVALID_HANDLE;
+			g_worldState = worldBaseState;
+			g_worldState.SetProgram(textured ? g_worldDiffuseProgram : g_worldSolidProgram)
+				.SetStateFlags(VRHI_STATE_WRITE_RGB | VRHI_STATE_WRITE_A | VRHI_STATE_WRITE_Z |
+					VRHI_STATE_DEPTH_TEST_ENABLE | VRHI_STATE_DEPTH_TEST_LESS |
+					VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES | VRHI_STATE_BLEND_ALPHA)
+				.SetVertexBuffer(g_sceneVertexBuffer, 0, 0, 0,
+					static_cast<uint32_t>(g_sceneVertices.size()))
+				.SetIndexBuffer(g_sceneIndexBuffer, 0, 0,
+					static_cast<uint32_t>(g_sceneIndexes.size()))
+				.SetTextures({}).SetSamplers({});
+			if (textured) {
+				g_worldState.SetTexture(0, { "u_diffuse", 0, texture })
+					.SetSampler(0, { "u_diffuseSampler", 0,
+						VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
+						VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_WRAP });
+			}
+			if (vhSetState(g_worldStateId, g_worldState)) {
+				if (!submitted) vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
+				vhDrawIndexed(g_worldStateId, draw.indexCount, 1, draw.firstIndex);
+				submitted = true;
+			} else {
+				VRHI_Printf(PRINT_WARNING,
+					"renderer_vrhi: scene draw vhSetState failed (first=%u indexes=%u textured=%s)\n",
+					draw.firstIndex, draw.indexCount, textured ? "yes" : "no");
+			}
+		}
+	}
 	g_worldDrawSubmitted = submitted;
-	if (!submitted) {
+	// RenderScene is also used for world-less scene frames (menu/model previews),
+	// so only report a skipped draw when a loaded world produced no output.
+	if (!submitted && g_worldLoaded) {
 		VRHI_Printf(PRINT_WARNING,
-			"renderer_vrhi: world draw skipped; no valid surface batches (vertices=%zu indexes=%zu)\n",
-			g_worldVertices.size(), g_worldIndexes.size());
+			"renderer_vrhi: world/scene draw skipped (world vertices=%zu indexes=%zu scene submissions=%zu)\n",
+			g_worldVertices.size(), g_worldIndexes.size(), g_sceneDraws.size());
 	}
 }
 static void VRHI_SetColor(const float *rgba) {
@@ -3296,6 +3648,6 @@ extern "C" Q_EXPORT refexport_t *QDECL GetRefAPI(int apiVersion,
 	exports.TakeVideoFrame = VRHI_TakeVideoFrame;
 
 	VRHI_Printf(PRINT_ALL,
-		"renderer_vrhi: loaded (clear/present + direct-image/solid-fallback UI + lightmapped/image PVS-culled BSP world)\n");
+		"renderer_vrhi: loaded (clear/present + bounded sprite/beam/poly scenes + direct-image UI + lightmapped/image PVS-culled BSP world)\n");
 	return &exports;
 }

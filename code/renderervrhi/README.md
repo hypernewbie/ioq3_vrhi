@@ -40,7 +40,7 @@ A bounded first-stage shader-script diffuse lookup is supported for BSP maps:
 `scripts/*.shader` is scanned once per map, matching BSP shader names and taking
 the first non-special `map`/`clampmap` image stage into a copied cache. This
 is not full Quake shader/material parity; deform, fog, blend, additional
-stage/material semantics, PK3 material stages, area/door masking, entities, and
+stage/material semantics, PK3 material stages, area/door masking, and
 corresponding renderer parity remain unsupported and fall back to the existing
 lightmap/solid path. Script file count, per-file/aggregate text,
 token, candidate image, and decoded image memory are bounded, so malformed or
@@ -50,9 +50,14 @@ oversized input is rejected safely.
 `Shutdown(qtrue)` finishes and destroys VRHI, input, the window, and SDL video in
 that order.
 
-Model, skin, general shader-script/JPG/PNG/PK3 material stages, scene entities,
-fonts, cinematics, and video-capture resources are intentionally not
-implemented. Shader registration admits bounded TGA/JPG/JPEG/PNG names (bare
+RT_SPRITE and RT_BEAM entities plus AddPolyToScene triangle-fan batches are
+retained in bounded CPU scene storage and rendered as camera-facing 3D geometry
+after the static world. Registered direct image handles are reused when
+available, with a solid fallback. Scene CPU submissions and renderer-owned
+transient vertex/index buffers reset on ClearScene and are destroyed on restart
+and shutdown. RT_MODEL (including MD3 parsing and inline BSP submodels), rail,
+lightning, portal, fonts, cinematics, and video-capture resources remain
+explicit safe no-ops; no fake model parity is attempted. Shader registration admits bounded TGA/JPG/JPEG/PNG names (bare
 names probe `.tga`, `.jpg`, `.jpeg`, and `.png`; explicit supported extensions are not
 rewritten); the BSP-only first-stage script lookup uses the same image resolver,
 and all other material semantics remain unsupported and use the solid UI

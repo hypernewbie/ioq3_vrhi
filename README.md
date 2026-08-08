@@ -47,6 +47,17 @@ The original id software readme that accompanied the Q3 source release has been
 renamed to id-readme.txt so as to prevent confusion. Please refer to the
 website for updated status.
 
+## VRHI renderer scene slice
+
+The optional `renderer_vrhi` backend retains bounded submissions between
+`ClearScene` and `RenderScene`. `RT_SPRITE` and `RT_BEAM` are emitted as
+camera-facing 3D quads, and `AddPolyToScene` emits validated triangle-fan
+batches after the static BSP world. Registered direct image handles are used
+when available, with a solid fallback otherwise. CPU and GPU scene storage is
+capped and reset on restart/shutdown. `RT_MODEL` (including MD3 and inline BSP
+submodels) and complex material/effect types remain documented safe no-ops in
+this initial slice; the static BSP world remains supported.
+
 ## Just want to play ioquake3?
 Check out our Player's Guide here:
 https://ioquake3.org/help/players-guide/
