@@ -43,6 +43,7 @@
 #include "qcommon/qfiles.h"
 #include "qcommon/surfaceflags.h"
 #include "renderercommon/tr_public.h"
+#include "renderervrhi/vrhi_tga_decode.h"
 
 // vrhi.h is the public header for the copied prebuilt VRHI library.  The
 // implementation deliberately uses only its device, swapchain, state,
@@ -1674,33 +1675,19 @@ static bool VRHI_LoadDiffuseTGA(const char *shaderName, int *imageIndex) {
 	}
 	const size_t fileSize = static_cast<size_t>(fileSizeLong);
 	const byte *bytes = static_cast<const byte *>(fileData);
-	uint16_t diskWidth = 0;
-	uint16_t diskHeight = 0;
-	std::memcpy(&diskWidth, bytes + 12, sizeof(diskWidth));
-	std::memcpy(&diskHeight, bytes + 14, sizeof(diskHeight));
-	const int width = static_cast<int>(LittleShort(diskWidth));
-	const int height = static_cast<int>(LittleShort(diskHeight));
-	const byte idLength = bytes[0];
-	const byte imageType = bytes[2];
-	const byte pixelSize = bytes[16];
-	const byte attributes = bytes[17];
-	const bool validDimensions = width > 0 && height > 0 &&
-		width <= VRHI_MAX_WORLD_DIFFUSE_DIMENSION && height <= VRHI_MAX_WORLD_DIFFUSE_DIMENSION;
-	const size_t pixelBytes = validDimensions
-		? static_cast<size_t>(width) * static_cast<size_t>(height) * 4 : 0;
-	const size_t sourceBytes = validDimensions && (pixelSize == 24 || pixelSize == 32)
-		? static_cast<size_t>(pixelSize / 8) * static_cast<size_t>(width) * static_cast<size_t>(height) : 0;
-	const size_t pixelOffset = 18u + static_cast<size_t>(idLength);
-	const bool valid = validDimensions && bytes[1] == 0 && imageType == 2 &&
-		(pixelSize == 24 || pixelSize == 32) && pixelOffset <= fileSize &&
-		sourceBytes <= fileSize - pixelOffset && pixelBytes <= VRHI_MAX_WORLD_DIFFUSE_BYTES;
-	if (!valid) {
+	// Bounded decode of uncompressed (type 2) and RLE (type 10) 24/32-bit
+	// true-color TGAs. Any malformed, oversized, or unsupported file returns
+	// false here and keeps the existing lightmap/solid fallback.
+	vrhi_tga::DecodeResult decoded;
+	if (!vrhi_tga::Decode(bytes, fileSize, VRHI_MAX_WORLD_DIFFUSE_DIMENSION,
+		VRHI_MAX_WORLD_DIFFUSE_BYTES, &decoded)) {
 		VRHI_Printf(PRINT_DEVELOPER,
-			"renderer_vrhi: diffuse '%s' unsupported; expected uncompressed 24/32-bit TGA within caps\n",
+			"renderer_vrhi: diffuse '%s' unsupported; expected type 2/10 (RLE) 24/32-bit TGA within caps\n",
 			path.c_str());
 		g_ri.FS_FreeFile(fileData);
 		return false;
 	}
+	const size_t pixelBytes = decoded.rgba.size();
 	// Keep the aggregate cap independent of the number of shader references.
 	size_t existingBytes = 0;
 	for (const VRHI_WorldDiffuseImage &image : g_worldDiffuseImages) existingBytes += image.pixels.size();
@@ -1711,30 +1698,15 @@ static bool VRHI_LoadDiffuseTGA(const char *shaderName, int *imageIndex) {
 	}
 	VRHI_WorldDiffuseImage image;
 	image.path = path;
-	image.width = width;
-	image.height = height;
-	image.pixels.resize(pixelBytes);
-	const size_t sourcePixelBytes = pixelSize / 8;
-	const bool topDown = (attributes & 0x20) != 0;
-	for (int fileRow = 0; fileRow < height; ++fileRow) {
-		const int outputRow = topDown ? fileRow : height - 1 - fileRow;
-		const byte *source = bytes + pixelOffset + static_cast<size_t>(fileRow) *
-			static_cast<size_t>(width) * sourcePixelBytes;
-		byte *destination = image.pixels.data() + static_cast<size_t>(outputRow) *
-			static_cast<size_t>(width) * 4;
-		for (int x = 0; x < width; ++x) {
-			destination[x * 4 + 0] = source[x * sourcePixelBytes + 2];
-			destination[x * 4 + 1] = source[x * sourcePixelBytes + 1];
-			destination[x * 4 + 2] = source[x * sourcePixelBytes + 0];
-			destination[x * 4 + 3] = sourcePixelBytes == 4 ? source[x * sourcePixelBytes + 3] : 255;
-		}
-	}
+	image.width = decoded.width;
+	image.height = decoded.height;
+	image.pixels = std::move(decoded.rgba);
 	g_ri.FS_FreeFile(fileData);
 	g_worldDiffuseImages.push_back(std::move(image));
 	const int index = static_cast<int>(g_worldDiffuseImages.size() - 1);
 	if (imageIndex != nullptr) *imageIndex = index;
 	VRHI_Printf(PRINT_ALL, "renderer_vrhi: decoded BSP diffuse '%s' (%dx%d, %zu bytes)\n",
-		path.c_str(), width, height, pixelBytes);
+		path.c_str(), decoded.width, decoded.height, pixelBytes);
 	return true;
 }
 
@@ -1957,7 +1929,7 @@ static void VRHI_LoadWorld(const char *name) {
 			surface.lightmapNum >= 0 && surface.lightmapNum < g_worldLightmapLayers
 			? surface.lightmapNum : -1;
 		int diffuseImage = -1;
-		// Only direct uncompressed TGA references are attempted. Shader scripts,
+		// Only direct uncompressed/RLE TGA references are attempted. Shader scripts,
 		// JPG/PNG and all stage/deform semantics intentionally use the old path.
 		VRHI_LoadDiffuseTGA(shader.shader, &diffuseImage);
 		const uint32_t surfaceFirstIndex = static_cast<uint32_t>(g_worldIndexes.size());
