@@ -67,8 +67,10 @@ static const vhStateId g_uiStateId = 2;
 static vhShader g_worldVertexShader = VRHI_INVALID_HANDLE;
 static vhShader g_worldSolidPixelShader = VRHI_INVALID_HANDLE;
 static vhShader g_worldLightmapPixelShader = VRHI_INVALID_HANDLE;
+static vhShader g_worldDiffusePixelShader = VRHI_INVALID_HANDLE;
 static vhProgram g_worldSolidProgram;
 static vhProgram g_worldLightmapProgram;
+static vhProgram g_worldDiffuseProgram;
 static vhState g_worldState;
 static const vhStateId g_worldStateId = 3;
 static vhBuffer g_worldVertexBuffer = VRHI_INVALID_HANDLE;
@@ -79,11 +81,26 @@ static nvrhi::Format g_worldDepthFormat = nvrhi::Format::UNKNOWN;
 static std::vector<glm::vec3> g_worldPositions;
 struct VRHI_WorldVertex {
 	glm::vec3 position;
+	glm::vec2 diffuse;
 	glm::vec2 lightmap;
 	float lightmapLayer;
 };
+struct VRHI_WorldDiffuseImage {
+	std::string path;
+	int width = 0;
+	int height = 0;
+	std::vector<byte> pixels;
+	vhTexture texture = VRHI_INVALID_HANDLE;
+};
+struct VRHI_WorldBatch {
+	uint32_t firstIndex = 0;
+	uint32_t indexCount = 0;
+	int diffuseImage = -1;
+};
 static std::vector<VRHI_WorldVertex> g_worldVertices;
 static std::vector<uint32_t> g_worldIndexes;
+static std::vector<VRHI_WorldBatch> g_worldBatches;
+static std::vector<VRHI_WorldDiffuseImage> g_worldDiffuseImages;
 static std::vector<byte> g_worldLightmapPixels;
 static int g_worldLightmapLayers = 0;
 static bool g_worldLightmapAvailable = false;
@@ -109,6 +126,11 @@ static const float VRHI_WORLD_FAR = 131072.0f;
 // Keep malformed or hostile BSP lumps from forcing an unbounded CPU/GPU
 // allocation. Normal Quake 3 maps use far fewer layers.
 static const int VRHI_MAX_WORLD_LIGHTMAP_LAYERS = 1024;
+// Diffuse loading is intentionally a small, direct-TGA subset. Keep both the
+// per-image and aggregate caps bounded when map shader names are malformed.
+static const int VRHI_MAX_WORLD_DIFFUSE_IMAGES = 256;
+static const int VRHI_MAX_WORLD_DIFFUSE_DIMENSION = 2048;
+static const size_t VRHI_MAX_WORLD_DIFFUSE_BYTES = 64u * 1024u * 1024u;
 
 // Keep the generated qpath within MAX_QPATH while allowing the command to
 // accept only a basename.  The prefix and suffix are fixed and never come
@@ -622,15 +644,17 @@ cbuffer WorldUniforms : register(b1, VRHI_STAGE_SPACE)
 };
 struct VSOutput {
     float4 position : SV_Position;
-    float2 lightmap : TEXCOORD0;
-    float lightmapLayer : TEXCOORD1;
+    float2 diffuse : TEXCOORD0;
+    float2 lightmap : TEXCOORD1;
+    float lightmapLayer : TEXCOORD2;
 };
 [shader("vertex")]
-VSOutput main(float3 position : POSITION, float2 lightmap : TEXCOORD0,
-    float lightmapLayer : TEXCOORD1)
+VSOutput main(float3 position : POSITION, float2 diffuse : TEXCOORD0,
+    float2 lightmap : TEXCOORD1, float lightmapLayer : TEXCOORD2)
 {
     VSOutput output;
     output.position = mul(u_worldViewProj, float4(position, 1.0));
+    output.diffuse = diffuse;
     output.lightmap = lightmap;
     output.lightmapLayer = lightmapLayer;
     return output;
@@ -650,8 +674,9 @@ Texture2DArray<float4> u_lightmap : register(t0, VRHI_STAGE_SPACE);
 SamplerState u_lightmapSampler : register(s0, VRHI_STAGE_SPACE);
 struct PSInput {
     float4 position : SV_Position;
-    float2 lightmap : TEXCOORD0;
-    float lightmapLayer : TEXCOORD1;
+    float2 diffuse : TEXCOORD0;
+    float2 lightmap : TEXCOORD1;
+    float lightmapLayer : TEXCOORD2;
 };
 [shader("pixel")]
 float4 main(PSInput input) : SV_Target
@@ -661,6 +686,28 @@ float4 main(PSInput input) : SV_Target
         return solid;
     return float4(u_lightmap.Sample(u_lightmapSampler,
         float3(saturate(input.lightmap), input.lightmapLayer)).rgb, 1.0);
+}
+)";
+
+static const char *VRHI_WorldDiffusePixelSource = R"(
+Texture2D<float4> u_diffuse : register(t0, VRHI_STAGE_SPACE);
+SamplerState u_diffuseSampler : register(s0, VRHI_STAGE_SPACE);
+Texture2DArray<float4> u_lightmap : register(t1, VRHI_STAGE_SPACE);
+SamplerState u_lightmapSampler : register(s1, VRHI_STAGE_SPACE);
+struct PSInput {
+    float4 position : SV_Position;
+    float2 diffuse : TEXCOORD0;
+    float2 lightmap : TEXCOORD1;
+    float lightmapLayer : TEXCOORD2;
+};
+[shader("pixel")]
+float4 main(PSInput input) : SV_Target
+{
+    float3 color = u_diffuse.Sample(u_diffuseSampler, input.diffuse).rgb;
+    if (input.lightmapLayer >= -0.5)
+        color *= u_lightmap.Sample(u_lightmapSampler,
+            float3(saturate(input.lightmap), input.lightmapLayer)).rgb;
+    return float4(color, 1.0);
 }
 )";
 
@@ -737,8 +784,19 @@ static void VRHI_DestroyWorldResources(bool clearGeometry) {
 		vhDestroyShader(g_worldLightmapPixelShader);
 		g_worldLightmapPixelShader = VRHI_INVALID_HANDLE;
 	}
+	if (g_worldDiffusePixelShader != VRHI_INVALID_HANDLE) {
+		vhDestroyShader(g_worldDiffusePixelShader);
+		g_worldDiffusePixelShader = VRHI_INVALID_HANDLE;
+	}
+	for (VRHI_WorldDiffuseImage &image : g_worldDiffuseImages) {
+		if (image.texture != VRHI_INVALID_HANDLE) {
+			vhDestroyTexture(image.texture);
+			image.texture = VRHI_INVALID_HANDLE;
+		}
+	}
 	g_worldSolidProgram.clear();
 	g_worldLightmapProgram.clear();
+	g_worldDiffuseProgram.clear();
 	g_worldLightmapAvailable = false;
 	g_worldLightmapLayers = 0;
 	g_worldLightmapPixels.clear();
@@ -748,6 +806,8 @@ static void VRHI_DestroyWorldResources(bool clearGeometry) {
 		g_worldPositions.clear();
 		g_worldVertices.clear();
 		g_worldIndexes.clear();
+		g_worldBatches.clear();
+		g_worldDiffuseImages.clear();
 		g_worldLoaded = false;
 	}
 	if (g_deviceInitialized) {
@@ -761,6 +821,7 @@ static bool VRHI_InitializeWorldShader(void) {
 	std::vector<uint32_t> vertexSpirv;
 	std::vector<uint32_t> solidPixelSpirv;
 	std::vector<uint32_t> lightmapPixelSpirv;
+	std::vector<uint32_t> diffusePixelSpirv;
 	std::string error;
 	if (!vhCompileShader("VRHI_WorldVertex", VRHI_WorldVertexSource,
 		VRHI_SHADER_STAGE_VERTEX | VRHI_SHADER_SM_6_0, vertexSpirv, "main",
@@ -781,12 +842,23 @@ static bool VRHI_InitializeWorldShader(void) {
 			"renderer_vrhi: lightmap shader unavailable; using solid fallback: %s\n",
 			lightmapError.c_str());
 	}
+	std::string diffuseError;
+	const bool diffuseCompiled = vhCompileShader("VRHI_WorldDiffusePixel",
+		VRHI_WorldDiffusePixelSource, VRHI_SHADER_STAGE_PIXEL | VRHI_SHADER_SM_6_0,
+		diffusePixelSpirv, "main", {}, {}, &diffuseError);
+	if (!diffuseCompiled) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: diffuse shader unavailable; TGA surfaces use lightmap/solid fallback: %s\n",
+			diffuseError.c_str());
+	}
 	g_worldVertexShader = vhAllocShader();
 	g_worldSolidPixelShader = vhAllocShader();
 	if (lightmapCompiled) g_worldLightmapPixelShader = vhAllocShader();
+	if (diffuseCompiled) g_worldDiffusePixelShader = vhAllocShader();
 	if (g_worldVertexShader == VRHI_INVALID_HANDLE ||
 		g_worldSolidPixelShader == VRHI_INVALID_HANDLE ||
-		(lightmapCompiled && g_worldLightmapPixelShader == VRHI_INVALID_HANDLE)) {
+		(lightmapCompiled && g_worldLightmapPixelShader == VRHI_INVALID_HANDLE) ||
+		(diffuseCompiled && g_worldDiffusePixelShader == VRHI_INVALID_HANDLE)) {
 		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: world shader allocation failed\n");
 		VRHI_DestroyWorldResources(false);
 		return false;
@@ -800,6 +872,10 @@ static bool VRHI_InitializeWorldShader(void) {
 		vhCreateShader(g_worldLightmapPixelShader, "VRHI_WorldLightmapPixel",
 			VRHI_SHADER_STAGE_PIXEL, lightmapPixelSpirv, "main");
 	}
+	if (diffuseCompiled) {
+		vhCreateShader(g_worldDiffusePixelShader, "VRHI_WorldDiffusePixel",
+			VRHI_SHADER_STAGE_PIXEL, diffusePixelSpirv, "main");
+	}
 	vhFinish();
 	if (g_vhErrorCounter.load(std::memory_order_relaxed) != errorsBefore) {
 		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: world shader creation failed\n");
@@ -811,9 +887,13 @@ static bool VRHI_InitializeWorldShader(void) {
 		g_worldLightmapProgram = vhCreateGfxProgram(g_worldVertexShader,
 			g_worldLightmapPixelShader);
 	}
+	if (diffuseCompiled) {
+		g_worldDiffuseProgram = vhCreateGfxProgram(g_worldVertexShader,
+			g_worldDiffusePixelShader);
+	}
 	g_worldShaderInitialized = true;
-	VRHI_Printf(PRINT_ALL, "renderer_vrhi: static BSP world shaders ready (lightmap=%s)\n",
-		lightmapCompiled ? "yes" : "no");
+	VRHI_Printf(PRINT_ALL, "renderer_vrhi: static BSP world shaders ready (lightmap=%s diffuse=%s)\n",
+		lightmapCompiled ? "yes" : "no", diffuseCompiled ? "yes" : "no");
 	return true;
 }
 
@@ -886,6 +966,40 @@ static bool VRHI_UploadWorldLightmaps(void) {
 	return true;
 }
 
+static bool VRHI_UploadWorldDiffuse(void) {
+	if (!g_deviceInitialized || g_worldDiffusePixelShader == VRHI_INVALID_HANDLE) return false;
+	bool anyUploaded = false;
+	for (VRHI_WorldDiffuseImage &image : g_worldDiffuseImages) {
+		if (image.texture != VRHI_INVALID_HANDLE) {
+			anyUploaded = true;
+			continue;
+		}
+		if (image.width <= 0 || image.height <= 0 || image.pixels.empty()) continue;
+		vhTexture texture = vhAllocTexture();
+		if (texture == VRHI_INVALID_HANDLE) {
+			VRHI_Printf(PRINT_WARNING, "renderer_vrhi: diffuse TGA '%s' allocation failed; using lightmap/solid fallback\n", image.path.c_str());
+			continue;
+		}
+		vhMem *data = new vhMem(image.pixels.size());
+		std::memcpy(data->data(), image.pixels.data(), data->size());
+		const int32_t errorsBefore = g_vhErrorCounter.load(std::memory_order_relaxed);
+		vhCreateTexture2D(texture, image.path.c_str(), glm::ivec2(image.width, image.height), 1,
+			nvrhi::Format::RGBA8_UNORM, VRHI_TEXTURE_NONE | VRHI_SAMPLER_NONE, data);
+		vhFinish();
+		if (g_vhErrorCounter.load(std::memory_order_relaxed) != errorsBefore) {
+			VRHI_Printf(PRINT_WARNING, "renderer_vrhi: diffuse TGA '%s' upload failed; using lightmap/solid fallback\n", image.path.c_str());
+			vhDestroyTexture(texture);
+			vhFinish();
+			continue;
+		}
+		image.texture = texture;
+		anyUploaded = true;
+		VRHI_Printf(PRINT_ALL, "renderer_vrhi: uploaded BSP diffuse '%s' (%dx%d, %zu bytes)\n",
+			image.path.c_str(), image.width, image.height, image.pixels.size());
+	}
+	return anyUploaded;
+}
+
 static bool VRHI_UploadWorldGeometry(void) {
 	if (!g_deviceInitialized || !g_worldLoaded || g_worldVertices.empty() ||
 		g_worldIndexes.empty()) return false;
@@ -908,7 +1022,7 @@ static bool VRHI_UploadWorldGeometry(void) {
 	std::memcpy(indexes->data(), g_worldIndexes.data(), indexes->size());
 	const int32_t errorsBefore = g_vhErrorCounter.load(std::memory_order_relaxed);
 	vhCreateVertexBuffer(g_worldVertexBuffer, "VRHI_WorldVertices", vertices,
-		"float3 float2 float", g_worldVertices.size());
+		"float3 float2 float2 float", g_worldVertices.size());
 	vhCreateIndexBuffer(g_worldIndexBuffer, "VRHI_WorldIndexes", indexes,
 		g_worldIndexes.size(), VRHI_BUFFER_INDEX32);
 	vhFinish();
@@ -921,6 +1035,7 @@ static bool VRHI_UploadWorldGeometry(void) {
 		return false;
 	}
 	VRHI_UploadWorldLightmaps();
+	VRHI_UploadWorldDiffuse();
 	VRHI_Printf(PRINT_ALL, "renderer_vrhi: uploaded world geometry (%zu vertices, %zu indexes)\n",
 		g_worldVertices.size(), g_worldIndexes.size());
 	return true;
@@ -1239,9 +1354,10 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 	g_frameBackbuffer = VRHI_INVALID_HANDLE;
 }
 
-// Image, entity, patch, and textured UI resources remain outside this slice.
+// Entity, patch, and textured UI resources remain outside this slice.
 // DrawStretchPic provides the existing solid-color UI fallback while the first
-// BSP model is rendered by the static world path above. Every callback is
+// BSP model and its bounded direct-TGA diffuse batches are rendered by the
+// static world path above. Every callback is
 // nevertheless populated so the client, cgame, and UI can safely exercise the
 // renderer without NULL dereferences.
 //
@@ -1249,8 +1365,9 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 // client, cgame, and UI see successful registrations (qhandle_t 0 means
 // failure). The handle policy mirrors the GL renderers: each handle space is
 // independent, the first handle is 1, the same name always resolves to the
-// same handle, and NULL/empty names fail with 0. No image, model, or world
-// data is actually loaded or kept beyond the name->handle mapping.
+// same handle, and NULL/empty names fail with 0. Registration callbacks keep
+// only this name->handle mapping; BSP diffuse image data is owned separately by
+// the bounded world loader.
 static qhandle_t VRHI_RegisterName(
 	std::unordered_map<std::string, qhandle_t> &handles, const char *name,
 	const char *kind) {
@@ -1396,6 +1513,102 @@ static int VRHI_ReadIndex(const byte *lumpData, int index) {
 	return LittleLong(disk);
 }
 
+static bool VRHI_LoadDiffuseTGA(const char *shaderName, int *imageIndex) {
+	if (imageIndex != nullptr) *imageIndex = -1;
+	if (shaderName == nullptr || g_ri.FS_ReadFile == nullptr) return false;
+	size_t shaderLength = 0;
+	while (shaderLength < MAX_QPATH && shaderName[shaderLength] != '\0') ++shaderLength;
+	if (shaderLength == 0 || shaderLength >= MAX_QPATH ||
+		shaderName[0] == '/' || shaderName[0] == '\\') return false;
+	std::string path(shaderName, shaderLength);
+	if (path.find("..") != std::string::npos) return false;
+	const size_t extension = path.size() >= 4 ? path.size() - 4 : 0;
+	if (path.size() < 4 || (path[extension] != '.' ||
+		(path[extension + 1] != 't' && path[extension + 1] != 'T') ||
+		(path[extension + 2] != 'g' && path[extension + 2] != 'G') ||
+		(path[extension + 3] != 'a' && path[extension + 3] != 'A'))) {
+		if (path.size() + 4 >= MAX_QPATH) return false;
+		path += ".tga";
+	}
+	for (size_t i = 0; i < g_worldDiffuseImages.size(); ++i) {
+		if (g_worldDiffuseImages[i].path == path) {
+			if (imageIndex != nullptr) *imageIndex = static_cast<int>(i);
+			return true;
+		}
+	}
+	if (g_worldDiffuseImages.size() >= VRHI_MAX_WORLD_DIFFUSE_IMAGES) return false;
+	void *fileData = nullptr;
+	const long fileSizeLong = g_ri.FS_ReadFile(path.c_str(), &fileData);
+	if (fileData == nullptr || fileSizeLong < 18) {
+		if (fileData != nullptr && g_ri.FS_FreeFile != nullptr) g_ri.FS_FreeFile(fileData);
+		return false;
+	}
+	const size_t fileSize = static_cast<size_t>(fileSizeLong);
+	const byte *bytes = static_cast<const byte *>(fileData);
+	uint16_t diskWidth = 0;
+	uint16_t diskHeight = 0;
+	std::memcpy(&diskWidth, bytes + 12, sizeof(diskWidth));
+	std::memcpy(&diskHeight, bytes + 14, sizeof(diskHeight));
+	const int width = static_cast<int>(LittleShort(diskWidth));
+	const int height = static_cast<int>(LittleShort(diskHeight));
+	const byte idLength = bytes[0];
+	const byte imageType = bytes[2];
+	const byte pixelSize = bytes[16];
+	const byte attributes = bytes[17];
+	const bool validDimensions = width > 0 && height > 0 &&
+		width <= VRHI_MAX_WORLD_DIFFUSE_DIMENSION && height <= VRHI_MAX_WORLD_DIFFUSE_DIMENSION;
+	const size_t pixelBytes = validDimensions
+		? static_cast<size_t>(width) * static_cast<size_t>(height) * 4 : 0;
+	const size_t sourceBytes = validDimensions && (pixelSize == 24 || pixelSize == 32)
+		? static_cast<size_t>(pixelSize / 8) * static_cast<size_t>(width) * static_cast<size_t>(height) : 0;
+	const size_t pixelOffset = 18u + static_cast<size_t>(idLength);
+	const bool valid = validDimensions && bytes[1] == 0 && imageType == 2 &&
+		(pixelSize == 24 || pixelSize == 32) && pixelOffset <= fileSize &&
+		sourceBytes <= fileSize - pixelOffset && pixelBytes <= VRHI_MAX_WORLD_DIFFUSE_BYTES;
+	if (!valid) {
+		VRHI_Printf(PRINT_DEVELOPER,
+			"renderer_vrhi: diffuse '%s' unsupported; expected uncompressed 24/32-bit TGA within caps\n",
+			path.c_str());
+		g_ri.FS_FreeFile(fileData);
+		return false;
+	}
+	// Keep the aggregate cap independent of the number of shader references.
+	size_t existingBytes = 0;
+	for (const VRHI_WorldDiffuseImage &image : g_worldDiffuseImages) existingBytes += image.pixels.size();
+	if (pixelBytes > VRHI_MAX_WORLD_DIFFUSE_BYTES - existingBytes) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: diffuse '%s' skipped; aggregate TGA memory cap reached\n", path.c_str());
+		g_ri.FS_FreeFile(fileData);
+		return false;
+	}
+	VRHI_WorldDiffuseImage image;
+	image.path = path;
+	image.width = width;
+	image.height = height;
+	image.pixels.resize(pixelBytes);
+	const size_t sourcePixelBytes = pixelSize / 8;
+	const bool topDown = (attributes & 0x20) != 0;
+	for (int fileRow = 0; fileRow < height; ++fileRow) {
+		const int outputRow = topDown ? fileRow : height - 1 - fileRow;
+		const byte *source = bytes + pixelOffset + static_cast<size_t>(fileRow) *
+			static_cast<size_t>(width) * sourcePixelBytes;
+		byte *destination = image.pixels.data() + static_cast<size_t>(outputRow) *
+			static_cast<size_t>(width) * 4;
+		for (int x = 0; x < width; ++x) {
+			destination[x * 4 + 0] = source[x * sourcePixelBytes + 2];
+			destination[x * 4 + 1] = source[x * sourcePixelBytes + 1];
+			destination[x * 4 + 2] = source[x * sourcePixelBytes + 0];
+			destination[x * 4 + 3] = sourcePixelBytes == 4 ? source[x * sourcePixelBytes + 3] : 255;
+		}
+	}
+	g_ri.FS_FreeFile(fileData);
+	g_worldDiffuseImages.push_back(std::move(image));
+	const int index = static_cast<int>(g_worldDiffuseImages.size() - 1);
+	if (imageIndex != nullptr) *imageIndex = index;
+	VRHI_Printf(PRINT_ALL, "renderer_vrhi: decoded BSP diffuse '%s' (%dx%d, %zu bytes)\n",
+		path.c_str(), width, height, pixelBytes);
+	return true;
+}
+
 static void VRHI_LoadWorld(const char *name) {
 	VRHI_DestroyWorldResources(true);
 	if (name == nullptr || name[0] == '\0' || g_ri.FS_ReadFile == nullptr) {
@@ -1517,6 +1730,11 @@ static void VRHI_LoadWorld(const char *name) {
 			(shader.surfaceFlags & SURF_NOLIGHTMAP) == 0 &&
 			surface.lightmapNum >= 0 && surface.lightmapNum < g_worldLightmapLayers
 			? surface.lightmapNum : -1;
+		int diffuseImage = -1;
+		// Only direct uncompressed TGA references are attempted. Shader scripts,
+		// JPG/PNG and all stage/deform semantics intentionally use the old path.
+		VRHI_LoadDiffuseTGA(shader.shader, &diffuseImage);
+		const uint32_t surfaceFirstIndex = static_cast<uint32_t>(g_worldIndexes.size());
 		int surfaceTriangles = 0;
 		for (int i = 0; i + 2 < surface.numIndexes; i += 3) {
 			const int source[3] = { VRHI_ReadIndex(indexesData, surface.firstIndex + i),
@@ -1554,6 +1772,11 @@ static void VRHI_LoadWorld(const char *name) {
 						vertices[corner].lightmap[1] <= 1.0f;
 					VRHI_WorldVertex worldVertex;
 					worldVertex.position = position[corner];
+					worldVertex.diffuse = (diffuseImage >= 0 &&
+						std::isfinite(vertices[corner].st[0]) &&
+						std::isfinite(vertices[corner].st[1]))
+						? glm::vec2(vertices[corner].st[0], vertices[corner].st[1])
+						: glm::vec2(0.0f);
 					worldVertex.lightmap = validLightmapUV
 						? glm::vec2(vertices[corner].lightmap[0], vertices[corner].lightmap[1])
 						: glm::vec2(0.0f);
@@ -1566,13 +1789,19 @@ static void VRHI_LoadWorld(const char *name) {
 			}
 			surfaceTriangles++;
 		}
-		if (surfaceTriangles > 0) accepted++;
-		else skipped++;
+		if (surfaceTriangles > 0) {
+			VRHI_WorldBatch batch;
+			batch.firstIndex = surfaceFirstIndex;
+			batch.indexCount = static_cast<uint32_t>(g_worldIndexes.size()) - surfaceFirstIndex;
+			batch.diffuseImage = diffuseImage;
+			g_worldBatches.push_back(batch);
+			accepted++;
+		} else skipped++;
 	}
 	g_worldLoaded = !g_worldVertices.empty() && !g_worldIndexes.empty();
-	VRHI_Printf(PRINT_ALL, "renderer_vrhi: BSP world '%s': models=1 surfaces=%d accepted=%d skipped=%d vertices=%zu indexes=%zu lightmaps=%d\n",
+	VRHI_Printf(PRINT_ALL, "renderer_vrhi: BSP world '%s': models=1 surfaces=%d accepted=%d skipped=%d vertices=%zu indexes=%zu lightmaps=%d diffuse=%zu batches=%zu\n",
 		name, model.numSurfaces, accepted, skipped, g_worldVertices.size(), g_worldIndexes.size(),
-		g_worldLightmapLayers);
+		g_worldLightmapLayers, g_worldDiffuseImages.size(), g_worldBatches.size());
 	g_ri.FS_FreeFile(fileData);
 	if (g_worldLoaded && g_deviceInitialized) VRHI_UploadWorldGeometry();
 }
@@ -1679,27 +1908,57 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		.SetStateFlags(VRHI_STATE_WRITE_RGB | VRHI_STATE_WRITE_A | VRHI_STATE_WRITE_Z |
 			VRHI_STATE_DEPTH_TEST_ENABLE | VRHI_STATE_DEPTH_TEST_LESS |
 			VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES)
-		.SetProgram(useLightmap ? g_worldLightmapProgram : g_worldSolidProgram)
 		.SetVertexBuffer(g_worldVertexBuffer, 0, 0, 0, static_cast<uint32_t>(g_worldVertices.size()))
 		.SetIndexBuffer(g_worldIndexBuffer, 0, 0, static_cast<uint32_t>(g_worldIndexes.size()))
 		.SetTextures({})
 		.SetSamplers({})
 		.DirtyAll();
-	if (useLightmap) {
-		g_worldState.SetTexture(0, { "u_lightmap", 0, g_worldLightmapTexture })
-			.SetSampler(0, { "u_lightmapSampler", 0,
-				VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
-				VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP });
-	}
+	const vhState worldBaseState = g_worldState;
 	g_worldDrawErrorBaseline = g_vhErrorCounter.load(std::memory_order_relaxed);
-	if (vhSetState(g_worldStateId, g_worldState)) {
-		vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
-		vhDrawIndexed(g_worldStateId, static_cast<uint32_t>(g_worldIndexes.size()));
-		g_worldDrawSubmitted = true;
-	} else {
+	bool submitted = false;
+	for (const VRHI_WorldBatch &batch : g_worldBatches) {
+		if (batch.indexCount == 0) continue;
+		const bool useDiffuse = g_worldDiffusePixelShader != VRHI_INVALID_HANDLE &&
+			batch.diffuseImage >= 0 &&
+			static_cast<size_t>(batch.diffuseImage) < g_worldDiffuseImages.size() &&
+			g_worldDiffuseImages[batch.diffuseImage].texture != VRHI_INVALID_HANDLE;
+		g_worldState = worldBaseState;
+		g_worldState.SetProgram(useDiffuse ? g_worldDiffuseProgram :
+			(useLightmap ? g_worldLightmapProgram : g_worldSolidProgram));
+		if (useDiffuse) {
+			const vhTexture diffuse = g_worldDiffuseImages[batch.diffuseImage].texture;
+			g_worldState.SetTexture(0, { "u_diffuse", 0, diffuse })
+				.SetSampler(0, { "u_diffuseSampler", 0,
+					VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
+					VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_WRAP });
+			if (useLightmap) {
+				g_worldState.SetTexture(1, { "u_lightmap", 1, g_worldLightmapTexture })
+					.SetSampler(1, { "u_lightmapSampler", 1,
+						VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
+						VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP });
+			}
+		} else if (useLightmap) {
+			g_worldState.SetTexture(0, { "u_lightmap", 0, g_worldLightmapTexture })
+				.SetSampler(0, { "u_lightmapSampler", 0,
+					VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
+					VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP });
+		}
+		if (vhSetState(g_worldStateId, g_worldState)) {
+			if (!submitted) vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
+			vhDrawIndexed(g_worldStateId, batch.indexCount, 1, batch.firstIndex);
+			submitted = true;
+		} else {
+			VRHI_Printf(PRINT_WARNING,
+				"renderer_vrhi: world batch vhSetState failed (first=%u indexes=%u diffuse=%s lightmap=%s)\n",
+				batch.firstIndex, batch.indexCount, useDiffuse ? "yes" : "no",
+				useLightmap ? "yes" : "no");
+		}
+	}
+	g_worldDrawSubmitted = submitted;
+	if (!submitted) {
 		VRHI_Printf(PRINT_WARNING,
-			"renderer_vrhi: world vhSetState failed (vertices=%zu indexes=%zu lightmap=%s)\n",
-			g_worldVertices.size(), g_worldIndexes.size(), useLightmap ? "yes" : "no");
+			"renderer_vrhi: world draw skipped; no valid surface batches (vertices=%zu indexes=%zu)\n",
+			g_worldVertices.size(), g_worldIndexes.size());
 	}
 }
 static void VRHI_SetColor(const float *rgba) {
@@ -1893,6 +2152,6 @@ extern "C" Q_EXPORT refexport_t *QDECL GetRefAPI(int apiVersion,
 	exports.TakeVideoFrame = VRHI_TakeVideoFrame;
 
 	VRHI_Printf(PRINT_ALL,
-		"renderer_vrhi: loaded (clear/present + solid-color UI + static BSP world)\n");
+		"renderer_vrhi: loaded (clear/present + solid-color UI + lightmapped/TGA BSP world)\n");
 	return &exports;
 }
