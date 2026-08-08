@@ -269,9 +269,12 @@ def build_command(engine: Path, home: Path, renderer: str, scene: Scene) -> list
     waits = "; ".join(actions)
     if renderer == "vrhi":
         # renderer_vrhi services its capture ticket in EndFrame.  Keep the
-        # OpenGL action string byte-for-byte unchanged; VRHI alone needs one
-        # frame boundary between screenshot and quit.
-        active_action = f"{waits}; screenshot {scene.screenshot}; wait; quit"
+        # OpenGL action string byte-for-byte unchanged. The command buffer is
+        # executed before CL_Frame; two waits are required so EndFrame can
+        # service the ticket before quit is executed on the following pass.
+        active_action = (
+            f"{waits}; screenshot {scene.screenshot}; wait; wait; quit"
+        )
     else:
         active_action = ACTIVE_ACTION_TEMPLATE.format(
             waits=waits,

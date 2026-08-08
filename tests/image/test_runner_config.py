@@ -53,7 +53,8 @@ class RunnerConfigTests(unittest.TestCase):
         )
         command = build_command(Path("ioquake3.exe"), Path("home"), "vrhi", scene)
         action = command[command.index("activeAction") + 1]
-        self.assertIn("screenshot unit-vrhi; wait; quit", action)
+        self.assertIn("screenshot unit-vrhi; wait; wait; quit", action)
+        self.assertNotIn("screenshot unit-vrhi; wait; quit", action)
         self.assertNotIn("screenshot unit-vrhi; quit", action)
 
     def test_map_scene_uses_devmap_for_pinned_viewpos(self) -> None:
