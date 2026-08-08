@@ -31,7 +31,11 @@ recovery and RGB conversion. Static world batches are
 PVS-culled: BSP nodes/leafs/leafsurfaces/planes/visibility lumps are decoded
 with little-endian safety into bounded CPU copies, the camera leaf is located
 from `refdef.vieworg`, the visible cluster bitset is decoded, and only batches
-reachable from visible leaves are drawn. The vertex/index buffers stay static;
+reachable from visible leaves are drawn. The per-frame `refdef.areamask` is
+honored during that traversal: a set bit closes the corresponding portal
+area, so leaves whose decoded area bit is masked are skipped, while negative
+or out-of-range area values are never masked and the absent/malformed-PVS
+all-visible fallback is unchanged. The vertex/index buffers stay static;
 culling only skips indexed ranges per batch. When visibility is absent or
 malformed, or the camera leaf cannot be resolved, the renderer falls back to
 drawing every batch. Per-frame visible cluster/batch/index counts are reported at
@@ -48,9 +52,11 @@ tcGen/tcMod variants, deform/fog/animMap/videoMap/normal/specular/portal/sky,
 and any malformed or incomplete sequence keep the shader on the existing
 lightmap/solid path. Multi-stage or multi-map shaders are never faked: only the
 first non-special `map`/`clampmap` TGA/JPG/JPEG/PNG candidate is used. This is
-not full Quake shader/material parity; PK3 material stages, area/door masking,
-and corresponding renderer parity remain unsupported and fall back to the
-existing lightmap/solid path. Script file count, per-file/aggregate text,
+not full Quake shader/material parity; PK3 material stages, shader-stage
+area/door masking, and corresponding renderer parity remain unsupported and
+fall back to the existing lightmap/solid path (the client `refdef.areamask`
+door culling is a separate mechanism and IS honored during PVS leaf
+traversal, see above). Script file count, per-file/aggregate text,
 token, candidate image, and decoded image memory are bounded, so malformed or
 oversized input is rejected safely. The dependency-free parser lives in
 `vrhi_shader_script.h` and is covered by `tests/vrhi_shader_script_test.cpp`.

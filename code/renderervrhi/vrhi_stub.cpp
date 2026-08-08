@@ -49,6 +49,7 @@
 #include "renderervrhi/vrhi_tga_decode.h"
 #include "renderervrhi/vrhi_image_decode.h"
 #include "renderervrhi/vrhi_dlight.h"
+#include "renderervrhi/vrhi_areamask.h"
 #include "renderervrhi/vrhi_font.h"
 #include "renderervrhi/vrhi_skin.h"
 #include "renderervrhi/vrhi_beam.h"
@@ -178,6 +179,7 @@ struct VRHI_WorldNode {
 };
 struct VRHI_WorldLeaf {
 	int32_t cluster = -1;
+	int32_t area = -1;
 	int32_t firstLeafSurface = 0;
 	int32_t numLeafSurfaces = 0;
 };
@@ -3204,6 +3206,7 @@ static void VRHI_LoadWorld(const char *name) {
 			const dleaf_t leaf = VRHI_ReadLeaf(leafsData, i);
 			VRHI_WorldLeaf host;
 			host.cluster = leaf.cluster;
+			host.area = leaf.area;
 			host.firstLeafSurface = leaf.firstLeafSurface;
 			host.numLeafSurfaces = leaf.numLeafSurfaces;
 			g_worldLeafs.push_back(host);
@@ -4173,12 +4176,17 @@ static int VRHI_LocateLeaf(const glm::vec3 &point) {
 }
 
 // Resolves the camera leaf/cluster and stamps every batch reachable through
-// the visible-cluster bitset. Returns true when PVS culling was applied and
-// false when the caller must fall back to drawing every batch (absent or
-// malformed visibility, camera outside the tree, non-finite vieworg). The
-// static vertex/index buffers are never rewritten; only the CPU-side batch
-// stamps change, so the uint32 index buffer and its VRHI flags stay intact.
-static bool VRHI_MarkVisibleWorldBatches(const glm::vec3 &vieworg) {
+// the visible-cluster bitset, skipping leaves whose portal area is closed in
+// the per-frame `refdef.areamask` (a set bit means the area must not render;
+// invalid/out-of-range area values are never masked). `areamask` is the
+// fixed-size refdef mask, exactly MAX_MAP_AREA_BYTES bytes. Returns true when
+// PVS culling was applied and false when the caller must fall back to drawing
+// every batch (absent or malformed visibility, camera outside the tree,
+// non-finite vieworg). The static vertex/index buffers are never rewritten;
+// only the CPU-side batch stamps change, so the uint32 index buffer and its
+// VRHI flags stay intact.
+static bool VRHI_MarkVisibleWorldBatches(const glm::vec3 &vieworg,
+	const byte (&areamask)[MAX_MAP_AREA_BYTES]) {
 	g_worldCameraLeaf = -1;
 	g_worldCameraCluster = -1;
 	g_worldVisibleClusters = 0;
@@ -4230,6 +4238,12 @@ static bool VRHI_MarkVisibleWorldBatches(const glm::vec3 &vieworg) {
 		}
 		if ((row[leafEntry.cluster >> 3] &
 			static_cast<byte>(1 << (leafEntry.cluster & 7))) == 0) {
+			continue;
+		}
+		// Closed-door area masking: a set bit in the refdef areamask closes
+		// that portal area, so its leaves must not render. Invalid area
+		// values (negative or beyond the mask) stay unmasked and visible.
+		if (VRHI_AreaIsMasked(areamask, MAX_MAP_AREA_BYTES, leafEntry.area)) {
 			continue;
 		}
 		if (leafEntry.firstLeafSurface < 0 || leafEntry.numLeafSurfaces < 0 ||
@@ -4302,12 +4316,14 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		!VRHI_FiniteVec3(fd->vieworg) || !VRHI_FiniteVec3(fd->viewaxis[0]) ||
 		!VRHI_FiniteVec3(fd->viewaxis[1]) || !VRHI_FiniteVec3(fd->viewaxis[2])) return;
 	if (!VRHI_CreateWorldDepth(g_frameViewportWidth, g_frameViewportHeight)) return;
-	// Resolve the camera leaf/cluster and stamp the visible surface batches.
-	// A failure to cull (no/malformed visibility, camera outside the tree)
-	// falls back to drawing every batch, preserving the previous output.
+	// Resolve the camera leaf/cluster and stamp the visible surface batches,
+	// honoring the per-frame refdef.areamask for closed-door areas. A failure
+	// to cull (no/malformed visibility, camera outside the tree) falls back
+	// to drawing every batch, preserving the previous output.
 	const glm::vec3 vieworg(fd->vieworg[0], fd->vieworg[1], fd->vieworg[2]);
 	const bool cullActive = g_worldLoaded && g_worldVertexBuffer != VRHI_INVALID_HANDLE &&
-		g_worldIndexBuffer != VRHI_INVALID_HANDLE && VRHI_MarkVisibleWorldBatches(vieworg);
+		g_worldIndexBuffer != VRHI_INVALID_HANDLE &&
+		VRHI_MarkVisibleWorldBatches(vieworg, fd->areamask);
 	if (cullActive != g_worldCullActive) {
 		VRHI_Printf(PRINT_ALL,
 			"renderer_vrhi: world cull %s (leaf=%d cluster=%d)\n",
