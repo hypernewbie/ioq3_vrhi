@@ -20,15 +20,13 @@ that order.
 
 Model, skin, shader, image, scene, textured UI, font, cinematic, and
 video-capture resources are intentionally not implemented yet; only the scoped
-static BSP world geometry path above is present. Their complete refexport
-callbacks are safe no-ops so the client, cgame, and UI cannot
-dereference a null renderer callback. The renderer-owned `screenshot` command
-arms a backbuffer capture ticket for the rendered clear/UI frame; EndFrame
-synchronously reads the bound backbuffer and writes a validated 24-bit BGR TGA
-when VRHI supports the readback. The registration callbacks (models, skins,
-shaders) return stable nonzero engine-local handles with the same
-name-to-handle semantics as the GL
-renderers, so engine code that treats qhandle_t 0 as a load failure proceeds
-normally; only the name->handle mapping is retained, never image, model, or
-world data. Resize/minimize failures are reported as warnings and are not
-treated as fatal initialization errors.
+static BSP world geometry path above is present. Every refexport callback is
+populated so the client, cgame, and UI cannot dereference a null renderer
+callback: model, skin, and shader registration returns stable nonzero
+engine-local handles with the same name-to-handle semantics as the GL
+renderers, while the remaining unsupported callbacks are safe no-ops. The
+renderer-owned `screenshot` command arms a backbuffer capture ticket for the
+final clear/world/UI frame; EndFrame synchronously reads the bound backbuffer
+and writes a validated 24-bit BGR TGA when VRHI supports the readback.
+Resize/minimize failures are reported as warnings and are not treated as fatal
+initialization errors.

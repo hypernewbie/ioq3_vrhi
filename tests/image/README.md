@@ -43,6 +43,17 @@ python tests/image/run_image_tests.py --scene demo088-test1
 python tests/image/run_image_tests.py --scene map-oa-dm1 --scene map-oa-dm3
 ```
 
+Run the hidden VRHI UI capture (renderer-owned final-present readback):
+
+```text
+python tests/image/run_image_tests.py \
+  --engine build/verify-vrhi/Release/ioquake3.exe \
+  --renderer vrhi --scene map-oa-dm1 --repeat 1 --timeout 90
+```
+
+VRHI map scenes are capture-only; add `cg_draw2D 1` through the scene's cvars
+in an ad-hoc manifest to paint UI rectangles into the capture.
+
 Run dependency-free comparator unit tests:
 
 ```text
@@ -51,15 +62,20 @@ python -m unittest discover tests/image -p "test_*.py"
 
 ## Current scope
 
-The suite uses the stock `screenshot` command. The demo scene checks pinned
-demo playback and requires exact repeatability. Map scenes start a local server,
-enable local cheats, move to a pinned spawn/view position, and check
-static-world startup. Map captures are currently capture-only because the stock
-client path has small timing-dependent scene differences; their raw hashes and
-logs are retained for later calibration.
-This is a plumbing/repeatability test, not a final-present or
-OpenGL-versus-VRHI correctness oracle. The latter requires the opt-in renderer
-capture path described in `temp/JOURNAL.md`.
+Captures come from the active renderer's own `screenshot` command. The demo
+scene checks pinned demo playback and requires exact repeatability. Map scenes
+start a local server, enable local cheats, move to a pinned spawn/view position,
+and check static-world startup. Map captures are currently capture-only because
+the stock client path has small timing-dependent scene differences; their raw
+hashes and logs are retained for later calibration.
+
+For the `vrhi` renderer the capture is the renderer-owned backbuffer readback
+implemented in `code/renderervrhi` (see `code/renderervrhi/README.md`); the
+runner inserts one `wait` between `screenshot` and `quit` so the renderer's
+EndFrame services the capture ticket. VRHI runs therefore report
+`authoritative_capture: true` in the report. GL runs remain a
+plumbing/repeatability test, not a final-present or OpenGL-versus-VRHI
+correctness oracle.
 
 The `.dm_70` OpenArena demos are intentionally not in the manifest because this
 ioquake3 build does not support protocol 70. Their maps are covered through

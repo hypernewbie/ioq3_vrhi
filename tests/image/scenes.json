@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "description": "Pinned OpenArena scenes for hidden stock-screenshot smoke tests.",
+  "description": "Pinned OpenArena scenes for hidden renderer-screenshot smoke tests.",
   "scenes": [
     {
       "name": "demo088-test1",
