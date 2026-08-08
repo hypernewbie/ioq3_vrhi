@@ -31,6 +31,211 @@ cvar_t		*cl_graphheight;
 cvar_t		*cl_graphscale;
 cvar_t		*cl_graphshift;
 
+// ======================================================================
+// Optional JSONL benchmark instrumentation (opt-in, see tests/benchmark/).
+//
+// IOQ3_BENCH_JSONL=1 enables it; IOQ3_BENCH_WARMUP and IOQ3_BENCH_SAMPLES
+// select how many frames to run. Every completed active (CA_ACTIVE)
+// SCR_UpdateScreen frame emits one JSONL sample to stdout:
+//
+//   {"event":"sample","producer_seconds":0.01,"finalize_seconds":0.01}
+//
+// producer_seconds is the CPU time spent producing the frame, from
+// SCR_UpdateScreen entry to immediately before re.EndFrame.
+// finalize_seconds is the time re.EndFrame takes, measured immediately
+// after it returns. The first IOQ3_BENCH_WARMUP samples are warmup (the
+// harness discards them); once IOQ3_BENCH_SAMPLES measured samples have
+// been emitted the engine requests a normal quit. Startup (non-CA_ACTIVE)
+// and recursively re-entered frames are never measured. When the
+// environment variable is absent this is a complete no-op.
+// ======================================================================
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <sys/time.h>
+#endif
+
+typedef struct {
+	qboolean	checked;	// environment read once
+	qboolean	enabled;	// IOQ3_BENCH_JSONL is active
+	qboolean	done;		// requested quit, stop measuring
+	int		warmup;		// samples to emit before the measured ones
+	int		samples;	// measured samples to emit, then quit
+	int		count;		// samples emitted so far
+	int		depth;		// > 0 while inside the outermost measured frame
+	double		frameStart;	// SCR_UpdateScreen entry time
+	double		beforeEnd;	// time immediately before re.EndFrame
+} scrBenchState_t;
+
+static scrBenchState_t scrBench;
+
+/*
+================
+SCR_BenchNow
+
+High-resolution wall clock in seconds. Windows uses the QPC; other
+platforms use gettimeofday like the engine's Sys_Milliseconds does.
+================
+*/
+static double SCR_BenchNow( void ) {
+#if defined(_WIN32)
+	static LARGE_INTEGER freq;
+	LARGE_INTEGER counter;
+
+	if( !freq.QuadPart ) {
+		QueryPerformanceFrequency( &freq );
+		if( !freq.QuadPart ) {
+			freq.QuadPart = 1;	// fallback: raw counter ticks
+		}
+	}
+	QueryPerformanceCounter( &counter );
+	return (double)counter.QuadPart / (double)freq.QuadPart;
+#else
+	struct timeval tv;
+
+	gettimeofday( &tv, NULL );
+	return (double)tv.tv_sec + (double)tv.tv_usec * 0.000001;
+#endif
+}
+
+/*
+================
+SCR_BenchEnvInt
+================
+*/
+static int SCR_BenchEnvInt( const char *name, int def ) {
+	const char *value = getenv( name );
+
+	if( !value || !*value ) {
+		return def;
+	}
+	return atoi( value );
+}
+
+/*
+================
+SCR_BenchInit
+
+Read the IOQ3_BENCH_* environment once, on the first frame.
+================
+*/
+static void SCR_BenchInit( void ) {
+	const char *value = getenv( "IOQ3_BENCH_JSONL" );
+
+	scrBench.enabled = qfalse;
+	if( !value || !*value || !strcmp( value, "0" ) ) {
+		return;
+	}
+	scrBench.enabled = qtrue;
+	scrBench.warmup = SCR_BenchEnvInt( "IOQ3_BENCH_WARMUP", 0 );
+	scrBench.samples = SCR_BenchEnvInt( "IOQ3_BENCH_SAMPLES", 1 );
+	if( scrBench.warmup < 0 ) {
+		scrBench.warmup = 0;
+	}
+	if( scrBench.samples < 1 ) {
+		scrBench.samples = 1;
+	}
+}
+
+/*
+================
+SCR_BenchFrameBegin
+
+Start timing the frame. Only outermost, active (CA_ACTIVE) frames are
+measured; startup and recursively re-entered frames are skipped.
+================
+*/
+static void SCR_BenchFrameBegin( void ) {
+	if( !scrBench.checked ) {
+		scrBench.checked = qtrue;
+		SCR_BenchInit();
+	}
+	if( !scrBench.enabled || scrBench.done ) {
+		return;
+	}
+	if( clc.state != CA_ACTIVE ) {
+		return;			// startup guard: not in a game yet
+	}
+	if( scrBench.depth++ > 0 ) {
+		return;			// recursive frame: the outer frame owns the sample
+	}
+	scrBench.frameStart = SCR_BenchNow();
+}
+
+/*
+================
+SCR_BenchBeforeEndFrame
+
+The producer phase ends immediately before re.EndFrame.
+================
+*/
+static void SCR_BenchBeforeEndFrame( void ) {
+	if( scrBench.depth != 1 || scrBench.done ) {
+		return;
+	}
+	scrBench.beforeEnd = SCR_BenchNow();
+}
+
+/*
+================
+SCR_BenchAfterEndFrame
+
+The finalize phase ends immediately after re.EndFrame returns. Emits the
+JSONL sample and requests a normal engine quit once the requested number
+of samples has been reached.
+================
+*/
+static void SCR_BenchAfterEndFrame( void ) {
+	char	line[256];
+	double	now;
+	double	producer;
+	double	finalize;
+
+	if( scrBench.depth != 1 || scrBench.done ) {
+		return;
+	}
+	now = SCR_BenchNow();
+
+	producer = now - scrBench.frameStart;
+	finalize = now - scrBench.beforeEnd;
+	if( producer < 0.0 ) {
+		producer = 0.0;
+	}
+	if( finalize < 0.0 ) {
+		finalize = 0.0;
+	}
+
+	Com_sprintf( line, sizeof( line ),
+		"{\"event\":\"sample\",\"producer_seconds\":%.9f,\"finalize_seconds\":%.9f}\n",
+		producer, finalize );
+	fputs( line, stdout );
+	fflush( stdout );
+
+	scrBench.count++;
+	if( scrBench.count >= scrBench.warmup + scrBench.samples ) {
+		scrBench.done = qtrue;
+		Cbuf_AddText( "quit\n" );	// normal engine quit
+	}
+}
+
+/*
+================
+SCR_BenchFrameEnd
+
+Leave the outermost measured frame.
+================
+*/
+static void SCR_BenchFrameEnd( void ) {
+	if( !scrBench.enabled ) {
+		return;
+	}
+	if( scrBench.depth > 0 ) {
+		scrBench.depth--;
+	}
+}
+
 /*
 ================
 SCR_DrawNamedPic
@@ -568,6 +773,8 @@ void SCR_UpdateScreen( void ) {
 	}
 	recursive = 1;
 
+	SCR_BenchFrameBegin();
+
 	// If there is no VM, there are also no rendering commands issued. Stop the renderer in
 	// that case.
 	if( uivm || com_dedicated->integer )
@@ -582,13 +789,16 @@ void SCR_UpdateScreen( void ) {
 			SCR_DrawScreenField( STEREO_CENTER );
 		}
 
+		SCR_BenchBeforeEndFrame();
 		if ( com_speeds->integer ) {
 			re.EndFrame( &time_frontend, &time_backend );
 		} else {
 			re.EndFrame( NULL, NULL );
 		}
+		SCR_BenchAfterEndFrame();
 	}
 	
+	SCR_BenchFrameEnd();
 	recursive = 0;
 }
 
