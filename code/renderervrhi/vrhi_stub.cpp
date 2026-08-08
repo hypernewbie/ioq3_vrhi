@@ -142,6 +142,11 @@ struct VRHI_SceneDraw {
 	// exactly as before. Blend modes, color/alpha constants, vertex colour
 	// and lightmap behavior are unchanged.
 	uint8_t alphaFunc = VRHI_SHADER_ALPHAFUNC_OFF;
+	// Bounded per-draw stage-local `clampMap` flag carried from the base
+	// stage's `clampMap` script statement. The textured material samplers
+	// select CLAMP UVW when this flag is set and keep the default WRAP UVW
+	// otherwise, so draws without the keyword sample exactly as before.
+	bool clampMap = false;
 };
 static std::vector<VRHI_SceneEntity> g_sceneEntities;
 static std::vector<VRHI_ScenePoly> g_scenePolys;
@@ -201,6 +206,13 @@ struct VRHI_WorldBatch {
 	// classification, constants, vertex colour, or lightmaps.
 	uint8_t stageAlphaFunc[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_ALPHAFUNC_OFF,
 		VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF };
+	// Per-stage bounded `clampMap` flag (the Quake3 `clampMap` keyword), carried
+	// from the parsed stage data to the sampler selection. Stages that declared
+	// clampMap sample with CLAMP UVW; every default `map` stage keeps the
+	// existing WRAP UVW sampler, so a shader without the keyword draws exactly
+	// as before. Never changes blend classification, constants, vertex colour,
+	// lightmaps, depth, or alpha testing.
+	uint8_t stageClampMap[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 	// A non-opaque stage zero is a translucent world batch. It is rendered
 	// after opaque batches in back-to-front order with depth writes disabled
 	// unless a stage explicitly declares depthWrite.
@@ -238,6 +250,10 @@ struct VRHI_SceneShaderMaterial {
 	// program discards fragments that fail the comparison on the material
 	// sample alpha; 0 (OFF) never discards, preserving the existing behavior.
 	uint8_t alphaFunc = VRHI_SHADER_ALPHAFUNC_OFF;
+	// Base-stage bounded `clampMap` flag (the Quake3 `clampMap` keyword in the
+	// base stage's script statement). The textured scene sampler selects CLAMP
+	// UVW when set and keeps the default WRAP UVW otherwise.
+	uint8_t clampMap = 0;
 };
 // Minimal, decoded copies of the BSP PVS traversal state. Values are
 // byte-swapped out of the on-disk little-endian form at load time and copied
@@ -3015,7 +3031,7 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 	uint8_t *blends, int *stageCount, uint8_t *rgbConstFlags,
 	float (*rgbConstColor)[3], uint8_t *alphaConstFlags,
 	float *alphaConstValues, uint8_t *depthWriteFlags = nullptr,
-	uint8_t *alphaFuncFlags = nullptr) {
+	uint8_t *alphaFuncFlags = nullptr, uint8_t *clampMapFlags = nullptr) {
 	if (images == nullptr || blends == nullptr || stageCount == nullptr) return false;
 	*stageCount = 0;
 	for (size_t i = 0; i < VRHI_SHADER_MAX_STAGES; ++i) {
@@ -3031,6 +3047,7 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 		if (alphaConstValues != nullptr) alphaConstValues[i] = 1.0f;
 		if (depthWriteFlags != nullptr) depthWriteFlags[i] = 0;
 		if (alphaFuncFlags != nullptr) alphaFuncFlags[i] = VRHI_SHADER_ALPHAFUNC_OFF;
+		if (clampMapFlags != nullptr) clampMapFlags[i] = 0;
 	}
 	std::vector<VRHI_ShaderStage> stages;
 	std::string directPath;
@@ -3081,6 +3098,7 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 		if (depthWriteFlags != nullptr) depthWriteFlags[i] = stages[i].depthWrite ? 1 : 0;
 		if (alphaFuncFlags != nullptr)
 			alphaFuncFlags[i] = static_cast<uint8_t>(stages[i].alphaFunc);
+		if (clampMapFlags != nullptr) clampMapFlags[i] = stages[i].clampMap ? 1 : 0;
 	}
 	*stageCount = static_cast<int>(stages.size());
 	if (scriptResolved)
@@ -3677,9 +3695,10 @@ static void VRHI_LoadWorld(const char *name) {
 		uint8_t stageDepthWrite[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		uint8_t stageAlphaFunc[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_ALPHAFUNC_OFF,
 			VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF };
+		uint8_t stageClampMap[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		VRHI_LoadDiffuseStages(shader.shader, stageImages, stageBlend, &stageCount,
 			stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
-			stageDepthWrite, stageAlphaFunc);
+			stageDepthWrite, stageAlphaFunc, stageClampMap);
 		diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 		if (surface.surfaceType == MST_PATCH) {
 			VRHI_PatchMesh patch;
@@ -3722,6 +3741,7 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageAlphaConstValue[stage] = stageAlphaConstValue[stage];
 				batch.stageDepthWrite[stage] = stageDepthWrite[stage];
 				batch.stageAlphaFunc[stage] = stageAlphaFunc[stage];
+				batch.stageClampMap[stage] = stageClampMap[stage];
 			}
 			g_worldBatches.push_back(batch);
 			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
@@ -3821,6 +3841,7 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageAlphaConstValue[stage] = stageAlphaConstValue[stage];
 				batch.stageDepthWrite[stage] = stageDepthWrite[stage];
 				batch.stageAlphaFunc[stage] = stageAlphaFunc[stage];
+				batch.stageClampMap[stage] = stageClampMap[stage];
 			}
 			g_worldBatches.push_back(batch);
 			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
@@ -3893,9 +3914,10 @@ static void VRHI_LoadWorld(const char *name) {
 			uint8_t stageDepthWrite[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 			uint8_t stageAlphaFunc[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_ALPHAFUNC_OFF,
 				VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF };
+			uint8_t stageClampMap[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 			VRHI_LoadDiffuseStages(shader.shader, stageImages, stageBlend, &stageCount,
 				stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
-				stageDepthWrite, stageAlphaFunc);
+				stageDepthWrite, stageAlphaFunc, stageClampMap);
 			const int diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 			VRHI_InlineBSPModel surfaceModel;
 			if (!VRHI_BuildInlineSurface(vertsData, vertCount, indexesData, indexCount,
@@ -3922,6 +3944,7 @@ static void VRHI_LoadWorld(const char *name) {
 					batch.stageAlphaConstValue[stage] = stageAlphaConstValue[stage];
 					batch.stageDepthWrite[stage] = stageDepthWrite[stage];
 					batch.stageAlphaFunc[stage] = stageAlphaFunc[stage];
+					batch.stageClampMap[stage] = stageClampMap[stage];
 				}
 			}
 			if (inlineModel.vertices.size() > VRHI_MAX_INLINE_VERTICES - surfaceModel.vertices.size() ||
@@ -4254,7 +4277,8 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	bool translucent = false, uint8_t blendMode = VRHI_SHADER_BLEND_OPAQUE,
 	uint8_t rgbConst = 0, const float *rgbConstColor = nullptr,
 	uint8_t alphaConst = 0, float alphaConstValue = 1.0f,
-	bool depthWrite = false, uint8_t alphaFunc = VRHI_SHADER_ALPHAFUNC_OFF) {
+	bool depthWrite = false, uint8_t alphaFunc = VRHI_SHADER_ALPHAFUNC_OFF,
+	bool clampMap = false) {
 	if (indexCount == 0 || firstIndex > UINT32_MAX || indexCount > UINT32_MAX ||
 		g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) return false;
 	VRHI_SceneDraw draw;
@@ -4275,6 +4299,7 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	draw.alphaConstValue = alphaConstValue;
 	draw.depthWrite = depthWrite;
 	draw.alphaFunc = alphaFunc;
+	draw.clampMap = clampMap;
 	g_sceneDraws.push_back(draw);
 	return true;
 }
@@ -4355,10 +4380,11 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 		uint8_t stageDepthWrite[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		uint8_t stageAlphaFunc[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_ALPHAFUNC_OFF,
 			VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF };
+		uint8_t stageClampMap[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		if (!shaderName.empty())
 			VRHI_LoadDiffuseStages(shaderName.c_str(), images, blends, &stageCount,
 				stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
-				stageDepthWrite, stageAlphaFunc);
+				stageDepthWrite, stageAlphaFunc, stageClampMap);
 		if (stageCount > 0) {
 			material.diffuseImage = images[0];
 			material.blendMode = blends[0];
@@ -4370,6 +4396,7 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 			material.alphaConstValue = stageAlphaConstValue[0];
 			material.depthWrite = stageDepthWrite[0];
 			material.alphaFunc = stageAlphaFunc[0];
+			material.clampMap = stageClampMap[0];
 		}
 		g_sceneShaderDiffuseByHandle.emplace(draw->shader, material);
 		if (material.diffuseImage >= 0) VRHI_UploadWorldDiffuse();
@@ -4388,6 +4415,7 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 	draw->alphaConstValue = material.alphaConstValue;
 	draw->depthWrite = material.depthWrite != 0;
 	draw->alphaFunc = material.alphaFunc;
+	draw->clampMap = material.clampMap != 0;
 	return image.texture;
 }
 
@@ -4568,7 +4596,8 @@ static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4
 				batch.diffuseImage, lightmapped, color.a < 0.999f, blendMode,
 				rgbConst, batch.stageRgbConstColor[0],
 				alphaConst, batch.stageAlphaConstValue[0],
-				batch.stageDepthWrite[0] != 0, batch.stageAlphaFunc[0])) {
+				batch.stageDepthWrite[0] != 0, batch.stageAlphaFunc[0],
+				batch.stageClampMap[0] != 0)) {
 				g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
 				g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
 				continue;
@@ -5065,9 +5094,17 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 			}
 			if (textured) {
 				const vhTexture diffuse = g_worldDiffuseImages[imageIndex].texture;
+				// Bounded stage-local `clampMap`: stages whose map statement used
+				// the Quake3 `clampMap` keyword sample the diffuse image with
+				// CLAMP UVW; every default `map` stage keeps the existing WRAP UVW
+				// sampler, so a shader without the keyword draws exactly as before.
+				const uint64_t diffuseSampler = batch.stageClampMap[stage] != 0
+					? (VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
+						VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP)
+					: (VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
+						VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_WRAP);
 				g_worldState.SetTexture(0, { "u_diffuse", 0, diffuse })
-					.SetSampler(0, { "u_diffuseSampler", 0, VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
-						VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_WRAP });
+					.SetSampler(0, { "u_diffuseSampler", 0, diffuseSampler });
 				if (!overlay && useLightmap)
 					g_worldState.SetTexture(1, { "u_lightmap", 1, g_worldLightmapTexture })
 						.SetSampler(1, { "u_lightmapSampler", 1, VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
@@ -5169,10 +5206,18 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 					static_cast<uint32_t>(g_sceneIndexes.size()))
 				.SetTextures({}).SetSamplers({});
 			if (textured) {
+				// Bounded per-draw `clampMap` (carried from the base stage's
+				// `clampMap` script statement, or from the inline-BSP batch's
+				// stage-zero flag): CLAMP UVW when set, the existing default WRAP
+				// UVW sampler otherwise, so draws without the keyword sample
+				// exactly as before.
+				const uint64_t diffuseSampler = draw.clampMap
+					? (VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
+						VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP)
+					: (VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
+						VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_WRAP);
 				g_worldState.SetTexture(0, { "u_diffuse", 0, texture })
-					.SetSampler(0, { "u_diffuseSampler", 0,
-						VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
-						VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_WRAP });
+					.SetSampler(0, { "u_diffuseSampler", 0, diffuseSampler });
 				// The shared diffuse shader declares its optional lightmap
 				// resources even for scene/model draws. Bind the map lightmap
 				// when available so model images never leave a declared slot

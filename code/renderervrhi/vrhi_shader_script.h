@@ -74,6 +74,25 @@ input buffer, so no FS storage can be referenced after FS_FreeFile.
 // The slice never changes alpha-blend modes, the bounded color/alpha const
 // generators, vertex colour, or lightmap behavior. The conservative first-stage
 // helper still treats `alphaFunc` as unsupported and rejects such shaders.
+//
+// The bounded stage-local `clampMap` slice extends the same simple multi-stage
+// parser: the Quake3 `clampMap` keyword is distinguished from `map` and sets a
+// stage-local flag, while the qpath validation is byte-for-byte the same safe
+// validation used for `map` (VRHI_ShaderPathIsSafe plus
+// VRHI_ResolveDirectImagePath, so traversal/drive/backslash/unsupported-
+// extension names reject identically). The flag is carried through the world,
+// inline-BSP, and scene shader-cache/draw paths, where the adapter selects the
+// UVW_CLAMP diffuse sampler flags for stages/draws that declared `clampMap`
+// and keeps the existing UVW_WRAP sampler for every default `map` stage, so a
+// shader without the keyword samples exactly as before. The flag never changes
+// blend modes, const generators, vertex colour, lightmaps, depth, or alpha
+// testing. Direct-image registrations carry no clamp flag (default `map`
+// wrapping semantics) and the UI path keeps its existing always-clamped
+// sampler, so both retain their current behavior. The conservative first-stage
+// helper continues to accept `clampmap` as a candidate with the same safe
+// qpath validation (it returns only a path string and carries no sampler
+// flag). `animMap` has no clamp variant and keeps its existing first-frame
+// static fallback with the default wrap sampler.
 ===========================================================================
 */
 #ifndef __VRHI_SHADER_SCRIPT_H
@@ -145,6 +164,13 @@ struct VRHI_ShaderStage {
 	// and LT128 (case-insensitive) are accepted; any other value keeps this
 	// OFF so the stage renders with no discard, exactly as before this slice.
 	int alphaFunc = VRHI_SHADER_ALPHAFUNC_OFF;
+	// Bounded stage-local `clampMap` flag: true only when the stage's map
+	// statement used the Quake3 `clampMap` keyword. The adapter selects the
+	// CLAMP diffuse sampler for this stage and keeps the default WRAP sampler
+	// for every `map` stage, so a shader without the keyword samples exactly
+	// as before. The flag never changes blend modes, const generators, vertex
+	// colour, lightmaps, depth, or alpha testing.
+	bool clampMap = false;
 };
 
 // Strict bounds, independent of the legacy qfiles.h limits so malformed or
@@ -502,6 +528,14 @@ inline bool VRHI_ParseSimpleShaderBlock(
 			if (tokens[j].text == "{" || tokens[j].text == "}") return false;
 			const std::string keyword = VRHI_ShaderLowerASCII(tokens[j].text);
 			if (keyword == "map" || keyword == "clampmap") {
+				// The Quake3 `clampMap` keyword is distinguished from `map` by
+				// the stage-local clamp flag; the qpath validation below is
+				// byte-for-byte the same safe validation used for `map`, so a
+				// clampMap stage with a traversal/drive/backslash/unsupported-
+				// extension name rejects identically. Default `map` stages keep
+				// the wrap sampler, so shaders without the keyword sample
+				// exactly as before.
+				const bool clampMap = keyword == "clampmap";
 				if (foundMap || j + 1 >= stageEnd) return false;
 				const std::string &texture = tokens[j + 1].text;
 				// Engine-owned maps such as $lightmap cannot be uploaded through
@@ -514,6 +548,7 @@ inline bool VRHI_ParseSimpleShaderBlock(
 				if (texture.empty() || !VRHI_ShaderPathIsSafe(texture) ||
 					texture.find('\\') != std::string::npos ||
 					!VRHI_ResolveDirectImagePath(texture.c_str(), &stage.path)) return false;
+				stage.clampMap = clampMap;
 				foundMap = true;
 				j += 2;
 				continue;

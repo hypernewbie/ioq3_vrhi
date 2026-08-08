@@ -12,7 +12,11 @@
 // stages/draws). The same slice also carries the bounded stage-local
 // alphaFunc comparisons GE128/GT0/LT128 (case-insensitive) through to the
 // textured material shaders; unknown comparisons and truncated statements
-// keep the stage usable with alpha testing OFF.
+// keep the stage usable with alpha testing OFF. The stage-local clampMap
+// flag distinguishes the Quake3 `clampMap` keyword from `map` (default wrap
+// sampler) with the same safe qpath validation; the adapter selects CLAMP
+// UVW sampler flags for clamped stages/draws and keeps WRAP UVW for every
+// default `map` stage.
 //
 // Build and run (any C++11-or-later compiler):
 //   clang++ -std=c++17 -O1 -Wall -Wextra -Werror tests/vrhi_shader_script_test.cpp -o vrhi_shader_script_test && ./vrhi_shader_script_test
@@ -825,6 +829,140 @@ void testStageAlphaFunc() {
 	}
 }
 
+void testStageClampMap() {
+	// Bounded stage-local clampMap: the Quake3 `clampMap` keyword is
+	// distinguished from `map` by a per-stage flag, while the qpath
+	// validation stays byte-for-byte the safe validation used for `map`.
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	// Stage-locality: the flag is per stage; `map` keeps the default wrap
+	// (false) and `clampmap` sets clamp (true), without changing blend
+	// classification or the resolved path.
+	const std::string mixed = script(
+		"{ map textures/base.tga }\n"
+		"{ clampmap textures/clamped.tga blendFunc blend }\n"
+		"{ map textures/overlay.tga blendFunc blend }");
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(mixed), mixed.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			CHECK(!stages[0].clampMap);
+			CHECK(stages[1].clampMap);
+			CHECK(!stages[2].clampMap);
+			CHECK_EQ_STR(stages[1].path, "textures/clamped.tga");
+			CHECK_EQ_INT(stages[1].blendMode, VRHI_SHADER_BLEND_ALPHA);
+			CHECK_EQ_INT(stages[2].blendMode, VRHI_SHADER_BLEND_ALPHA);
+		}
+	}
+	// Keyword matching is case-insensitive, like every other directive.
+	const std::string upper = script(
+		"{ CLAMPMAP textures/a.tga }\n"
+		"{ ClampMap textures/b.tga blendFunc blend }\n"
+		"{ map textures/c.tga }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(upper), upper.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			CHECK(stages[0].clampMap);
+			CHECK(stages[1].clampMap);
+			CHECK(!stages[2].clampMap);
+		}
+	}
+	// Token consumption: clampmap consumes exactly two tokens (keyword +
+	// path), so a following directive on the same stage still parses and the
+	// flag stays set alongside blend/depthWrite/alphaFunc.
+	const std::string mixedDirectives = script(
+		"{ clampmap textures/clamped.tga blendFunc blend depthWrite alphaFunc GE128 }\n");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(mixedDirectives), mixedDirectives.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(stages[0].clampMap);
+			CHECK_EQ_STR(stages[0].path, "textures/clamped.tga");
+			CHECK_EQ_INT(stages[0].blendMode, VRHI_SHADER_BLEND_ALPHA);
+			CHECK(stages[0].depthWrite);
+			CHECK_EQ_INT(stages[0].alphaFunc, VRHI_SHADER_ALPHAFUNC_GE128);
+		}
+	}
+	// clampmap keeps the exact same safe qpath validation as map: traversal
+	// and unsupported-extension paths reject the whole shader identically,
+	// and a bare name is retained for the extension probe.
+	const std::string traversal = script("{ clampmap ../evil.tga }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(traversal), traversal.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 0u);
+	const std::string badExt = script("{ clampmap textures/evil.exe }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(badExt), badExt.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 0u);
+	const std::string bare = script("{ clampmap textures/foo/bar }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(bare), bare.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(stages[0].clampMap);
+			CHECK_EQ_STR(stages[0].path, "textures/foo/bar");
+		}
+	}
+	// A truncated clampmap at the end of a stage rejects (never borrowing
+	// tokens past the stage), and a second map on the same stage rejects.
+	const std::string truncated = script("{ clampmap }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncated), truncated.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 0u);
+	const std::string secondMap = script("{ clampmap textures/a.tga map textures/b.tga }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(secondMap), secondMap.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 0u);
+	// Engine-owned maps cannot be clamped through the direct-image path:
+	// `clampmap $lightmap` skips that stage exactly like `map $lightmap`, and
+	// each real map stage keeps its own flag.
+	const std::string special = script(
+		"{ clampmap $lightmap }\n"
+		"{ map textures/base.tga }\n"
+		"{ clampmap textures/clamped.tga }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(special), special.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 2u);
+		if (stages.size() == 2) {
+			CHECK(!stages[0].clampMap);
+			CHECK(stages[1].clampMap);
+		}
+	}
+	// Default remains wrap: every `map` stage (including animMap's static
+	// first-frame fallback, which has no clamp variant) carries clampMap
+	// false.
+	const std::string defaults = script(
+		"{ map textures/base.tga }\n"
+		"{ animMap 8 textures/a.tga textures/b.tga blendFunc blend }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(defaults), defaults.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 2u);
+		if (stages.size() == 2) {
+			CHECK(!stages[0].clampMap);
+			CHECK(!stages[1].clampMap);
+		}
+	}
+}
+
 void testConsoleScriptResolution() {
 	// OpenArena defines the in-game console background as a script shader
 	// (scripts/oanew.shader): `console { { map textures/sfx/logo256.tga } }`.
@@ -895,6 +1033,7 @@ int main() {
 	testConstGenerators();
 	testStageDepthWrite();
 	testStageAlphaFunc();
+	testStageClampMap();
 	testConsoleScriptResolution();
 	testPathSafetyHelpers();
 
