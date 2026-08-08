@@ -40,6 +40,8 @@
 #include <vector>
 
 #include "q_shared.h"
+#include "qcommon/qfiles.h"
+#include "qcommon/surfaceflags.h"
 #include "renderercommon/tr_public.h"
 
 // vrhi.h is the public header for the copied prebuilt VRHI library.  The
@@ -62,6 +64,19 @@ static vhShader g_uiPixelShader = VRHI_INVALID_HANDLE;
 static vhProgram g_uiProgram;
 static vhState g_uiState;
 static const vhStateId g_uiStateId = 2;
+static vhShader g_worldVertexShader = VRHI_INVALID_HANDLE;
+static vhShader g_worldPixelShader = VRHI_INVALID_HANDLE;
+static vhProgram g_worldProgram;
+static vhState g_worldState;
+static const vhStateId g_worldStateId = 3;
+static vhBuffer g_worldVertexBuffer = VRHI_INVALID_HANDLE;
+static vhBuffer g_worldIndexBuffer = VRHI_INVALID_HANDLE;
+static vhTexture g_worldDepthTexture = VRHI_INVALID_HANDLE;
+static nvrhi::Format g_worldDepthFormat = nvrhi::Format::UNKNOWN;
+static std::vector<glm::vec3> g_worldPositions;
+static std::vector<uint32_t> g_worldIndexes;
+static bool g_worldLoaded = false;
+static bool g_worldShaderInitialized = false;
 static glm::vec4 g_uiColor(1.0f, 1.0f, 1.0f, 1.0f);
 static int g_frameViewportWidth = 0;
 static int g_frameViewportHeight = 0;
@@ -74,6 +89,9 @@ static int g_windowHeight = 720;
 static vhState g_frameState;
 static vhTexture g_frameBackbuffer = VRHI_INVALID_HANDLE;
 static const vhStateId g_frameStateId = 1;
+
+static const float VRHI_WORLD_NEAR = 1.0f;
+static const float VRHI_WORLD_FAR = 131072.0f;
 
 // Keep the generated qpath within MAX_QPATH while allowing the command to
 // accept only a basename.  The prefix and suffix are fixed and never come
@@ -564,6 +582,45 @@ static void VRHI_FillConfig(glconfig_t *config) {
 	config->smpActive = qfalse;
 }
 
+static const char *VRHI_WorldVertexSource = R"(
+struct GlobalUniforms : register(b0, VRHI_STAGE_SPACE)
+{
+    float4 u_viewRect;
+    float4 u_viewTexel;
+    float4x4 u_view;
+    float4x4 u_invView;
+    float4x4 u_proj;
+    float4x4 u_invProj;
+    float4x4 u_viewProj;
+    float4x4 u_invViewProj;
+    float4 u_alphaRef4;
+    float4 u_global[21];
+};
+struct WorldUniforms : register(b1, VRHI_STAGE_SPACE)
+{
+    float4x4 u_world[4];
+    float4x4 u_worldView;
+    float4x4 u_worldViewProj;
+    float4 _pad[8];
+};
+struct VSOutput { float4 position : SV_Position; };
+[shader("vertex")]
+VSOutput main(float3 position : ATTR0)
+{
+    VSOutput output;
+    output.position = mul(u_worldViewProj, float4(position, 1.0));
+    return output;
+}
+)";
+
+static const char *VRHI_WorldPixelSource = R"(
+[shader("pixel")]
+float4 main() : SV_Target
+{
+    return float4(0.24, 0.42, 0.22, 1.0);
+}
+)";
+
 // This shader is deliberately a solid-color UI fallback. It draws no texture
 // or world content; the shader handle and texture coordinates remain ignored.
 static const char *VRHI_UIVertexSource = R"(
@@ -603,6 +660,168 @@ float4 main() : SV_Target
     return ui_color;
 }
 )";
+
+static void VRHI_DestroyWorldResources(bool clearGeometry) {
+	if (g_deviceInitialized) {
+		vhFinish();
+	}
+	if (g_worldVertexBuffer != VRHI_INVALID_HANDLE) {
+		vhDestroyBuffer(g_worldVertexBuffer);
+		g_worldVertexBuffer = VRHI_INVALID_HANDLE;
+	}
+	if (g_worldIndexBuffer != VRHI_INVALID_HANDLE) {
+		vhDestroyBuffer(g_worldIndexBuffer);
+		g_worldIndexBuffer = VRHI_INVALID_HANDLE;
+	}
+	if (g_worldDepthTexture != VRHI_INVALID_HANDLE) {
+		vhDestroyTexture(g_worldDepthTexture);
+		g_worldDepthTexture = VRHI_INVALID_HANDLE;
+		g_worldDepthFormat = nvrhi::Format::UNKNOWN;
+	}
+	if (g_worldVertexShader != VRHI_INVALID_HANDLE) {
+		vhDestroyShader(g_worldVertexShader);
+		g_worldVertexShader = VRHI_INVALID_HANDLE;
+	}
+	if (g_worldPixelShader != VRHI_INVALID_HANDLE) {
+		vhDestroyShader(g_worldPixelShader);
+		g_worldPixelShader = VRHI_INVALID_HANDLE;
+	}
+	g_worldProgram.clear();
+	g_worldShaderInitialized = false;
+	g_worldState = vhState();
+	if (clearGeometry) {
+		g_worldPositions.clear();
+		g_worldIndexes.clear();
+		g_worldLoaded = false;
+	}
+	if (g_deviceInitialized) {
+		vhFinish();
+	}
+}
+
+static bool VRHI_InitializeWorldShader(void) {
+	if (!g_deviceInitialized) {
+		return false;
+	}
+	if (g_worldShaderInitialized) {
+		return true;
+	}
+	std::vector<uint32_t> vertexSpirv;
+	std::vector<uint32_t> pixelSpirv;
+	std::string error;
+	if (!vhCompileShader("VRHI_WorldVertex", VRHI_WorldVertexSource,
+		VRHI_SHADER_STAGE_VERTEX | VRHI_SHADER_SM_6_0, vertexSpirv, "main",
+		{}, {}, &error) ||
+		!vhCompileShader("VRHI_WorldPixel", VRHI_WorldPixelSource,
+		VRHI_SHADER_STAGE_PIXEL | VRHI_SHADER_SM_6_0, pixelSpirv, "main",
+		{}, {}, &error)) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: world shader compile failed: %s\n", error.c_str());
+		return false;
+	}
+	g_worldVertexShader = vhAllocShader();
+	g_worldPixelShader = vhAllocShader();
+	if (g_worldVertexShader == VRHI_INVALID_HANDLE ||
+		g_worldPixelShader == VRHI_INVALID_HANDLE) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: world shader allocation failed\n");
+		if (g_worldVertexShader != VRHI_INVALID_HANDLE) vhDestroyShader(g_worldVertexShader);
+		if (g_worldPixelShader != VRHI_INVALID_HANDLE) vhDestroyShader(g_worldPixelShader);
+		g_worldVertexShader = g_worldPixelShader = VRHI_INVALID_HANDLE;
+		return false;
+	}
+	const int32_t errorsBefore = g_vhErrorCounter.load(std::memory_order_relaxed);
+	vhCreateShader(g_worldVertexShader, "VRHI_WorldVertex", VRHI_SHADER_STAGE_VERTEX,
+		vertexSpirv, "main");
+	vhCreateShader(g_worldPixelShader, "VRHI_WorldPixel", VRHI_SHADER_STAGE_PIXEL,
+		pixelSpirv, "main");
+	vhFinish();
+	if (g_vhErrorCounter.load(std::memory_order_relaxed) != errorsBefore) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: world shader creation failed\n");
+		if (g_worldVertexShader != VRHI_INVALID_HANDLE) vhDestroyShader(g_worldVertexShader);
+		if (g_worldPixelShader != VRHI_INVALID_HANDLE) vhDestroyShader(g_worldPixelShader);
+		g_worldVertexShader = g_worldPixelShader = VRHI_INVALID_HANDLE;
+		vhFinish();
+		return false;
+	}
+	g_worldProgram = vhCreateGfxProgram(g_worldVertexShader, g_worldPixelShader);
+	g_worldShaderInitialized = true;
+	VRHI_Printf(PRINT_ALL, "renderer_vrhi: static BSP world shader ready\n");
+	return true;
+}
+
+static bool VRHI_CreateWorldDepth(int width, int height) {
+	if (!g_deviceInitialized || width <= 0 || height <= 0) return false;
+	if (g_worldDepthTexture != VRHI_INVALID_HANDLE) {
+		const vhTexInfo info = vhGetTextureInfo(g_worldDepthTexture);
+		if (info.dimensions.x == width && info.dimensions.y == height) return true;
+		vhFinish();
+		vhDestroyTexture(g_worldDepthTexture);
+		g_worldDepthTexture = VRHI_INVALID_HANDLE;
+		g_worldDepthFormat = nvrhi::Format::UNKNOWN;
+	}
+	const nvrhi::Format formats[] = { nvrhi::Format::D32S8,
+		nvrhi::Format::D24S8, nvrhi::Format::D32, nvrhi::Format::D16 };
+	for (nvrhi::Format format : formats) {
+		vhTexture texture = vhAllocTexture();
+		if (texture == VRHI_INVALID_HANDLE) continue;
+		const int32_t errorsBefore = g_vhErrorCounter.load(std::memory_order_relaxed);
+		vhCreateTexture2D(texture, "VRHI_WorldDepth", glm::ivec2(width, height), 1,
+			format, VRHI_TEXTURE_RT);
+		vhFinish();
+		if (g_vhErrorCounter.load(std::memory_order_relaxed) == errorsBefore) {
+			g_worldDepthTexture = texture;
+			g_worldDepthFormat = format;
+			VRHI_Printf(PRINT_ALL, "renderer_vrhi: world depth %dx%d format %s\n",
+				width, height, VRHI_TextureFormatName(format));
+			return true;
+		}
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: depth format %s unavailable; trying fallback\n",
+			VRHI_TextureFormatName(format));
+		vhDestroyTexture(texture);
+		vhFinish();
+	}
+	VRHI_Printf(PRINT_WARNING, "renderer_vrhi: no supported world depth format\n");
+	return false;
+}
+
+static bool VRHI_UploadWorldGeometry(void) {
+	if (!g_deviceInitialized || !g_worldLoaded || g_worldPositions.empty() ||
+		g_worldIndexes.empty()) return false;
+	if (!VRHI_InitializeWorldShader()) return false;
+	if (g_worldVertexBuffer != VRHI_INVALID_HANDLE || g_worldIndexBuffer != VRHI_INVALID_HANDLE) vhFinish();
+	if (g_worldVertexBuffer != VRHI_INVALID_HANDLE) vhDestroyBuffer(g_worldVertexBuffer);
+	if (g_worldIndexBuffer != VRHI_INVALID_HANDLE) vhDestroyBuffer(g_worldIndexBuffer);
+	g_worldVertexBuffer = vhAllocBuffer();
+	g_worldIndexBuffer = vhAllocBuffer();
+	if (g_worldVertexBuffer == VRHI_INVALID_HANDLE || g_worldIndexBuffer == VRHI_INVALID_HANDLE) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: world buffer allocation failed\n");
+		if (g_worldVertexBuffer != VRHI_INVALID_HANDLE) vhDestroyBuffer(g_worldVertexBuffer);
+		if (g_worldIndexBuffer != VRHI_INVALID_HANDLE) vhDestroyBuffer(g_worldIndexBuffer);
+		g_worldVertexBuffer = g_worldIndexBuffer = VRHI_INVALID_HANDLE;
+		return false;
+	}
+	vhMem *vertices = new vhMem(g_worldPositions.size() * sizeof(glm::vec3));
+	std::memcpy(vertices->data(), g_worldPositions.data(), vertices->size());
+	vhMem *indexes = new vhMem(g_worldIndexes.size() * sizeof(uint32_t));
+	std::memcpy(indexes->data(), g_worldIndexes.data(), indexes->size());
+	const int32_t errorsBefore = g_vhErrorCounter.load(std::memory_order_relaxed);
+	vhCreateVertexBuffer(g_worldVertexBuffer, "VRHI_WorldPositions", vertices, "float3",
+		g_worldPositions.size());
+	vhCreateIndexBuffer(g_worldIndexBuffer, "VRHI_WorldIndexes", indexes,
+		g_worldIndexes.size());
+	vhFinish();
+	if (g_vhErrorCounter.load(std::memory_order_relaxed) != errorsBefore) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: world buffer upload reported VRHI errors\n");
+		vhDestroyBuffer(g_worldVertexBuffer);
+		vhDestroyBuffer(g_worldIndexBuffer);
+		g_worldVertexBuffer = g_worldIndexBuffer = VRHI_INVALID_HANDLE;
+		vhFinish();
+		return false;
+	}
+	VRHI_Printf(PRINT_ALL, "renderer_vrhi: uploaded world geometry (%zu vertices, %zu indexes)\n",
+		g_worldPositions.size(), g_worldIndexes.size());
+	return true;
+}
 
 static void VRHI_DestroyUI(void) {
 	if (g_uiVertexShader != VRHI_INVALID_HANDLE) {
@@ -749,13 +968,18 @@ static void VRHI_BeginRegistration(glconfig_t *config) {
 	// Compile the tiny UI fallback only after vhInit has created a device; a
 	// shader failure leaves clear/present and all no-op callbacks usable.
 	VRHI_InitializeUI();
+	VRHI_InitializeWorldShader();
+	if (g_worldLoaded) VRHI_UploadWorldGeometry();
+	VRHI_CreateWorldDepth(g_windowWidth, g_windowHeight);
 	VRHI_FillConfig(config);
 }
 
 static void VRHI_Shutdown(qboolean destroyWindow) {
 	if (!destroyWindow) {
 		if (g_deviceInitialized) {
-			// Keep the device and SDL window alive for a subsequent registration.
+			// Keep the device and SDL window alive for a subsequent registration,
+			// but release map/video resources before the swapchain is reused.
+			VRHI_DestroyWorldResources(true);
 			vhFinish();
 		}
 		g_frameState = vhState();
@@ -783,6 +1007,7 @@ static void VRHI_Shutdown(qboolean destroyWindow) {
 		// ordering clear and guarantees the clear command queue is drained before
 		// the device or native window is torn down.
 		vhFinish();
+		VRHI_DestroyWorldResources(true);
 		VRHI_DestroyUI();
 		vhFinish();
 		vhShutdown(false);
@@ -840,6 +1065,9 @@ static void VRHI_BeginFrame(stereoFrame_t stereoFrame) {
 		.SetViewClear(VRHI_CLEAR_COLOR, clearColor);
 	g_frameViewportWidth = width;
 	g_frameViewportHeight = height;
+	// Depth is a renderer-owned attachment, not part of the clear-only frame
+	// state. Recreate it lazily so resize/minimize transitions remain harmless.
+	VRHI_CreateWorldDepth(width, height);
 	if (g_uiInitialized) {
 		// Reuse the acquired backbuffer and viewport, but explicitly disable
 		// depth and enable alpha blending for UI overlays.
@@ -899,10 +1127,11 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 	g_frameBackbuffer = VRHI_INVALID_HANDLE;
 }
 
-// Registration, scene, image, and textured UI resources are intentionally not
-// part of this first slice. DrawStretchPic provides only the solid-color UI
-// fallback above. Every callback is nevertheless populated so the client,
-// cgame, and UI can safely exercise the renderer without NULL dereferences.
+// Image, entity, patch, and textured UI resources remain outside this slice.
+// DrawStretchPic provides the existing solid-color UI fallback while the first
+// BSP model is rendered by the static world path above. Every callback is
+// nevertheless populated so the client, cgame, and UI can safely exercise the
+// renderer without NULL dereferences.
 //
 // The four registration callbacks return stable engine-local qhandles so the
 // client, cgame, and UI see successful registrations (qhandle_t 0 means
@@ -951,8 +1180,141 @@ static qhandle_t VRHI_RegisterShaderNoMip(const char *name) {
 	// the GL renderers where both paths resolve through the same shader table.
 	return VRHI_RegisterName(g_shaderHandles, name, "RegisterShaderNoMip");
 }
+static bool VRHI_ValidLump(const dheader_t *header, int index, long fileSize,
+	const char *name) {
+	const lump_t &lump = header->lumps[index];
+	if (lump.fileofs < 0 || lump.filelen < 0 ||
+		static_cast<long long>(lump.fileofs) > fileSize ||
+		static_cast<long long>(lump.filelen) >
+			static_cast<long long>(fileSize) - lump.fileofs) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: BSP lump %s invalid (offset=%d length=%d file=%ld)\n",
+			name, lump.fileofs, lump.filelen, fileSize);
+		return false;
+	}
+	return true;
+}
+
 static void VRHI_LoadWorld(const char *name) {
-	(void)name;
+	VRHI_DestroyWorldResources(true);
+	if (name == nullptr || name[0] == '\0' || g_ri.FS_ReadFile == nullptr) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: BSP world load missing name or filesystem\n");
+		return;
+	}
+	void *fileData = nullptr;
+	const long fileSize = g_ri.FS_ReadFile(name, &fileData);
+	if (fileSize < static_cast<long>(sizeof(dheader_t)) || fileData == nullptr) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: BSP world '%s' read failed (%ld bytes)\n",
+			name, fileSize);
+		return;
+	}
+	const dheader_t *header = reinterpret_cast<const dheader_t *>(fileData);
+	if (header->ident != BSP_IDENT || header->version != BSP_VERSION) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: BSP world '%s' rejected (ident=0x%08x version=%d)\n",
+			name, header->ident, header->version);
+		g_ri.FS_FreeFile(fileData);
+		return;
+	}
+	static const char *lumpNames[HEADER_LUMPS] = { "entities", "shaders", "planes", "nodes",
+		"leafs", "leafsurfaces", "leafbrushes", "models", "brushes", "brushsides",
+		"drawverts", "drawindexes", "fogs", "surfaces", "lightmaps", "lightgrid", "visibility" };
+	for (int i = 0; i < HEADER_LUMPS; ++i) {
+		if (!VRHI_ValidLump(header, i, fileSize, lumpNames[i])) {
+			g_ri.FS_FreeFile(fileData);
+			return;
+		}
+	}
+	const lump_t &modelsLump = header->lumps[LUMP_MODELS];
+	const lump_t &surfacesLump = header->lumps[LUMP_SURFACES];
+	const lump_t &vertsLump = header->lumps[LUMP_DRAWVERTS];
+	const lump_t &indexesLump = header->lumps[LUMP_DRAWINDEXES];
+	const lump_t &shadersLump = header->lumps[LUMP_SHADERS];
+	if (modelsLump.filelen < static_cast<int>(sizeof(dmodel_t)) ||
+		shadersLump.filelen % static_cast<int>(sizeof(dshader_t)) != 0 ||
+		surfacesLump.filelen % static_cast<int>(sizeof(dsurface_t)) != 0 ||
+		vertsLump.filelen % static_cast<int>(sizeof(drawVert_t)) != 0 ||
+		indexesLump.filelen % static_cast<int>(sizeof(int)) != 0) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: BSP world '%s' has malformed geometry lumps\n", name);
+		g_ri.FS_FreeFile(fileData);
+		return;
+	}
+	const dmodel_t *models = reinterpret_cast<const dmodel_t *>(
+		static_cast<const byte *>(fileData) + modelsLump.fileofs);
+	const dsurface_t *surfaces = reinterpret_cast<const dsurface_t *>(
+		static_cast<const byte *>(fileData) + surfacesLump.fileofs);
+	const dshader_t *shaders = reinterpret_cast<const dshader_t *>(
+		static_cast<const byte *>(fileData) + shadersLump.fileofs);
+	const drawVert_t *drawVerts = reinterpret_cast<const drawVert_t *>(
+		static_cast<const byte *>(fileData) + vertsLump.fileofs);
+	const int *drawIndexes = reinterpret_cast<const int *>(
+		static_cast<const byte *>(fileData) + indexesLump.fileofs);
+	const int surfaceCount = surfacesLump.filelen / static_cast<int>(sizeof(dsurface_t));
+	const int vertCount = vertsLump.filelen / static_cast<int>(sizeof(drawVert_t));
+	const int indexCount = indexesLump.filelen / static_cast<int>(sizeof(int));
+	const dmodel_t &model = models[0];
+	if (model.firstSurface < 0 || model.numSurfaces < 0 ||
+		model.firstSurface > surfaceCount || model.numSurfaces > surfaceCount - model.firstSurface) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: BSP world '%s' has invalid first model surface range\n", name);
+		g_ri.FS_FreeFile(fileData);
+		return;
+	}
+	int accepted = 0;
+	int skipped = 0;
+	for (int surfaceIndex = model.firstSurface;
+		surfaceIndex < model.firstSurface + model.numSurfaces; ++surfaceIndex) {
+		const dsurface_t &surface = surfaces[surfaceIndex];
+		if ((surface.surfaceType != MST_PLANAR && surface.surfaceType != MST_TRIANGLE_SOUP) ||
+			surface.shaderNum < 0 || surface.shaderNum >=
+			shadersLump.filelen / static_cast<int>(sizeof(dshader_t)) ||
+			(shaders[surface.shaderNum].surfaceFlags & (SURF_SKY | SURF_NODRAW)) ||
+			surface.firstVert < 0 || surface.numVerts < 3 ||
+			surface.firstVert > vertCount || surface.numVerts > vertCount - surface.firstVert ||
+			surface.firstIndex < 0 || surface.numIndexes < 3 ||
+			surface.firstIndex > indexCount || surface.numIndexes > indexCount - surface.firstIndex ||
+			surface.numIndexes % 3 != 0) {
+			skipped++;
+			continue;
+		}
+		std::unordered_map<int, uint32_t> localVertices;
+		int surfaceTriangles = 0;
+		for (int i = 0; i + 2 < surface.numIndexes; i += 3) {
+			const int source[3] = { drawIndexes[surface.firstIndex + i],
+				drawIndexes[surface.firstIndex + i + 1], drawIndexes[surface.firstIndex + i + 2] };
+			bool valid = true;
+			glm::vec3 position[3];
+			for (int corner = 0; corner < 3; ++corner) {
+				if (source[corner] < 0 || source[corner] >= surface.numVerts) { valid = false; break; }
+				const drawVert_t &vertex = drawVerts[surface.firstVert + source[corner]];
+				position[corner] = glm::vec3(vertex.xyz[0], vertex.xyz[1], vertex.xyz[2]);
+				if (!std::isfinite(position[corner].x) || !std::isfinite(position[corner].y) ||
+					!std::isfinite(position[corner].z)) { valid = false; break; }
+			}
+			if (!valid || source[0] == source[1] || source[0] == source[2] || source[1] == source[2]) continue;
+			const glm::vec3 edge1 = position[1] - position[0];
+			const glm::vec3 edge2 = position[2] - position[0];
+			const glm::vec3 cross = glm::cross(edge1, edge2);
+			if (glm::dot(cross, cross) <= 1.0e-10f) continue;
+			for (int corner = 0; corner < 3; ++corner) {
+				std::unordered_map<int, uint32_t>::iterator found = localVertices.find(source[corner]);
+				uint32_t local;
+				if (found == localVertices.end()) {
+					local = static_cast<uint32_t>(g_worldPositions.size());
+					localVertices.emplace(source[corner], local);
+					const drawVert_t &vertex = drawVerts[surface.firstVert + source[corner]];
+					g_worldPositions.emplace_back(vertex.xyz[0], vertex.xyz[1], vertex.xyz[2]);
+				} else local = found->second;
+				g_worldIndexes.push_back(local);
+			}
+			surfaceTriangles++;
+		}
+		if (surfaceTriangles > 0) accepted++;
+		else skipped++;
+	}
+	g_worldLoaded = !g_worldPositions.empty() && !g_worldIndexes.empty();
+	VRHI_Printf(PRINT_ALL, "renderer_vrhi: BSP world '%s': models=1 surfaces=%d accepted=%d skipped=%d vertices=%zu indexes=%zu\n",
+		name, model.numSurfaces, accepted, skipped, g_worldPositions.size(), g_worldIndexes.size());
+	g_ri.FS_FreeFile(fileData);
+	if (g_worldLoaded && g_deviceInitialized) VRHI_UploadWorldGeometry();
 }
 static void VRHI_SetWorldVisData(const byte *vis) {
 	(void)vis;
@@ -999,8 +1361,64 @@ static void VRHI_AddAdditiveLightToScene(const vec3_t org, float intensity,
 	(void)g;
 	(void)b;
 }
+static glm::mat4 VRHI_QuakeViewMatrix(const refdef_t *fd) {
+	glm::mat4 quakeView(1.0f);
+	for (int column = 0; column < 3; ++column) {
+		for (int row = 0; row < 3; ++row) quakeView[column][row] = fd->viewaxis[column][row];
+		quakeView[3][column] = -fd->vieworg[0] * fd->viewaxis[column][0] -
+			fd->vieworg[1] * fd->viewaxis[column][1] - fd->vieworg[2] * fd->viewaxis[column][2];
+	}
+	glm::mat4 flip(1.0f);
+	flip[0] = glm::vec4(0.0f, 0.0f, -1.0f, 0.0f);
+	flip[1] = glm::vec4(-1.0f, 0.0f, 0.0f, 0.0f);
+	flip[2] = glm::vec4(0.0f, 1.0f, 0.0f, 0.0f);
+	return quakeView * flip;
+}
+
+static glm::mat4 VRHI_QuakeProjection(const refdef_t *fd) {
+	const float xScale = 1.0f / std::tan(fd->fov_x * 3.14159265358979323846f / 360.0f);
+	const float yScale = 1.0f / std::tan(fd->fov_y * 3.14159265358979323846f / 360.0f);
+	glm::mat4 projection(0.0f);
+	projection[0][0] = xScale;
+	// Vulkan's framebuffer origin is top-left; invert the Quake up axis in
+	// clip space while retaining the zero-to-one depth range.
+	projection[1][1] = -yScale;
+	projection[2][2] = -VRHI_WORLD_FAR / (VRHI_WORLD_FAR - VRHI_WORLD_NEAR);
+	projection[3][2] = -VRHI_WORLD_FAR * VRHI_WORLD_NEAR /
+		(VRHI_WORLD_FAR - VRHI_WORLD_NEAR);
+	projection[2][3] = -1.0f;
+	return projection;
+}
+
 static void VRHI_RenderScene(const refdef_t *fd) {
-	(void)fd;
+	if (fd == nullptr || (fd->rdflags & (RDF_NOWORLDMODEL | RDF_HYPERSPACE)) != 0 ||
+		!g_deviceInitialized || !g_frameBackbufferReady || !g_worldLoaded ||
+		!g_worldShaderInitialized || g_worldVertexBuffer == VRHI_INVALID_HANDLE ||
+		g_worldIndexBuffer == VRHI_INVALID_HANDLE || g_worldDepthTexture == VRHI_INVALID_HANDLE ||
+		fd->width <= 0 || fd->height <= 0 || !std::isfinite(fd->fov_x) ||
+		!std::isfinite(fd->fov_y) || fd->fov_x <= 0.0f || fd->fov_y <= 0.0f) return;
+	if (!VRHI_CreateWorldDepth(g_frameViewportWidth, g_frameViewportHeight)) return;
+	g_worldState = g_frameState;
+	g_worldState.SetColourAttachment(0, g_frameBackbuffer)
+		.SetDepthAttachment(g_worldDepthTexture)
+		.SetViewRect(glm::vec4(static_cast<float>(fd->x), static_cast<float>(fd->y),
+			static_cast<float>(fd->width), static_cast<float>(fd->height)))
+		.SetViewScissor(glm::vec4(static_cast<float>(fd->x), static_cast<float>(fd->y),
+			static_cast<float>(fd->width), static_cast<float>(fd->height)))
+		.SetViewClear(VRHI_CLEAR_DEPTH, glm::vec4(0.0f), 1.0f)
+		.SetViewTransform(VRHI_QuakeViewMatrix(fd), VRHI_QuakeProjection(fd))
+		.SetWorldTransform(glm::mat4(1.0f))
+		.SetStateFlags(VRHI_STATE_WRITE_RGB | VRHI_STATE_WRITE_A | VRHI_STATE_WRITE_Z |
+			VRHI_STATE_DEPTH_TEST_ENABLE | VRHI_STATE_DEPTH_TEST_LESS |
+			VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES)
+		.SetProgram(g_worldProgram)
+		.SetVertexBuffer(g_worldVertexBuffer, 0, 0, 0, static_cast<uint32_t>(g_worldPositions.size()))
+		.SetIndexBuffer(g_worldIndexBuffer, 0, 0, static_cast<uint32_t>(g_worldIndexes.size()))
+		.DirtyAll();
+	if (vhSetState(g_worldStateId, g_worldState)) {
+		vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
+		vhDrawIndexed(g_worldStateId, static_cast<uint32_t>(g_worldIndexes.size()));
+	}
 }
 static void VRHI_SetColor(const float *rgba) {
 	if (rgba == nullptr) {
@@ -1193,7 +1611,6 @@ extern "C" Q_EXPORT refexport_t *QDECL GetRefAPI(int apiVersion,
 	exports.TakeVideoFrame = VRHI_TakeVideoFrame;
 
 	VRHI_Printf(PRINT_ALL,
-		"renderer_vrhi: loaded (clear/present + solid-color UI fallback; "
-		"textured resources/world are no-op)\n");
+		"renderer_vrhi: loaded (clear/present + solid-color UI + static BSP world)\n");
 	return &exports;
 }
