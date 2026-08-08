@@ -97,11 +97,48 @@ struct VRHI_WorldBatch {
 	uint32_t indexCount = 0;
 	int diffuseImage = -1;
 };
+// Minimal, decoded copies of the BSP PVS traversal state. Values are
+// byte-swapped out of the on-disk little-endian form at load time and copied
+// out of the FS buffer, so no pointer into FS data is retained. Only the
+// fields needed to locate the camera leaf and map visible leaves to surface
+// batches are kept; the rest of the node/leaf payload is discarded.
+struct VRHI_WorldPlane {
+	glm::vec3 normal;
+	float dist = 0.0f;
+};
+struct VRHI_WorldNode {
+	int32_t planeNum = 0;
+	int32_t children[2] = { 0, 0 };
+};
+struct VRHI_WorldLeaf {
+	int32_t cluster = -1;
+	int32_t firstLeafSurface = 0;
+	int32_t numLeafSurfaces = 0;
+};
 static std::vector<VRHI_WorldVertex> g_worldVertices;
 static std::vector<uint32_t> g_worldIndexes;
 static std::vector<VRHI_WorldBatch> g_worldBatches;
 static std::vector<VRHI_WorldDiffuseImage> g_worldDiffuseImages;
 static std::vector<byte> g_worldLightmapPixels;
+// BSP PVS cull state (CPU copies, see VRHI_WorldPlane/Node/Leaf above).
+static std::vector<VRHI_WorldPlane> g_worldPlanes;
+static std::vector<VRHI_WorldNode> g_worldNodes;
+static std::vector<VRHI_WorldLeaf> g_worldLeafs;
+static std::vector<int32_t> g_worldLeafSurfaces;
+static std::vector<int32_t> g_worldSurfaceBatch; // surface index -> batch index or -1
+static std::vector<byte> g_worldVisBits;         // numClusters * clusterBytes rows
+static std::vector<int32_t> g_worldBatchMarked;  // per-batch visible epoch stamp
+static int32_t g_worldVisEpoch = 0;
+static int32_t g_worldNumClusters = 0;
+static int32_t g_worldClusterBytes = 0;
+static bool g_worldVisAvailable = false;
+static bool g_worldCullActive = false;
+static int g_worldCameraLeaf = -1;
+static int g_worldCameraCluster = -1;
+static int g_worldVisibleClusters = 0;
+static int g_worldVisibleBatches = 0;
+static uint32_t g_worldVisibleIndexes = 0;
+static bool g_worldCullReported = false;
 static int g_worldLightmapLayers = 0;
 static bool g_worldLightmapAvailable = false;
 static bool g_worldLoaded = false;
@@ -131,6 +168,16 @@ static const int VRHI_MAX_WORLD_LIGHTMAP_LAYERS = 1024;
 static const int VRHI_MAX_WORLD_DIFFUSE_IMAGES = 256;
 static const int VRHI_MAX_WORLD_DIFFUSE_DIMENSION = 2048;
 static const size_t VRHI_MAX_WORLD_DIFFUSE_BYTES = 64u * 1024u * 1024u;
+// PVS cull state is a bounded, decoded CPU copy of the BSP node/leaf/plane/
+// leafsurface/visibility lumps. Normal Quake 3 maps stay far below these caps;
+// exceeding a cap disables culling (all-visible fallback) instead of allocating
+// unbounded memory from a malformed or hostile lump.
+static const int VRHI_MAX_WORLD_PLANES = 65536;
+static const int VRHI_MAX_WORLD_NODES = 65536;
+static const int VRHI_MAX_WORLD_LEAFS = 65536;
+static const int VRHI_MAX_WORLD_LEAFSURFACES = 262144;
+static const int VRHI_MAX_WORLD_CLUSTERS = 65536;
+static const size_t VRHI_MAX_WORLD_VIS_BYTES = 16u * 1024u * 1024u;
 
 // Keep the generated qpath within MAX_QPATH while allowing the command to
 // accept only a basename.  The prefix and suffix are fixed and never come
@@ -802,6 +849,24 @@ static void VRHI_DestroyWorldResources(bool clearGeometry) {
 	g_worldLightmapPixels.clear();
 	g_worldShaderInitialized = false;
 	g_worldState = vhState();
+	g_worldPlanes.clear();
+	g_worldNodes.clear();
+	g_worldLeafs.clear();
+	g_worldLeafSurfaces.clear();
+	g_worldSurfaceBatch.clear();
+	g_worldVisBits.clear();
+	g_worldBatchMarked.clear();
+	g_worldVisEpoch = 0;
+	g_worldNumClusters = 0;
+	g_worldClusterBytes = 0;
+	g_worldVisAvailable = false;
+	g_worldCullActive = false;
+	g_worldCameraLeaf = -1;
+	g_worldCameraCluster = -1;
+	g_worldVisibleClusters = 0;
+	g_worldVisibleBatches = 0;
+	g_worldVisibleIndexes = 0;
+	g_worldCullReported = false;
 	if (clearGeometry) {
 		g_worldPositions.clear();
 		g_worldVertices.clear();
@@ -1513,6 +1578,70 @@ static int VRHI_ReadIndex(const byte *lumpData, int index) {
 	return LittleLong(disk);
 }
 
+// BSP PVS cull lumps are decoded with the same little-endian discipline as
+// the geometry lumps above. Only the fields the point-in-BSP walk and the
+// leaf-surface mapping need are kept in the CPU copies.
+static dplane_t VRHI_DecodePlane(const dplane_t &disk) {
+	dplane_t host = disk;
+	for (int i = 0; i < 3; ++i) {
+		host.normal[i] = LittleFloat(disk.normal[i]);
+	}
+	host.dist = LittleFloat(disk.dist);
+	return host;
+}
+
+static dnode_t VRHI_DecodeNode(const dnode_t &disk) {
+	dnode_t host = disk;
+	host.planeNum = LittleLong(disk.planeNum);
+	for (int i = 0; i < 2; ++i) {
+		host.children[i] = LittleLong(disk.children[i]);
+	}
+	for (int i = 0; i < 3; ++i) {
+		host.mins[i] = LittleLong(disk.mins[i]);
+		host.maxs[i] = LittleLong(disk.maxs[i]);
+	}
+	return host;
+}
+
+static dleaf_t VRHI_DecodeLeaf(const dleaf_t &disk) {
+	dleaf_t host = disk;
+	host.cluster = LittleLong(disk.cluster);
+	host.area = LittleLong(disk.area);
+	for (int i = 0; i < 3; ++i) {
+		host.mins[i] = LittleLong(disk.mins[i]);
+		host.maxs[i] = LittleLong(disk.maxs[i]);
+	}
+	host.firstLeafSurface = LittleLong(disk.firstLeafSurface);
+	host.numLeafSurfaces = LittleLong(disk.numLeafSurfaces);
+	host.firstLeafBrush = LittleLong(disk.firstLeafBrush);
+	host.numLeafBrushes = LittleLong(disk.numLeafBrushes);
+	return host;
+}
+
+static dplane_t VRHI_ReadPlane(const byte *lumpData, int index) {
+	dplane_t disk;
+	std::memcpy(&disk, lumpData + static_cast<size_t>(index) * sizeof(disk), sizeof(disk));
+	return VRHI_DecodePlane(disk);
+}
+
+static dnode_t VRHI_ReadNode(const byte *lumpData, int index) {
+	dnode_t disk;
+	std::memcpy(&disk, lumpData + static_cast<size_t>(index) * sizeof(disk), sizeof(disk));
+	return VRHI_DecodeNode(disk);
+}
+
+static dleaf_t VRHI_ReadLeaf(const byte *lumpData, int index) {
+	dleaf_t disk;
+	std::memcpy(&disk, lumpData + static_cast<size_t>(index) * sizeof(disk), sizeof(disk));
+	return VRHI_DecodeLeaf(disk);
+}
+
+static int VRHI_ReadLeafSurface(const byte *lumpData, int index) {
+	int disk;
+	std::memcpy(&disk, lumpData + static_cast<size_t>(index) * sizeof(disk), sizeof(disk));
+	return LittleLong(disk);
+}
+
 static bool VRHI_LoadDiffuseTGA(const char *shaderName, int *imageIndex) {
 	if (imageIndex != nullptr) *imageIndex = -1;
 	if (shaderName == nullptr || g_ri.FS_ReadFile == nullptr) return false;
@@ -1663,6 +1792,99 @@ static void VRHI_LoadWorld(const char *name) {
 		g_ri.FS_FreeFile(fileData);
 		return;
 	}
+	// ---- BSP PVS cull state (planes/nodes/leafs/leafsurfaces/visibility) ----
+	// All values are decoded with LittleLong/LittleFloat and copied out of the
+	// FS buffer, so nothing below retains a pointer into FS data. A missing or
+	// malformed cull lump only disables culling; the world still renders with
+	// the all-visible fallback, preserving the previous visual scope.
+	const lump_t &planesLump = lumps[LUMP_PLANES];
+	const lump_t &nodesLump = lumps[LUMP_NODES];
+	const lump_t &leafsLump = lumps[LUMP_LEAFS];
+	const lump_t &leafSurfacesLump = lumps[LUMP_LEAFSURFACES];
+	const lump_t &visLump = lumps[LUMP_VISIBILITY];
+	const int planeCount = planesLump.filelen / static_cast<int>(sizeof(dplane_t));
+	const int nodeCount = nodesLump.filelen / static_cast<int>(sizeof(dnode_t));
+	const int leafCount = leafsLump.filelen / static_cast<int>(sizeof(dleaf_t));
+	const int leafSurfaceCount = leafSurfacesLump.filelen / static_cast<int>(sizeof(int));
+	const bool cullLumpsValid = planesLump.filelen > 0 && nodesLump.filelen > 0 &&
+		leafsLump.filelen > 0 && leafSurfacesLump.filelen > 0 &&
+		static_cast<size_t>(planesLump.filelen) % sizeof(dplane_t) == 0 &&
+		static_cast<size_t>(nodesLump.filelen) % sizeof(dnode_t) == 0 &&
+		static_cast<size_t>(leafsLump.filelen) % sizeof(dleaf_t) == 0 &&
+		static_cast<size_t>(leafSurfacesLump.filelen) % sizeof(int) == 0 &&
+		planeCount <= VRHI_MAX_WORLD_PLANES && nodeCount <= VRHI_MAX_WORLD_NODES &&
+		leafCount <= VRHI_MAX_WORLD_LEAFS && leafSurfaceCount <= VRHI_MAX_WORLD_LEAFSURFACES;
+	if (!cullLumpsValid) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: BSP world '%s' cull lumps absent or oversized; all-visible fallback\n",
+			name);
+	}
+	if (cullLumpsValid) {
+		const byte *planesData = fileBytes + static_cast<size_t>(planesLump.fileofs);
+		const byte *nodesData = fileBytes + static_cast<size_t>(nodesLump.fileofs);
+		const byte *leafsData = fileBytes + static_cast<size_t>(leafsLump.fileofs);
+		const byte *leafSurfacesData = fileBytes + static_cast<size_t>(leafSurfacesLump.fileofs);
+		g_worldPlanes.reserve(static_cast<size_t>(planeCount));
+		g_worldNodes.reserve(static_cast<size_t>(nodeCount));
+		g_worldLeafs.reserve(static_cast<size_t>(leafCount));
+		g_worldLeafSurfaces.reserve(static_cast<size_t>(leafSurfaceCount));
+		for (int i = 0; i < planeCount; ++i) {
+			const dplane_t plane = VRHI_ReadPlane(planesData, i);
+			VRHI_WorldPlane host;
+			host.normal = glm::vec3(plane.normal[0], plane.normal[1], plane.normal[2]);
+			host.dist = plane.dist;
+			g_worldPlanes.push_back(host);
+		}
+		for (int i = 0; i < nodeCount; ++i) {
+			const dnode_t node = VRHI_ReadNode(nodesData, i);
+			VRHI_WorldNode host;
+			host.planeNum = node.planeNum;
+			host.children[0] = node.children[0];
+			host.children[1] = node.children[1];
+			g_worldNodes.push_back(host);
+		}
+		for (int i = 0; i < leafCount; ++i) {
+			const dleaf_t leaf = VRHI_ReadLeaf(leafsData, i);
+			VRHI_WorldLeaf host;
+			host.cluster = leaf.cluster;
+			host.firstLeafSurface = leaf.firstLeafSurface;
+			host.numLeafSurfaces = leaf.numLeafSurfaces;
+			g_worldLeafs.push_back(host);
+		}
+		for (int i = 0; i < leafSurfaceCount; ++i) {
+			g_worldLeafSurfaces.push_back(VRHI_ReadLeafSurface(leafSurfacesData, i));
+		}
+	}
+	g_worldVisAvailable = false;
+	g_worldNumClusters = 0;
+	g_worldClusterBytes = 0;
+	g_worldVisBits.clear();
+	if (cullLumpsValid && visLump.filelen >= 8) {
+		int diskNumClusters = 0;
+		int diskClusterBytes = 0;
+		std::memcpy(&diskNumClusters, fileBytes + static_cast<size_t>(visLump.fileofs), sizeof(diskNumClusters));
+		std::memcpy(&diskClusterBytes, fileBytes + static_cast<size_t>(visLump.fileofs) + sizeof(diskNumClusters), sizeof(diskClusterBytes));
+		const int numClusters = LittleLong(diskNumClusters);
+		const int clusterBytes = LittleLong(diskClusterBytes);
+		const bool visRowSufficient = numClusters > 0 && clusterBytes > 0 &&
+			numClusters <= VRHI_MAX_WORLD_CLUSTERS &&
+			clusterBytes >= (numClusters + 7) / 8 &&
+			static_cast<size_t>(clusterBytes) <= VRHI_MAX_WORLD_VIS_BYTES;
+		const size_t visBytes = visRowSufficient
+			? static_cast<size_t>(numClusters) * static_cast<size_t>(clusterBytes) : 0;
+		if (visRowSufficient && visBytes <= VRHI_MAX_WORLD_VIS_BYTES &&
+			visBytes <= static_cast<size_t>(visLump.filelen) - 8) {
+			g_worldNumClusters = numClusters;
+			g_worldClusterBytes = clusterBytes;
+			g_worldVisBits.assign(fileBytes + static_cast<size_t>(visLump.fileofs) + 8,
+				fileBytes + static_cast<size_t>(visLump.fileofs) + 8 + visBytes);
+			g_worldVisAvailable = true;
+		} else {
+			VRHI_Printf(PRINT_WARNING,
+				"renderer_vrhi: BSP world '%s' visibility lump malformed; all-visible fallback\n",
+				name);
+		}
+	}
 	const byte *modelsData = fileBytes + static_cast<size_t>(modelsLump.fileofs);
 	const byte *surfacesData = fileBytes + static_cast<size_t>(surfacesLump.fileofs);
 	const byte *shadersData = fileBytes + static_cast<size_t>(shadersLump.fileofs);
@@ -1709,6 +1931,10 @@ static void VRHI_LoadWorld(const char *name) {
 	}
 	int accepted = 0;
 	int skipped = 0;
+	// Map every surface in the surfaces lump to its batch index so the
+	// leafsurface lump can be resolved at render time. Entries that were not
+	// accepted (or belong to submodels) stay -1 and are never drawn.
+	g_worldSurfaceBatch.assign(static_cast<size_t>(surfaceCount), -1);
 	for (int surfaceIndex = model.firstSurface;
 		surfaceIndex < model.firstSurface + model.numSurfaces; ++surfaceIndex) {
 		const dsurface_t surface = VRHI_ReadSurface(surfacesData, surfaceIndex);
@@ -1795,17 +2021,30 @@ static void VRHI_LoadWorld(const char *name) {
 			batch.indexCount = static_cast<uint32_t>(g_worldIndexes.size()) - surfaceFirstIndex;
 			batch.diffuseImage = diffuseImage;
 			g_worldBatches.push_back(batch);
+			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
 			accepted++;
 		} else skipped++;
 	}
 	g_worldLoaded = !g_worldVertices.empty() && !g_worldIndexes.empty();
-	VRHI_Printf(PRINT_ALL, "renderer_vrhi: BSP world '%s': models=1 surfaces=%d accepted=%d skipped=%d vertices=%zu indexes=%zu lightmaps=%d diffuse=%zu batches=%zu\n",
+	// Per-batch visibility stamps are rebuilt whenever the batch list changes.
+	g_worldBatchMarked.assign(g_worldBatches.size(), 0);
+	g_worldVisEpoch = 0;
+	VRHI_Printf(PRINT_ALL,
+		"renderer_vrhi: BSP world '%s': models=1 surfaces=%d accepted=%d skipped=%d vertices=%zu indexes=%zu lightmaps=%d diffuse=%zu batches=%zu cull=%s planes=%d nodes=%d leafs=%d leafsurfaces=%d clusters=%d vis=%s\n",
 		name, model.numSurfaces, accepted, skipped, g_worldVertices.size(), g_worldIndexes.size(),
-		g_worldLightmapLayers, g_worldDiffuseImages.size(), g_worldBatches.size());
+		g_worldLightmapLayers, g_worldDiffuseImages.size(), g_worldBatches.size(),
+		cullLumpsValid ? (g_worldVisAvailable ? "pvs" : "fallback-novis") : "fallback-lumps",
+		planeCount, nodeCount, leafCount, leafSurfaceCount, g_worldNumClusters,
+		g_worldVisAvailable ? "yes" : "no");
 	g_ri.FS_FreeFile(fileData);
 	if (g_worldLoaded && g_deviceInitialized) VRHI_UploadWorldGeometry();
 }
 static void VRHI_SetWorldVisData(const byte *vis) {
+	// The engine in this tree never calls this callback; the GL renderers use
+	// it to share the collision model's vis buffer. The VRHI world loader
+	// instead keeps its own bounded, decoded copy of the visibility lump from
+	// the BSP file, so no external pointer (and no pointer into FS data) is
+	// ever retained here.
 	(void)vis;
 }
 static void VRHI_EndRegistration(void) {}
@@ -1882,6 +2121,133 @@ static glm::mat4 VRHI_QuakeProjection(const refdef_t *fd) {
 	return projection;
 }
 
+// Walks the decoded BSP node tree from the root to the leaf containing point.
+// Returns the leaf index, or -1 when the traversal state is malformed (out of
+// range plane/node references or a child cycle). The walk is bounded by the
+// number of nodes so a hostile lump can never loop forever.
+static int VRHI_LocateLeaf(const glm::vec3 &point) {
+	if (g_worldNodes.empty() || g_worldPlanes.empty() || g_worldLeafs.empty()) {
+		return -1;
+	}
+	int index = 0;
+	const int maxSteps = static_cast<int>(g_worldNodes.size()) + 1;
+	for (int step = 0; step < maxSteps; ++step) {
+		if (index < 0) {
+			const int leaf = -index - 1;
+			return leaf >= 0 && leaf < static_cast<int>(g_worldLeafs.size()) ? leaf : -1;
+		}
+		if (index >= static_cast<int>(g_worldNodes.size())) {
+			return -1;
+		}
+		const VRHI_WorldNode &node = g_worldNodes[static_cast<size_t>(index)];
+		if (node.planeNum < 0 || node.planeNum >= static_cast<int>(g_worldPlanes.size())) {
+			return -1;
+		}
+		const VRHI_WorldPlane &plane = g_worldPlanes[static_cast<size_t>(node.planeNum)];
+		const float d = glm::dot(point, plane.normal) - plane.dist;
+		index = d > 0.0f ? node.children[0] : node.children[1];
+	}
+	return -1;
+}
+
+// Resolves the camera leaf/cluster and stamps every batch reachable through
+// the visible-cluster bitset. Returns true when PVS culling was applied and
+// false when the caller must fall back to drawing every batch (absent or
+// malformed visibility, camera outside the tree, non-finite vieworg). The
+// static vertex/index buffers are never rewritten; only the CPU-side batch
+// stamps change, so the uint32 index buffer and its VRHI flags stay intact.
+static bool VRHI_MarkVisibleWorldBatches(const glm::vec3 &vieworg) {
+	g_worldCameraLeaf = -1;
+	g_worldCameraCluster = -1;
+	g_worldVisibleClusters = 0;
+	g_worldVisibleBatches = 0;
+	g_worldVisibleIndexes = 0;
+	if (!g_worldVisAvailable || g_worldNodes.empty() || g_worldPlanes.empty() ||
+		g_worldLeafs.empty() || g_worldLeafSurfaces.empty() ||
+		g_worldSurfaceBatch.empty() || g_worldBatchMarked.empty() ||
+		!std::isfinite(vieworg.x) || !std::isfinite(vieworg.y) || !std::isfinite(vieworg.z)) {
+		return false;
+	}
+	const int leaf = VRHI_LocateLeaf(vieworg);
+	if (leaf < 0) {
+		return false;
+	}
+	g_worldCameraLeaf = leaf;
+	const int cluster = g_worldLeafs[static_cast<size_t>(leaf)].cluster;
+	if (cluster < 0 || cluster >= g_worldNumClusters) {
+		return false;
+	}
+	g_worldCameraCluster = cluster;
+
+	// Bump the visibility epoch, guarding against wrap-around by resetting
+	// the stamps before reusing epoch 1.
+	if (g_worldVisEpoch <= 0 ||
+		g_worldVisEpoch == std::numeric_limits<int32_t>::max()) {
+		g_worldVisEpoch = 1;
+		std::fill(g_worldBatchMarked.begin(), g_worldBatchMarked.end(), 0);
+	} else {
+		++g_worldVisEpoch;
+	}
+
+	const byte *row = g_worldVisBits.data() +
+		static_cast<size_t>(cluster) * static_cast<size_t>(g_worldClusterBytes);
+	int visibleClusters = 0;
+	for (int c = 0; c < g_worldNumClusters; ++c) {
+		if ((row[c >> 3] & static_cast<byte>(1 << (c & 7))) != 0) {
+			++visibleClusters;
+		}
+	}
+	g_worldVisibleClusters = visibleClusters;
+
+	uint32_t visibleIndexes = 0;
+	int visibleBatches = 0;
+	const int leafSurfaceCount = static_cast<int>(g_worldLeafSurfaces.size());
+	for (const VRHI_WorldLeaf &leafEntry : g_worldLeafs) {
+		if (leafEntry.cluster < 0 || leafEntry.cluster >= g_worldNumClusters) {
+			continue;
+		}
+		if ((row[leafEntry.cluster >> 3] &
+			static_cast<byte>(1 << (leafEntry.cluster & 7))) == 0) {
+			continue;
+		}
+		if (leafEntry.firstLeafSurface < 0 || leafEntry.numLeafSurfaces < 0 ||
+			leafEntry.firstLeafSurface > leafSurfaceCount ||
+			leafEntry.numLeafSurfaces > leafSurfaceCount - leafEntry.firstLeafSurface) {
+			continue;
+		}
+		for (int i = 0; i < leafEntry.numLeafSurfaces; ++i) {
+			const int surface = g_worldLeafSurfaces[
+				static_cast<size_t>(leafEntry.firstLeafSurface) + static_cast<size_t>(i)];
+			if (surface < 0 || surface >= static_cast<int>(g_worldSurfaceBatch.size())) {
+				continue;
+			}
+			const int batch = g_worldSurfaceBatch[static_cast<size_t>(surface)];
+			if (batch < 0 || batch >= static_cast<int>(g_worldBatchMarked.size())) {
+				continue;
+			}
+			if (g_worldBatchMarked[static_cast<size_t>(batch)] == g_worldVisEpoch) {
+				continue;
+			}
+			g_worldBatchMarked[static_cast<size_t>(batch)] = g_worldVisEpoch;
+			++visibleBatches;
+			visibleIndexes += g_worldBatches[static_cast<size_t>(batch)].indexCount;
+		}
+	}
+	g_worldVisibleBatches = visibleBatches;
+	g_worldVisibleIndexes = visibleIndexes;
+	return true;
+}
+
+// Per-frame cull diagnostics are gated by an immediate (non-latched) cheat
+// cvar so hidden captures can prove cull counts without a vid_restart.
+static int VRHI_CullDebugEnabled(void) {
+	if (g_ri.Cvar_Get == nullptr) {
+		return 0;
+	}
+	cvar_t *cvar = g_ri.Cvar_Get("r_vrhi_cullDebug", "0", CVAR_CHEAT);
+	return cvar != nullptr ? cvar->integer : 0;
+}
+
 static void VRHI_RenderScene(const refdef_t *fd) {
 	if (fd == nullptr || (fd->rdflags & (RDF_NOWORLDMODEL | RDF_HYPERSPACE)) != 0 ||
 		!g_deviceInitialized || !g_frameBackbufferReady || !g_worldLoaded ||
@@ -1890,6 +2256,38 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		fd->width <= 0 || fd->height <= 0 || !std::isfinite(fd->fov_x) ||
 		!std::isfinite(fd->fov_y) || fd->fov_x <= 0.0f || fd->fov_y <= 0.0f) return;
 	if (!VRHI_CreateWorldDepth(g_frameViewportWidth, g_frameViewportHeight)) return;
+	// Resolve the camera leaf/cluster and stamp the visible surface batches.
+	// A failure to cull (no/malformed visibility, camera outside the tree)
+	// falls back to drawing every batch, preserving the previous output.
+	const glm::vec3 vieworg(fd->vieworg[0], fd->vieworg[1], fd->vieworg[2]);
+	const bool cullActive = VRHI_MarkVisibleWorldBatches(vieworg);
+	if (cullActive != g_worldCullActive) {
+		VRHI_Printf(PRINT_ALL,
+			"renderer_vrhi: world cull %s (leaf=%d cluster=%d)\n",
+			cullActive ? "active" : "fallback all-visible",
+			g_worldCameraLeaf, g_worldCameraCluster);
+	}
+	g_worldCullActive = cullActive;
+	if (cullActive && !g_worldCullReported) {
+		g_worldCullReported = true;
+		VRHI_Printf(PRINT_ALL,
+			"renderer_vrhi: PVS cull first frame: leaf=%d cluster=%d visibleClusters=%d visibleBatches=%d visibleIndexes=%u/%zu batches=%zu\n",
+			g_worldCameraLeaf, g_worldCameraCluster, g_worldVisibleClusters,
+			g_worldVisibleBatches, g_worldVisibleIndexes, g_worldIndexes.size(),
+			g_worldBatches.size());
+	}
+	if (VRHI_CullDebugEnabled()) {
+		VRHI_Printf(PRINT_ALL,
+			"renderer_vrhi: cull frame: %s leaf=%d cluster=%d visibleClusters=%d visibleBatches=%d visibleIndexes=%u/%zu batches=%zu\n",
+			cullActive ? "active" : "fallback", g_worldCameraLeaf, g_worldCameraCluster,
+			g_worldVisibleClusters, g_worldVisibleBatches, g_worldVisibleIndexes,
+			g_worldIndexes.size(), g_worldBatches.size());
+	} else if (cullActive) {
+		VRHI_Printf(PRINT_DEVELOPER,
+			"renderer_vrhi: cull frame: leaf=%d cluster=%d visibleClusters=%d visibleBatches=%d visibleIndexes=%u/%zu\n",
+			g_worldCameraLeaf, g_worldCameraCluster, g_worldVisibleClusters,
+			g_worldVisibleBatches, g_worldVisibleIndexes, g_worldIndexes.size());
+	}
 	const bool useLightmap = g_worldLightmapAvailable &&
 		g_worldLightmapTexture != VRHI_INVALID_HANDLE &&
 		g_worldLightmapPixelShader != VRHI_INVALID_HANDLE;
@@ -1916,8 +2314,12 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 	const vhState worldBaseState = g_worldState;
 	g_worldDrawErrorBaseline = g_vhErrorCounter.load(std::memory_order_relaxed);
 	bool submitted = false;
-	for (const VRHI_WorldBatch &batch : g_worldBatches) {
+	for (size_t batchIndex = 0; batchIndex < g_worldBatches.size(); ++batchIndex) {
+		const VRHI_WorldBatch &batch = g_worldBatches[batchIndex];
 		if (batch.indexCount == 0) continue;
+		// PVS culling skips unmarked batches; the static vertex/index buffers
+		// and the uint32 index buffer contents are never modified per frame.
+		if (cullActive && g_worldBatchMarked[batchIndex] != g_worldVisEpoch) continue;
 		const bool useDiffuse = g_worldDiffusePixelShader != VRHI_INVALID_HANDLE &&
 			batch.diffuseImage >= 0 &&
 			static_cast<size_t>(batch.diffuseImage) < g_worldDiffuseImages.size() &&
@@ -2076,9 +2478,29 @@ static qboolean VRHI_GetEntityToken(char *buffer, int size) {
 	return qfalse;
 }
 static qboolean VRHI_InPVS(const vec3_t p1, const vec3_t p2) {
-	(void)p1;
-	(void)p2;
-	return qfalse;
+	// Mirrors the GL renderers: without a loaded visibility set the query
+	// fails (qfalse). Uses the renderer's own decoded vis copy, so it works
+	// even when the engine never shares the collision model's buffer.
+	if (p1 == nullptr || p2 == nullptr || !g_worldVisAvailable) {
+		return qfalse;
+	}
+	const glm::vec3 point1(p1[0], p1[1], p1[2]);
+	const glm::vec3 point2(p2[0], p2[1], p2[2]);
+	const int leaf1 = VRHI_LocateLeaf(point1);
+	const int leaf2 = VRHI_LocateLeaf(point2);
+	if (leaf1 < 0 || leaf2 < 0) {
+		return qfalse;
+	}
+	const int cluster1 = g_worldLeafs[static_cast<size_t>(leaf1)].cluster;
+	const int cluster2 = g_worldLeafs[static_cast<size_t>(leaf2)].cluster;
+	if (cluster1 < 0 || cluster1 >= g_worldNumClusters ||
+		cluster2 < 0 || cluster2 >= g_worldNumClusters) {
+		return qfalse;
+	}
+	const byte *row = g_worldVisBits.data() +
+		static_cast<size_t>(cluster1) * static_cast<size_t>(g_worldClusterBytes);
+	return (row[cluster2 >> 3] & static_cast<byte>(1 << (cluster2 & 7))) != 0
+		? qtrue : qfalse;
 }
 static void VRHI_TakeVideoFrame(int h, int w, byte *captureBuffer,
 	byte *encodeBuffer, qboolean motionJpeg) {
@@ -2152,6 +2574,6 @@ extern "C" Q_EXPORT refexport_t *QDECL GetRefAPI(int apiVersion,
 	exports.TakeVideoFrame = VRHI_TakeVideoFrame;
 
 	VRHI_Printf(PRINT_ALL,
-		"renderer_vrhi: loaded (clear/present + solid-color UI + lightmapped/TGA BSP world)\n");
+		"renderer_vrhi: loaded (clear/present + solid-color UI + lightmapped/TGA PVS-culled BSP world)\n");
 	return &exports;
 }
