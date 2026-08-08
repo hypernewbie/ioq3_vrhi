@@ -147,6 +147,15 @@ struct VRHI_SceneDraw {
 	// select CLAMP UVW when this flag is set and keep the default WRAP UVW
 	// otherwise, so draws without the keyword sample exactly as before.
 	bool clampMap = false;
+	// Bounded per-draw static `tcMod scale` carried from the base stage's
+	// `tcMod scale s t` script statement. The textured material pixel
+	// shaders scale the diffuse (material) UVs by (s, t) before sampling;
+	// lightmap UVs, UI textures, vertex colour, blend modes, constants,
+	// depth, and alpha testing are unchanged. False with identity (1,1)
+	// when the stage has no scale statement, so draws without the keyword
+	// sample exactly as before.
+	bool tcModScale = false;
+	float tcModScaleValue[2] = { 1.0f, 1.0f };
 };
 static std::vector<VRHI_SceneEntity> g_sceneEntities;
 static std::vector<VRHI_ScenePoly> g_scenePolys;
@@ -213,6 +222,14 @@ struct VRHI_WorldBatch {
 	// as before. Never changes blend classification, constants, vertex colour,
 	// lightmaps, depth, or alpha testing.
 	uint8_t stageClampMap[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+	// Per-stage bounded static `tcMod scale` (s, t) carried from the parsed
+	// stage data to the pixel-shader UV scaling. Flag 0 means identity UVs
+	// (no `tcMod scale` in the stage), preserving the existing sampling;
+	// only the diffuse material sample is scaled, never lightmaps, vertex
+	// colour, or UI.
+	uint8_t stageTcModScale[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+	float stageTcModScaleValue[VRHI_SHADER_MAX_STAGES][2] = {
+		{ 1.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 1.0f } };
 	// A non-opaque stage zero is a translucent world batch. It is rendered
 	// after opaque batches in back-to-front order with depth writes disabled
 	// unless a stage explicitly declares depthWrite.
@@ -254,6 +271,11 @@ struct VRHI_SceneShaderMaterial {
 	// base stage's script statement). The textured scene sampler selects CLAMP
 	// UVW when set and keeps the default WRAP UVW otherwise.
 	uint8_t clampMap = 0;
+	// Base-stage bounded static `tcMod scale` (s, t). The textured scene
+	// program scales the diffuse (material) UVs by (s, t) before sampling;
+	// (1,1) when the base stage has no scale statement.
+	uint8_t tcModScale = 0;
+	float tcModScaleValue[2] = { 1.0f, 1.0f };
 };
 // Minimal, decoded copies of the BSP PVS traversal state. Values are
 // byte-swapped out of the on-disk little-endian form at load time and copied
@@ -1227,12 +1249,17 @@ cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
 {
     float4 u_materialConst; // rgbGen const tint (rgb), alphaGen const (a); 1,1,1,1 when absent
     float4 u_alphaTest;     // stage alphaFunc mode: 0 off, 1 GE128, 2 GT0, 3 LT128; 0 when absent
+    float4 u_tcModScale;    // static tcMod scale (s, t); 1,1,0,0 when absent (identity UVs)
 };
 struct PSInput { float4 position : SV_Position; float2 diffuse : TEXCOORD0; float2 lightmap : TEXCOORD1; float lightmapLayer : TEXCOORD2; float4 color : TEXCOORD3; };
 [shader("pixel")]
 float4 main(PSInput input) : SV_Target
 {
-    float4 sample = u_diffuse.Sample(u_diffuseSampler, input.diffuse);
+    // Bounded static tcMod scale: only the diffuse (material) UVs are scaled
+    // before sampling; lightmap UVs, vertex colour, and blend state are never
+    // modified. Identity (1,1) when the stage has no scale statement.
+    float2 uv = input.diffuse * u_tcModScale.xy;
+    float4 sample = u_diffuse.Sample(u_diffuseSampler, uv);
     // Bounded static const generators tint only the material sample; vertex
     // colour and blend state are never modified here.
     sample *= u_materialConst;
@@ -1258,6 +1285,7 @@ cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
 {
     float4 u_materialConst; // rgbGen const tint (rgb), alphaGen const (a); 1,1,1,1 when absent
     float4 u_alphaTest;     // stage alphaFunc mode: 0 off, 1 GE128, 2 GT0, 3 LT128; 0 when absent
+    float4 u_tcModScale;    // static tcMod scale (s, t); 1,1,0,0 when absent (identity UVs)
 };
 struct PSInput {
     float4 position : SV_Position;
@@ -1269,7 +1297,12 @@ struct PSInput {
 [shader("pixel")]
 float4 main(PSInput input) : SV_Target
 {
-    float4 sample = u_diffuse.Sample(u_diffuseSampler, input.diffuse);
+    // Bounded static tcMod scale: only the diffuse (material) UVs are scaled
+    // before sampling; lightmap UVs, vertex colour, lightmaps, and blend
+    // state are never modified. Identity (1,1) when the stage has no scale
+    // statement, so draws without the keyword sample exactly as before.
+    float2 uv = input.diffuse * u_tcModScale.xy;
+    float4 sample = u_diffuse.Sample(u_diffuseSampler, uv);
     // Bounded static const generators tint only the material sample; vertex
     // colour, lightmaps, and blend state are never modified here.
     sample.rgb *= u_materialConst.rgb;
@@ -3031,7 +3064,8 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 	uint8_t *blends, int *stageCount, uint8_t *rgbConstFlags,
 	float (*rgbConstColor)[3], uint8_t *alphaConstFlags,
 	float *alphaConstValues, uint8_t *depthWriteFlags = nullptr,
-	uint8_t *alphaFuncFlags = nullptr, uint8_t *clampMapFlags = nullptr) {
+	uint8_t *alphaFuncFlags = nullptr, uint8_t *clampMapFlags = nullptr,
+	uint8_t *tcModScaleFlags = nullptr, float (*tcModScaleValues)[2] = nullptr) {
 	if (images == nullptr || blends == nullptr || stageCount == nullptr) return false;
 	*stageCount = 0;
 	for (size_t i = 0; i < VRHI_SHADER_MAX_STAGES; ++i) {
@@ -3048,6 +3082,11 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 		if (depthWriteFlags != nullptr) depthWriteFlags[i] = 0;
 		if (alphaFuncFlags != nullptr) alphaFuncFlags[i] = VRHI_SHADER_ALPHAFUNC_OFF;
 		if (clampMapFlags != nullptr) clampMapFlags[i] = 0;
+		if (tcModScaleFlags != nullptr) tcModScaleFlags[i] = 0;
+		if (tcModScaleValues != nullptr) {
+			tcModScaleValues[i][0] = 1.0f;
+			tcModScaleValues[i][1] = 1.0f;
+		}
 	}
 	std::vector<VRHI_ShaderStage> stages;
 	std::string directPath;
@@ -3099,6 +3138,11 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 		if (alphaFuncFlags != nullptr)
 			alphaFuncFlags[i] = static_cast<uint8_t>(stages[i].alphaFunc);
 		if (clampMapFlags != nullptr) clampMapFlags[i] = stages[i].clampMap ? 1 : 0;
+		if (tcModScaleFlags != nullptr) tcModScaleFlags[i] = stages[i].tcModScale ? 1 : 0;
+		if (tcModScaleValues != nullptr) {
+			tcModScaleValues[i][0] = stages[i].tcModScaleS;
+			tcModScaleValues[i][1] = stages[i].tcModScaleT;
+		}
 	}
 	*stageCount = static_cast<int>(stages.size());
 	if (scriptResolved)
@@ -3696,9 +3740,13 @@ static void VRHI_LoadWorld(const char *name) {
 		uint8_t stageAlphaFunc[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_ALPHAFUNC_OFF,
 			VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF };
 		uint8_t stageClampMap[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		uint8_t stageTcModScale[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		float stageTcModScaleValue[VRHI_SHADER_MAX_STAGES][2] = {
+			{ 1.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 1.0f } };
 		VRHI_LoadDiffuseStages(shader.shader, stageImages, stageBlend, &stageCount,
 			stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
-			stageDepthWrite, stageAlphaFunc, stageClampMap);
+			stageDepthWrite, stageAlphaFunc, stageClampMap,
+			stageTcModScale, stageTcModScaleValue);
 		diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 		if (surface.surfaceType == MST_PATCH) {
 			VRHI_PatchMesh patch;
@@ -3742,6 +3790,9 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageDepthWrite[stage] = stageDepthWrite[stage];
 				batch.stageAlphaFunc[stage] = stageAlphaFunc[stage];
 				batch.stageClampMap[stage] = stageClampMap[stage];
+				batch.stageTcModScale[stage] = stageTcModScale[stage];
+				batch.stageTcModScaleValue[stage][0] = stageTcModScaleValue[stage][0];
+				batch.stageTcModScaleValue[stage][1] = stageTcModScaleValue[stage][1];
 			}
 			g_worldBatches.push_back(batch);
 			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
@@ -3842,6 +3893,9 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageDepthWrite[stage] = stageDepthWrite[stage];
 				batch.stageAlphaFunc[stage] = stageAlphaFunc[stage];
 				batch.stageClampMap[stage] = stageClampMap[stage];
+				batch.stageTcModScale[stage] = stageTcModScale[stage];
+				batch.stageTcModScaleValue[stage][0] = stageTcModScaleValue[stage][0];
+				batch.stageTcModScaleValue[stage][1] = stageTcModScaleValue[stage][1];
 			}
 			g_worldBatches.push_back(batch);
 			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
@@ -3915,9 +3969,13 @@ static void VRHI_LoadWorld(const char *name) {
 			uint8_t stageAlphaFunc[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_ALPHAFUNC_OFF,
 				VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF };
 			uint8_t stageClampMap[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+			uint8_t stageTcModScale[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+			float stageTcModScaleValue[VRHI_SHADER_MAX_STAGES][2] = {
+				{ 1.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 1.0f } };
 			VRHI_LoadDiffuseStages(shader.shader, stageImages, stageBlend, &stageCount,
 				stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
-				stageDepthWrite, stageAlphaFunc, stageClampMap);
+				stageDepthWrite, stageAlphaFunc, stageClampMap,
+				stageTcModScale, stageTcModScaleValue);
 			const int diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 			VRHI_InlineBSPModel surfaceModel;
 			if (!VRHI_BuildInlineSurface(vertsData, vertCount, indexesData, indexCount,
@@ -3945,6 +4003,9 @@ static void VRHI_LoadWorld(const char *name) {
 					batch.stageDepthWrite[stage] = stageDepthWrite[stage];
 					batch.stageAlphaFunc[stage] = stageAlphaFunc[stage];
 					batch.stageClampMap[stage] = stageClampMap[stage];
+					batch.stageTcModScale[stage] = stageTcModScale[stage];
+					batch.stageTcModScaleValue[stage][0] = stageTcModScaleValue[stage][0];
+					batch.stageTcModScaleValue[stage][1] = stageTcModScaleValue[stage][1];
 				}
 			}
 			if (inlineModel.vertices.size() > VRHI_MAX_INLINE_VERTICES - surfaceModel.vertices.size() ||
@@ -4278,7 +4339,8 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	uint8_t rgbConst = 0, const float *rgbConstColor = nullptr,
 	uint8_t alphaConst = 0, float alphaConstValue = 1.0f,
 	bool depthWrite = false, uint8_t alphaFunc = VRHI_SHADER_ALPHAFUNC_OFF,
-	bool clampMap = false) {
+	bool clampMap = false, bool tcModScale = false,
+	const float *tcModScaleValue = nullptr) {
 	if (indexCount == 0 || firstIndex > UINT32_MAX || indexCount > UINT32_MAX ||
 		g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) return false;
 	VRHI_SceneDraw draw;
@@ -4300,6 +4362,11 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	draw.depthWrite = depthWrite;
 	draw.alphaFunc = alphaFunc;
 	draw.clampMap = clampMap;
+	draw.tcModScale = tcModScale;
+	if (tcModScaleValue != nullptr) {
+		draw.tcModScaleValue[0] = tcModScaleValue[0];
+		draw.tcModScaleValue[1] = tcModScaleValue[1];
+	}
 	g_sceneDraws.push_back(draw);
 	return true;
 }
@@ -4381,10 +4448,14 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 		uint8_t stageAlphaFunc[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_ALPHAFUNC_OFF,
 			VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF, VRHI_SHADER_ALPHAFUNC_OFF };
 		uint8_t stageClampMap[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		uint8_t stageTcModScale[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		float stageTcModScaleValue[VRHI_SHADER_MAX_STAGES][2] = {
+			{ 1.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 1.0f } };
 		if (!shaderName.empty())
 			VRHI_LoadDiffuseStages(shaderName.c_str(), images, blends, &stageCount,
 				stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
-				stageDepthWrite, stageAlphaFunc, stageClampMap);
+				stageDepthWrite, stageAlphaFunc, stageClampMap,
+				stageTcModScale, stageTcModScaleValue);
 		if (stageCount > 0) {
 			material.diffuseImage = images[0];
 			material.blendMode = blends[0];
@@ -4397,6 +4468,9 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 			material.depthWrite = stageDepthWrite[0];
 			material.alphaFunc = stageAlphaFunc[0];
 			material.clampMap = stageClampMap[0];
+			material.tcModScale = stageTcModScale[0];
+			material.tcModScaleValue[0] = stageTcModScaleValue[0][0];
+			material.tcModScaleValue[1] = stageTcModScaleValue[0][1];
 		}
 		g_sceneShaderDiffuseByHandle.emplace(draw->shader, material);
 		if (material.diffuseImage >= 0) VRHI_UploadWorldDiffuse();
@@ -4416,6 +4490,9 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 	draw->depthWrite = material.depthWrite != 0;
 	draw->alphaFunc = material.alphaFunc;
 	draw->clampMap = material.clampMap != 0;
+	draw->tcModScale = material.tcModScale != 0;
+	draw->tcModScaleValue[0] = material.tcModScaleValue[0];
+	draw->tcModScaleValue[1] = material.tcModScaleValue[1];
 	return image.texture;
 }
 
@@ -4597,7 +4674,8 @@ static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4
 				rgbConst, batch.stageRgbConstColor[0],
 				alphaConst, batch.stageAlphaConstValue[0],
 				batch.stageDepthWrite[0] != 0, batch.stageAlphaFunc[0],
-				batch.stageClampMap[0] != 0)) {
+				batch.stageClampMap[0] != 0,
+				batch.stageTcModScale[0] != 0, batch.stageTcModScaleValue[0])) {
 				g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
 				g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
 				continue;
@@ -5132,6 +5210,18 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 				const glm::vec4 alphaTest(
 					static_cast<float>(batch.stageAlphaFunc[stage]), 0.0f, 0.0f, 0.0f);
 				g_worldState.SetUniform(1, { "u_alphaTest", { alphaTest } });
+				// Bounded static tcMod scale for this stage: the textured
+				// material pixel shaders scale the diffuse UVs by (s, t) before
+				// sampling. Identity (1,1) when the stage has no tcMod scale,
+				// always written so the per-draw uniform never carries a stale
+				// scale from an earlier draw. Only the diffuse sample is
+				// scaled; lightmap UVs, UI textures, vertex colour, and blend
+				// state are untouched.
+				const glm::vec4 tcModScale(
+					batch.stageTcModScale[stage] ? batch.stageTcModScaleValue[stage][0] : 1.0f,
+					batch.stageTcModScale[stage] ? batch.stageTcModScaleValue[stage][1] : 1.0f,
+					0.0f, 0.0f);
+				g_worldState.SetUniform(2, { "u_tcModScale", { tcModScale } });
 			}
 			if (vhSetState(g_worldStateId, g_worldState)) {
 				if (!submitted) vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
@@ -5256,6 +5346,17 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 				const glm::vec4 alphaTest(
 					static_cast<float>(draw.alphaFunc), 0.0f, 0.0f, 0.0f);
 				g_worldState.SetUniform(1, { "u_alphaTest", { alphaTest } });
+				// Bounded static tcMod scale carried on the scene draw
+				// (identity when the base stage has no scale statement), always
+				// written so the per-draw uniform never carries a stale scale
+				// from an earlier draw. Only the diffuse sample is scaled;
+				// lightmap UVs, UI textures, vertex colour, and blend state
+				// are untouched.
+				const glm::vec4 tcModScale(
+					draw.tcModScale ? draw.tcModScaleValue[0] : 1.0f,
+					draw.tcModScale ? draw.tcModScaleValue[1] : 1.0f,
+					0.0f, 0.0f);
+				g_worldState.SetUniform(2, { "u_tcModScale", { tcModScale } });
 			}
 			if (vhSetState(g_worldStateId, g_worldState)) {
 				if (!submitted) vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);

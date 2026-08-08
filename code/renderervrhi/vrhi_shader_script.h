@@ -93,6 +93,23 @@ input buffer, so no FS storage can be referenced after FS_FreeFile.
 // qpath validation (it returns only a path string and carries no sampler
 // flag). `animMap` has no clamp variant and keeps its existing first-frame
 // static fallback with the default wrap sampler.
+//
+// The bounded stage-local `tcMod scale` slice extends the same simple
+// multi-stage parser with exactly the Quake3 static `tcMod scale s t`
+// statement: both components must be finite, nonzero, and inside the defined
+// safe magnitude range (VRHI_SCRIPT_TCMOD_SCALE_* below), so a zero, huge, or
+// non-numeric scale can never collapse or explode sampling. The parsed scale
+// is carried through the world, inline-BSP, and scene shader-cache/draw paths
+// so the textured material pixel shaders scale the diffuse (material) UVs by
+// (s, t) before sampling. It is applied ONLY to the diffuse/material sample;
+// lightmap UVs, UI textures, vertex colour, blend classification, const
+// generators, depth, and alpha testing are never modified. Every other tcMod
+// variant (scroll, rotate, turb, stretch, ...) and every malformed, truncated,
+// zero, non-finite, or out-of-range scale keeps the existing fallback: the
+// stage stays accepted and samples with identity UVs exactly as before this
+// slice, and the statement never borrows tokens past the stage end. The
+// conservative first-stage helper still treats `tcMod` as unsupported and
+// rejects such shaders.
 ===========================================================================
 */
 #ifndef __VRHI_SHADER_SCRIPT_H
@@ -171,6 +188,19 @@ struct VRHI_ShaderStage {
 	// as before. The flag never changes blend modes, const generators, vertex
 	// colour, lightmaps, depth, or alpha testing.
 	bool clampMap = false;
+	// Bounded stage-local static `tcMod scale s t`: true only when the stage's
+	// tcMod statement used the Quake3 `scale` variant with two finite, nonzero,
+	// safely bounded components. The scale is carried into the world/scene
+	// draw state and applied in the textured material pixel shaders to the
+	// diffuse (material) UVs only; lightmap UVs, UI textures, vertex colour,
+	// blend modes, const generators, depth, and alpha testing are never
+	// modified. Stages without the keyword (or with any other tcMod variant
+	// such as scroll, rotate, turb, or stretch) keep identity UVs exactly as
+	// before. Negative (mirrored) scales inside the safe magnitude range are
+	// accepted like the GL1 renderer's TCModScale.
+	bool tcModScale = false;
+	float tcModScaleS = 1.0f;
+	float tcModScaleT = 1.0f;
 };
 
 // Strict bounds, independent of the legacy qfiles.h limits so malformed or
@@ -190,6 +220,15 @@ static const std::size_t VRHI_SCRIPT_MAX_TOKEN_BYTES = 1024;
 static const float VRHI_SCRIPT_GENCONST_MIN = 0.0f;
 static const float VRHI_SCRIPT_GENCONST_RGB_MAX = 1.0f;
 static const float VRHI_SCRIPT_GENCONST_ALPHA_MAX = 1.0f;
+
+// Bounded static `tcMod scale` range. Each component must be finite, nonzero,
+// and |value| inside [MIN, MAX]; zero would collapse every diffuse UV to a
+// single texel and extreme magnitudes would alias/explode sampling, so both
+// keep the existing identity-UV fallback. The range comfortably covers every
+// practical static scale used by Quake3 maps (for example 0.25, 0.5, 2, 4)
+// while remaining numerically safe for the pixel-shader multiply.
+static const float VRHI_SCRIPT_TCMOD_SCALE_MIN = 1.0f / 64.0f;
+static const float VRHI_SCRIPT_TCMOD_SCALE_MAX = 64.0f;
 
 struct VRHI_ShaderScriptToken {
 	std::string text;
@@ -223,6 +262,28 @@ inline bool VRHI_ShaderParseFiniteConstant(const std::string &text,
 	if (end == text.c_str() || *end != '\0' || errno == ERANGE ||
 		!std::isfinite(parsed) || parsed < minValue || parsed > maxValue)
 		return false;
+	*value = parsed;
+	return true;
+}
+
+// Parses one token as a bounded static `tcMod scale` component: finite,
+// nonzero, and |value| inside [VRHI_SCRIPT_TCMOD_SCALE_MIN,
+// VRHI_SCRIPT_TCMOD_SCALE_MAX]. Negative (mirrored) scales are accepted like
+// the GL1 renderer's TCModScale (st *= scale). Returns false for empty,
+// non-numeric, partially consumed (trailing junk), non-finite, zero, or
+// out-of-range tokens, so the tcMod scale slice accepts only exact in-range
+// components and every other value keeps the identity-UV fallback. Locale
+// behaviour mirrors the original renderer's atof-based ParseVector path.
+inline bool VRHI_ShaderParseTcModScale(const std::string &text, float *value) {
+	if (value == nullptr || text.empty()) return false;
+	char *end = nullptr;
+	errno = 0;
+	const float parsed = std::strtof(text.c_str(), &end);
+	if (end == text.c_str() || *end != '\0' || errno == ERANGE ||
+		!std::isfinite(parsed) || parsed == 0.0f) return false;
+	const float magnitude = std::fabs(parsed);
+	if (magnitude < VRHI_SCRIPT_TCMOD_SCALE_MIN ||
+		magnitude > VRHI_SCRIPT_TCMOD_SCALE_MAX) return false;
 	*value = parsed;
 	return true;
 }
@@ -689,6 +750,49 @@ inline bool VRHI_ParseSimpleShaderBlock(
 				} else {
 					j += 1;
 				}
+				continue;
+			}
+			if (keyword == "tcmod") {
+				// Bounded static `tcMod scale s t`: preserved only when the next
+				// token is the `scale` variant and both components are finite,
+				// nonzero, and inside the defined safe magnitude range. Every
+				// other tcMod variant (scroll, rotate, turb, stretch, ...) keeps
+				// the existing unsupported fallback: the keyword is consumed and
+				// its argument tokens remain bounded and ignored below, exactly
+				// as before this slice.
+				if (j + 1 < stageEnd && VRHI_ShaderTokenIs(tokens[j + 1], "scale")) {
+					// A syntactically complete `tcMod scale s t` statement
+					// consumes exactly four tokens (keyword + "scale" + s + t)
+					// so a following directive (map, blendFunc, ...) still
+					// parses normally. A complete but invalid/out-of-range
+					// statement (for example `tcMod scale 0 2` or
+					// `tcMod scale abc 2`) also consumes its whole declared
+					// argument count, so keyword-looking argument tokens cannot
+					// be re-parsed as stage directives; the stage stays accepted
+					// with identity UVs (the existing fallback).
+					if (j + 3 < stageEnd) {
+						float s = 1.0f;
+						float t = 1.0f;
+						if (VRHI_ShaderParseTcModScale(tokens[j + 2].text, &s) &&
+							VRHI_ShaderParseTcModScale(tokens[j + 3].text, &t)) {
+							stage.tcModScale = true;
+							stage.tcModScaleS = s;
+							stage.tcModScaleT = t;
+						}
+						j += 4;
+						continue;
+					}
+					// Truncated `tcMod scale` at the end of a stage: consume the
+					// keyword and the `scale` marker (and any partial argument
+					// below via the generic fallthrough), keep identity UVs, and
+					// never borrow tokens past the stage end.
+					j += 2;
+					continue;
+				}
+				// Non-scale tcMod (scroll/rotate/turb/stretch/...): keep the
+				// existing fallback by consuming just the keyword; the remaining
+				// argument tokens are bounded by stageEnd and ignored below.
+				j += 1;
 				continue;
 			}
 			const std::size_t consumed = VRHI_ShaderAllowlistedStatement(tokens, j, stageEnd);

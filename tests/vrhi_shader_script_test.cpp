@@ -16,7 +16,12 @@
 // flag distinguishes the Quake3 `clampMap` keyword from `map` (default wrap
 // sampler) with the same safe qpath validation; the adapter selects CLAMP
 // UVW sampler flags for clamped stages/draws and keeps WRAP UVW for every
-// default `map` stage.
+// default `map` stage. The bounded stage-local `tcMod scale s t` slice
+// accepts only finite, nonzero, safely bounded (|value| in [1/64, 64])
+// components and carries the per-stage scale to the textured material UV
+// sampling; every other tcMod variant (scroll/rotate/turb/stretch) and every
+// malformed, truncated, zero, or out-of-range scale keeps the identity-UV
+// fallback with the stage still accepted.
 //
 // Build and run (any C++11-or-later compiler):
 //   clang++ -std=c++17 -O1 -Wall -Wextra -Werror tests/vrhi_shader_script_test.cpp -o vrhi_shader_script_test && ./vrhi_shader_script_test
@@ -963,6 +968,249 @@ void testStageClampMap() {
 	}
 }
 
+void testStageTcModScale() {
+	// Bounded static `tcMod scale s t`: both components must be finite,
+	// nonzero, and inside the defined safe magnitude range
+	// [1/64, 64]; the parsed scale is carried per stage for the textured
+	// material UV scaling. Every other tcMod variant (scroll, rotate, turb,
+	// stretch, ...) and every malformed/truncated/zero/out-of-range scale
+	// keeps the existing fallback: the stage stays accepted and samples with
+	// identity UVs exactly as before.
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	// Basic acceptance: integer, fractional, mirrored (negative), and
+	// boundary scales all parse; identity values (1,1) are also accepted and
+	// change nothing. Split across two scripts (the parser caps every shader
+	// at four stages).
+	const std::string accepted = script(
+		"{ map textures/base.tga tcMod scale 2 3 }\n"
+		"{ map textures/a.png blendFunc blend tcMod scale 0.5 0.25 }\n"
+		"{ map textures/b.png blendFunc blend tcMod scale -2 -3 }\n"
+		"{ map textures/c.png blendFunc blend tcMod scale 64 0.015625 }");
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(accepted), accepted.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 4u);
+		if (stages.size() == 4) {
+			CHECK(stages[0].tcModScale);
+			CHECK(stages[0].tcModScaleS > 1.99f && stages[0].tcModScaleS < 2.01f);
+			CHECK(stages[0].tcModScaleT > 2.99f && stages[0].tcModScaleT < 3.01f);
+			CHECK(stages[1].tcModScale);
+			CHECK(stages[1].tcModScaleS > 0.49f && stages[1].tcModScaleS < 0.51f);
+			CHECK(stages[1].tcModScaleT > 0.24f && stages[1].tcModScaleT < 0.26f);
+			CHECK(stages[2].tcModScale);
+			CHECK(stages[2].tcModScaleS < -1.99f && stages[2].tcModScaleS > -2.01f);
+			CHECK(stages[2].tcModScaleT < -2.99f && stages[2].tcModScaleT > -3.01f);
+			CHECK(stages[3].tcModScale);
+			CHECK(stages[3].tcModScaleS > 63.99f && stages[3].tcModScaleS < 64.01f);
+			CHECK(stages[3].tcModScaleT > 0.015f && stages[3].tcModScaleT < 0.016f);
+		}
+	}
+	const std::string identityScale = script(
+		"{ map textures/d.png blendFunc blend tcMod scale 1 1 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(identityScale), identityScale.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(stages[0].tcModScale);
+			CHECK(stages[0].tcModScaleS == 1.0f);
+			CHECK(stages[0].tcModScaleT == 1.0f);
+		}
+	}
+	// Stage locality: each stage keeps its own scale, and stages without the
+	// keyword keep identity (flag false), exactly as before the slice.
+	const std::string locality = script(
+		"{ map textures/base.tga tcMod scale 2 3 }\n"
+		"{ map textures/a.png blendFunc blend }\n"
+		"{ map textures/b.png blendFunc blend tcMod scale 4 5 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(locality), locality.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			CHECK(stages[0].tcModScale);
+			CHECK(stages[0].tcModScaleS > 1.99f && stages[0].tcModScaleS < 2.01f);
+			CHECK(!stages[1].tcModScale);
+			CHECK(stages[1].tcModScaleS == 1.0f);
+			CHECK(stages[1].tcModScaleT == 1.0f);
+			CHECK(stages[2].tcModScale);
+			CHECK(stages[2].tcModScaleT > 4.99f && stages[2].tcModScaleT < 5.01f);
+		}
+	}
+	// The scale statement consumes exactly four tokens, so a following
+	// directive on the same stage still parses, and the scale composes with
+	// every other bounded stage slice (blend, depthWrite, alphaFunc,
+	// clampMap, const generators) without changing any of them.
+	const std::string composed = script(
+		"{ clampmap textures/clamped.tga tcMod scale 2 3 blendFunc blend depthWrite alphaFunc GE128 rgbGen const 0.5 0.5 0.5 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(composed), composed.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(stages[0].tcModScale);
+			CHECK(stages[0].tcModScaleS > 1.99f && stages[0].tcModScaleS < 2.01f);
+			CHECK(stages[0].tcModScaleT > 2.99f && stages[0].tcModScaleT < 3.01f);
+			CHECK(stages[0].clampMap);
+			CHECK_EQ_INT(stages[0].blendMode, VRHI_SHADER_BLEND_ALPHA);
+			CHECK(stages[0].depthWrite);
+			CHECK_EQ_INT(stages[0].alphaFunc, VRHI_SHADER_ALPHAFUNC_GE128);
+			CHECK(stages[0].rgbGenConst);
+		}
+	}
+	// Keyword matching is case-insensitive, like every other directive.
+	const std::string upper = script(
+		"{ map textures/base.tga TCMOD SCALE 2 2 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(upper), upper.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) CHECK(stages[0].tcModScale);
+	}
+	// Statement order is independent: a scale declared before the map on the
+	// same stage still parses and still consumes exactly its own tokens.
+	const std::string scaleFirst = script(
+		"{ tcMod scale 4 4 map textures/base.tga }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(scaleFirst), scaleFirst.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(stages[0].tcModScale);
+			CHECK(stages[0].tcModScaleS > 3.99f && stages[0].tcModScaleS < 4.01f);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+		}
+	}
+	// Fallbacks: zero, out-of-range, non-numeric, trailing-junk, and
+	// truncated scales keep the stage accepted with identity UVs (flag
+	// false) instead of rejecting the material.
+	const std::string fallbacks = script(
+		"{ map textures/base.tga tcMod scale 0 2 }\n"
+		"{ map textures/a.png blendFunc blend tcMod scale 1e30 2 }\n"
+		"{ map textures/b.png blendFunc blend tcMod scale 0.0001 1 }\n"
+		"{ map textures/c.png blendFunc blend tcMod scale abc def }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(fallbacks), fallbacks.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 4u);
+		if (stages.size() == 4) {
+			for (std::size_t i = 0; i < stages.size(); ++i) {
+				CHECK(!stages[i].tcModScale);
+				CHECK(stages[i].tcModScaleS == 1.0f);
+				CHECK(stages[i].tcModScaleT == 1.0f);
+			}
+		}
+	}
+	// Truncated `tcMod scale` statements at the end of a stage keep the
+	// fallback (identity UVs) and never borrow tokens past the stage end.
+	const std::string truncated = script("{ map textures/base.tga tcMod scale 2 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncated), truncated.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(!stages[0].tcModScale);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+		}
+	}
+	const std::string truncatedMarker = script("{ map textures/base.tga tcMod scale }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncatedMarker), truncatedMarker.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) CHECK(!stages[0].tcModScale);
+	}
+	const std::string truncatedBare = script("{ map textures/base.tga tcMod }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncatedBare), truncatedBare.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) CHECK(!stages[0].tcModScale);
+	}
+	// A syntactically complete scale statement with invalid/out-of-range
+	// values consumes its whole declared argument count, so keyword-looking
+	// argument tokens (for example `tcMod scale 2 map`) cannot be re-parsed
+	// as stage directives: the stage stays accepted with identity UVs.
+	const std::string keywordValues = script(
+		"{ map textures/base.tga tcMod scale 2 map }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(keywordValues), keywordValues.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(!stages[0].tcModScale);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+		}
+	}
+	// Unsupported tcMod variants keep the existing fallback: the stage stays
+	// accepted with identity UVs, exactly as before this slice.
+	const std::string unsupported = script(
+		"{ map textures/base.tga tcMod scroll 0.1 0.1 }\n"
+		"{ map textures/a.png blendFunc blend tcMod rotate 90 }\n"
+		"{ map textures/b.png blendFunc blend tcMod turb 0 1 1 0.5 0.5 }\n"
+		"{ map textures/c.png blendFunc blend tcMod stretch sin 0 1 0.5 0.5 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(unsupported), unsupported.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 4u);
+		if (stages.size() == 4) {
+			for (std::size_t i = 0; i < stages.size(); ++i) {
+				CHECK(!stages[i].tcModScale);
+				CHECK(stages[i].tcModScaleS == 1.0f);
+				CHECK(stages[i].tcModScaleT == 1.0f);
+			}
+		}
+	}
+	// A dynamic tcMod followed by a static scale keeps the scale slice
+	// intact (scroll falls back, the scale is preserved).
+	const std::string mixed = script(
+		"{ map textures/base.tga tcMod scroll 0.1 0.1 tcMod scale 2 2 }\n"
+		"{ map textures/a.png blendFunc blend tcMod scale 3 3 tcMod rotate 90 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(mixed), mixed.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 2u);
+		if (stages.size() == 2) {
+			CHECK(stages[0].tcModScale);
+			CHECK(stages[0].tcModScaleS > 1.99f && stages[0].tcModScaleS < 2.01f);
+			CHECK(stages[1].tcModScale);
+			CHECK(stages[1].tcModScaleS > 2.99f && stages[1].tcModScaleS < 3.01f);
+		}
+	}
+	// The conservative first-stage opaque helper still rejects tcMod: only
+	// identity matches the fixed opaque diffuse pass, so a tcMod scale shader
+	// keeps its existing fallback there.
+	CHECK_EQ_STR(candidateBody(
+		"{ map textures/foo/bar.tga tcMod scale 2 2 }", nullptr), "");
+}
+
 void testConsoleScriptResolution() {
 	// OpenArena defines the in-game console background as a script shader
 	// (scripts/oanew.shader): `console { { map textures/sfx/logo256.tga } }`.
@@ -1034,6 +1282,7 @@ int main() {
 	testStageDepthWrite();
 	testStageAlphaFunc();
 	testStageClampMap();
+	testStageTcModScale();
 	testConsoleScriptResolution();
 	testPathSafetyHelpers();
 
