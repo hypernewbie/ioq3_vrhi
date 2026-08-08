@@ -65,16 +65,28 @@ static vhProgram g_uiProgram;
 static vhState g_uiState;
 static const vhStateId g_uiStateId = 2;
 static vhShader g_worldVertexShader = VRHI_INVALID_HANDLE;
-static vhShader g_worldPixelShader = VRHI_INVALID_HANDLE;
-static vhProgram g_worldProgram;
+static vhShader g_worldSolidPixelShader = VRHI_INVALID_HANDLE;
+static vhShader g_worldLightmapPixelShader = VRHI_INVALID_HANDLE;
+static vhProgram g_worldSolidProgram;
+static vhProgram g_worldLightmapProgram;
 static vhState g_worldState;
 static const vhStateId g_worldStateId = 3;
 static vhBuffer g_worldVertexBuffer = VRHI_INVALID_HANDLE;
 static vhBuffer g_worldIndexBuffer = VRHI_INVALID_HANDLE;
 static vhTexture g_worldDepthTexture = VRHI_INVALID_HANDLE;
+static vhTexture g_worldLightmapTexture = VRHI_INVALID_HANDLE;
 static nvrhi::Format g_worldDepthFormat = nvrhi::Format::UNKNOWN;
 static std::vector<glm::vec3> g_worldPositions;
+struct VRHI_WorldVertex {
+	glm::vec3 position;
+	glm::vec2 lightmap;
+	float lightmapLayer;
+};
+static std::vector<VRHI_WorldVertex> g_worldVertices;
 static std::vector<uint32_t> g_worldIndexes;
+static std::vector<byte> g_worldLightmapPixels;
+static int g_worldLightmapLayers = 0;
+static bool g_worldLightmapAvailable = false;
 static bool g_worldLoaded = false;
 static bool g_worldShaderInitialized = false;
 static int32_t g_worldDrawErrorBaseline = 0;
@@ -605,21 +617,47 @@ cbuffer WorldUniforms : register(b1, VRHI_STAGE_SPACE)
     float4x4 u_worldViewProj;
     float4 _pad[8];
 };
-struct VSOutput { float4 position : SV_Position; };
+struct VSOutput {
+    float4 position : SV_Position;
+    float2 lightmap : TEXCOORD0;
+    float lightmapLayer : TEXCOORD1;
+};
 [shader("vertex")]
-VSOutput main(float3 position : POSITION)
+VSOutput main(float3 position : POSITION, float2 lightmap : TEXCOORD0,
+    float lightmapLayer : TEXCOORD1)
 {
     VSOutput output;
     output.position = mul(u_worldViewProj, float4(position, 1.0));
+    output.lightmap = lightmap;
+    output.lightmapLayer = lightmapLayer;
     return output;
 }
 )";
 
-static const char *VRHI_WorldPixelSource = R"(
+static const char *VRHI_WorldSolidPixelSource = R"(
 [shader("pixel")]
 float4 main() : SV_Target
 {
     return float4(0.24, 0.42, 0.22, 1.0);
+}
+)";
+
+static const char *VRHI_WorldLightmapPixelSource = R"(
+Texture2DArray<float4> u_lightmap : register(t0, VRHI_STAGE_SPACE);
+SamplerState u_lightmapSampler : register(s0, VRHI_STAGE_SPACE);
+struct PSInput {
+    float4 position : SV_Position;
+    float2 lightmap : TEXCOORD0;
+    float lightmapLayer : TEXCOORD1;
+};
+[shader("pixel")]
+float4 main(PSInput input) : SV_Target
+{
+    const float4 solid = float4(0.24, 0.42, 0.22, 1.0);
+    if (input.lightmapLayer < -0.5)
+        return solid;
+    return float4(u_lightmap.Sample(u_lightmapSampler,
+        float3(saturate(input.lightmap), input.lightmapLayer)).rgb, 1.0);
 }
 )";
 
@@ -680,19 +718,32 @@ static void VRHI_DestroyWorldResources(bool clearGeometry) {
 		g_worldDepthTexture = VRHI_INVALID_HANDLE;
 		g_worldDepthFormat = nvrhi::Format::UNKNOWN;
 	}
+	if (g_worldLightmapTexture != VRHI_INVALID_HANDLE) {
+		vhDestroyTexture(g_worldLightmapTexture);
+		g_worldLightmapTexture = VRHI_INVALID_HANDLE;
+	}
 	if (g_worldVertexShader != VRHI_INVALID_HANDLE) {
 		vhDestroyShader(g_worldVertexShader);
 		g_worldVertexShader = VRHI_INVALID_HANDLE;
 	}
-	if (g_worldPixelShader != VRHI_INVALID_HANDLE) {
-		vhDestroyShader(g_worldPixelShader);
-		g_worldPixelShader = VRHI_INVALID_HANDLE;
+	if (g_worldSolidPixelShader != VRHI_INVALID_HANDLE) {
+		vhDestroyShader(g_worldSolidPixelShader);
+		g_worldSolidPixelShader = VRHI_INVALID_HANDLE;
 	}
-	g_worldProgram.clear();
+	if (g_worldLightmapPixelShader != VRHI_INVALID_HANDLE) {
+		vhDestroyShader(g_worldLightmapPixelShader);
+		g_worldLightmapPixelShader = VRHI_INVALID_HANDLE;
+	}
+	g_worldSolidProgram.clear();
+	g_worldLightmapProgram.clear();
+	g_worldLightmapAvailable = false;
+	g_worldLightmapLayers = 0;
+	g_worldLightmapPixels.clear();
 	g_worldShaderInitialized = false;
 	g_worldState = vhState();
 	if (clearGeometry) {
 		g_worldPositions.clear();
+		g_worldVertices.clear();
 		g_worldIndexes.clear();
 		g_worldLoaded = false;
 	}
@@ -702,52 +753,64 @@ static void VRHI_DestroyWorldResources(bool clearGeometry) {
 }
 
 static bool VRHI_InitializeWorldShader(void) {
-	if (!g_deviceInitialized) {
-		return false;
-	}
-	if (g_worldShaderInitialized) {
-		return true;
-	}
+	if (!g_deviceInitialized) return false;
+	if (g_worldShaderInitialized) return true;
 	std::vector<uint32_t> vertexSpirv;
-	std::vector<uint32_t> pixelSpirv;
+	std::vector<uint32_t> solidPixelSpirv;
+	std::vector<uint32_t> lightmapPixelSpirv;
 	std::string error;
 	if (!vhCompileShader("VRHI_WorldVertex", VRHI_WorldVertexSource,
 		VRHI_SHADER_STAGE_VERTEX | VRHI_SHADER_SM_6_0, vertexSpirv, "main",
 		{}, {}, &error) ||
-		!vhCompileShader("VRHI_WorldPixel", VRHI_WorldPixelSource,
-		VRHI_SHADER_STAGE_PIXEL | VRHI_SHADER_SM_6_0, pixelSpirv, "main",
+		!vhCompileShader("VRHI_WorldSolidPixel", VRHI_WorldSolidPixelSource,
+		VRHI_SHADER_STAGE_PIXEL | VRHI_SHADER_SM_6_0, solidPixelSpirv, "main",
 		{}, {}, &error)) {
-		VRHI_Printf(PRINT_WARNING,
-			"renderer_vrhi: world shader compile failed: %s\n", error.c_str());
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: world shader compile failed: %s\n",
+			error.c_str());
 		return false;
 	}
+	std::string lightmapError;
+	const bool lightmapCompiled = vhCompileShader("VRHI_WorldLightmapPixel",
+		VRHI_WorldLightmapPixelSource, VRHI_SHADER_STAGE_PIXEL | VRHI_SHADER_SM_6_0,
+		lightmapPixelSpirv, "main", {}, {}, &lightmapError);
+	if (!lightmapCompiled) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: lightmap shader unavailable; using solid fallback: %s\n",
+			lightmapError.c_str());
+	}
 	g_worldVertexShader = vhAllocShader();
-	g_worldPixelShader = vhAllocShader();
+	g_worldSolidPixelShader = vhAllocShader();
+	if (lightmapCompiled) g_worldLightmapPixelShader = vhAllocShader();
 	if (g_worldVertexShader == VRHI_INVALID_HANDLE ||
-		g_worldPixelShader == VRHI_INVALID_HANDLE) {
+		g_worldSolidPixelShader == VRHI_INVALID_HANDLE ||
+		(lightmapCompiled && g_worldLightmapPixelShader == VRHI_INVALID_HANDLE)) {
 		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: world shader allocation failed\n");
-		if (g_worldVertexShader != VRHI_INVALID_HANDLE) vhDestroyShader(g_worldVertexShader);
-		if (g_worldPixelShader != VRHI_INVALID_HANDLE) vhDestroyShader(g_worldPixelShader);
-		g_worldVertexShader = g_worldPixelShader = VRHI_INVALID_HANDLE;
+		VRHI_DestroyWorldResources(false);
 		return false;
 	}
 	const int32_t errorsBefore = g_vhErrorCounter.load(std::memory_order_relaxed);
 	vhCreateShader(g_worldVertexShader, "VRHI_WorldVertex", VRHI_SHADER_STAGE_VERTEX,
 		vertexSpirv, "main");
-	vhCreateShader(g_worldPixelShader, "VRHI_WorldPixel", VRHI_SHADER_STAGE_PIXEL,
-		pixelSpirv, "main");
+	vhCreateShader(g_worldSolidPixelShader, "VRHI_WorldSolidPixel", VRHI_SHADER_STAGE_PIXEL,
+		solidPixelSpirv, "main");
+	if (lightmapCompiled) {
+		vhCreateShader(g_worldLightmapPixelShader, "VRHI_WorldLightmapPixel",
+			VRHI_SHADER_STAGE_PIXEL, lightmapPixelSpirv, "main");
+	}
 	vhFinish();
 	if (g_vhErrorCounter.load(std::memory_order_relaxed) != errorsBefore) {
 		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: world shader creation failed\n");
-		if (g_worldVertexShader != VRHI_INVALID_HANDLE) vhDestroyShader(g_worldVertexShader);
-		if (g_worldPixelShader != VRHI_INVALID_HANDLE) vhDestroyShader(g_worldPixelShader);
-		g_worldVertexShader = g_worldPixelShader = VRHI_INVALID_HANDLE;
-		vhFinish();
+		VRHI_DestroyWorldResources(false);
 		return false;
 	}
-	g_worldProgram = vhCreateGfxProgram(g_worldVertexShader, g_worldPixelShader);
+	g_worldSolidProgram = vhCreateGfxProgram(g_worldVertexShader, g_worldSolidPixelShader);
+	if (lightmapCompiled) {
+		g_worldLightmapProgram = vhCreateGfxProgram(g_worldVertexShader,
+			g_worldLightmapPixelShader);
+	}
 	g_worldShaderInitialized = true;
-	VRHI_Printf(PRINT_ALL, "renderer_vrhi: static BSP world shader ready\n");
+	VRHI_Printf(PRINT_ALL, "renderer_vrhi: static BSP world shaders ready (lightmap=%s)\n",
+		lightmapCompiled ? "yes" : "no");
 	return true;
 }
 
@@ -786,8 +849,42 @@ static bool VRHI_CreateWorldDepth(int width, int height) {
 	return false;
 }
 
+static bool VRHI_UploadWorldLightmaps(void) {
+	if (!g_deviceInitialized || g_worldLightmapTexture != VRHI_INVALID_HANDLE ||
+		g_worldLightmapLayers <= 0 || g_worldLightmapPixels.empty() ||
+		g_worldLightmapPixelShader == VRHI_INVALID_HANDLE) return g_worldLightmapAvailable;
+	const size_t layerBytes = static_cast<size_t>(LIGHTMAP_WIDTH) * LIGHTMAP_HEIGHT * 4;
+	if (g_worldLightmapPixels.size() != layerBytes * static_cast<size_t>(g_worldLightmapLayers)) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: invalid decoded lightmap storage\n");
+		return false;
+	}
+	vhTexture texture = vhAllocTexture();
+	if (texture == VRHI_INVALID_HANDLE) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: lightmap texture allocation failed; using solid world\n");
+		return false;
+	}
+	vhMem *data = new vhMem(g_worldLightmapPixels.size());
+	std::memcpy(data->data(), g_worldLightmapPixels.data(), data->size());
+	const int32_t errorsBefore = g_vhErrorCounter.load(std::memory_order_relaxed);
+	vhCreateTexture2DArray(texture, "VRHI_BSPLightmaps",
+		glm::ivec2(LIGHTMAP_WIDTH, LIGHTMAP_HEIGHT), g_worldLightmapLayers, 1,
+		nvrhi::Format::RGBA8_UNORM, VRHI_TEXTURE_NONE | VRHI_SAMPLER_NONE, data);
+	vhFinish();
+	if (g_vhErrorCounter.load(std::memory_order_relaxed) != errorsBefore) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: lightmap texture upload failed; using solid world\n");
+		vhDestroyTexture(texture);
+		vhFinish();
+		return false;
+	}
+	g_worldLightmapTexture = texture;
+	g_worldLightmapAvailable = true;
+	VRHI_Printf(PRINT_ALL, "renderer_vrhi: uploaded BSP lightmaps (%d layers, %zu bytes)\n",
+		g_worldLightmapLayers, g_worldLightmapPixels.size());
+	return true;
+}
+
 static bool VRHI_UploadWorldGeometry(void) {
-	if (!g_deviceInitialized || !g_worldLoaded || g_worldPositions.empty() ||
+	if (!g_deviceInitialized || !g_worldLoaded || g_worldVertices.empty() ||
 		g_worldIndexes.empty()) return false;
 	if (!VRHI_InitializeWorldShader()) return false;
 	if (g_worldVertexBuffer != VRHI_INVALID_HANDLE || g_worldIndexBuffer != VRHI_INVALID_HANDLE) vhFinish();
@@ -802,13 +899,13 @@ static bool VRHI_UploadWorldGeometry(void) {
 		g_worldVertexBuffer = g_worldIndexBuffer = VRHI_INVALID_HANDLE;
 		return false;
 	}
-	vhMem *vertices = new vhMem(g_worldPositions.size() * sizeof(glm::vec3));
-	std::memcpy(vertices->data(), g_worldPositions.data(), vertices->size());
+	vhMem *vertices = new vhMem(g_worldVertices.size() * sizeof(VRHI_WorldVertex));
+	std::memcpy(vertices->data(), g_worldVertices.data(), vertices->size());
 	vhMem *indexes = new vhMem(g_worldIndexes.size() * sizeof(uint32_t));
 	std::memcpy(indexes->data(), g_worldIndexes.data(), indexes->size());
 	const int32_t errorsBefore = g_vhErrorCounter.load(std::memory_order_relaxed);
-	vhCreateVertexBuffer(g_worldVertexBuffer, "VRHI_WorldPositions", vertices, "float3",
-		g_worldPositions.size());
+	vhCreateVertexBuffer(g_worldVertexBuffer, "VRHI_WorldVertices", vertices,
+		"float3 float2 float", g_worldVertices.size());
 	vhCreateIndexBuffer(g_worldIndexBuffer, "VRHI_WorldIndexes", indexes,
 		g_worldIndexes.size(), VRHI_BUFFER_INDEX32);
 	vhFinish();
@@ -820,8 +917,9 @@ static bool VRHI_UploadWorldGeometry(void) {
 		vhFinish();
 		return false;
 	}
+	VRHI_UploadWorldLightmaps();
 	VRHI_Printf(PRINT_ALL, "renderer_vrhi: uploaded world geometry (%zu vertices, %zu indexes)\n",
-		g_worldPositions.size(), g_worldIndexes.size());
+		g_worldVertices.size(), g_worldIndexes.size());
 	return true;
 }
 
@@ -1339,6 +1437,7 @@ static void VRHI_LoadWorld(const char *name) {
 	const lump_t &vertsLump = lumps[LUMP_DRAWVERTS];
 	const lump_t &indexesLump = lumps[LUMP_DRAWINDEXES];
 	const lump_t &shadersLump = lumps[LUMP_SHADERS];
+	const lump_t &lightmapsLump = lumps[LUMP_LIGHTMAPS];
 	if (static_cast<size_t>(modelsLump.filelen) < sizeof(dmodel_t) ||
 		static_cast<size_t>(shadersLump.filelen) % sizeof(dshader_t) != 0 ||
 		static_cast<size_t>(surfacesLump.filelen) % sizeof(dsurface_t) != 0 ||
@@ -1357,6 +1456,34 @@ static void VRHI_LoadWorld(const char *name) {
 	const int vertCount = vertsLump.filelen / static_cast<int>(sizeof(drawVert_t));
 	const int indexCount = indexesLump.filelen / static_cast<int>(sizeof(int));
 	const int shaderCount = shadersLump.filelen / static_cast<int>(sizeof(dshader_t));
+	const size_t lightmapLayerBytes = static_cast<size_t>(LIGHTMAP_WIDTH) *
+		LIGHTMAP_HEIGHT * 3;
+	const bool lightmapLumpValid = lightmapsLump.filelen > 0 &&
+		static_cast<size_t>(lightmapsLump.filelen) % lightmapLayerBytes == 0 &&
+		static_cast<size_t>(lightmapsLump.filelen) / lightmapLayerBytes <=
+		static_cast<size_t>(std::numeric_limits<int>::max());
+	if (lightmapsLump.filelen > 0 && !lightmapLumpValid) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: BSP world '%s' has malformed lightmap lump; surfaces use solid fallback\n",
+			name);
+	}
+	if (lightmapLumpValid) {
+		g_worldLightmapLayers = lightmapsLump.filelen / static_cast<int>(lightmapLayerBytes);
+		g_worldLightmapPixels.resize(static_cast<size_t>(g_worldLightmapLayers) *
+			static_cast<size_t>(LIGHTMAP_WIDTH) * LIGHTMAP_HEIGHT * 4);
+		const byte *lightmapData = fileBytes + static_cast<size_t>(lightmapsLump.fileofs);
+		for (int layer = 0; layer < g_worldLightmapLayers; ++layer) {
+			const byte *src = lightmapData + static_cast<size_t>(layer) * lightmapLayerBytes;
+			byte *dst = g_worldLightmapPixels.data() + static_cast<size_t>(layer) *
+				static_cast<size_t>(LIGHTMAP_WIDTH) * LIGHTMAP_HEIGHT * 4;
+			for (size_t pixel = 0; pixel < static_cast<size_t>(LIGHTMAP_WIDTH) * LIGHTMAP_HEIGHT; ++pixel) {
+				dst[pixel * 4 + 0] = src[pixel * 3 + 0];
+				dst[pixel * 4 + 1] = src[pixel * 3 + 1];
+				dst[pixel * 4 + 2] = src[pixel * 3 + 2];
+				dst[pixel * 4 + 3] = 255;
+			}
+		}
+	}
 	const dmodel_t model = VRHI_ReadModel(modelsData, 0);
 	if (model.firstSurface < 0 || model.numSurfaces < 0 ||
 		model.firstSurface > surfaceCount || model.numSurfaces > surfaceCount - model.firstSurface) {
@@ -1383,18 +1510,23 @@ static void VRHI_LoadWorld(const char *name) {
 			continue;
 		}
 		std::unordered_map<int, uint32_t> localVertices;
+		const int surfaceLightmapLayer = lightmapLumpValid &&
+			surface.lightmapNum >= 0 && surface.lightmapNum < g_worldLightmapLayers
+			? surface.lightmapNum : -1;
 		int surfaceTriangles = 0;
 		for (int i = 0; i + 2 < surface.numIndexes; i += 3) {
 			const int source[3] = { VRHI_ReadIndex(indexesData, surface.firstIndex + i),
 				VRHI_ReadIndex(indexesData, surface.firstIndex + i + 1),
 				VRHI_ReadIndex(indexesData, surface.firstIndex + i + 2) };
 			bool valid = true;
+			drawVert_t vertices[3];
 			glm::vec3 position[3];
 			for (int corner = 0; corner < 3; ++corner) {
 				if (source[corner] < 0 || source[corner] >= surface.numVerts) { valid = false; break; }
-				const drawVert_t vertex = VRHI_ReadDrawVert(vertsData,
+				vertices[corner] = VRHI_ReadDrawVert(vertsData,
 					surface.firstVert + source[corner]);
-				position[corner] = glm::vec3(vertex.xyz[0], vertex.xyz[1], vertex.xyz[2]);
+				position[corner] = glm::vec3(vertices[corner].xyz[0], vertices[corner].xyz[1],
+					vertices[corner].xyz[2]);
 				if (!std::isfinite(position[corner].x) || !std::isfinite(position[corner].y) ||
 					!std::isfinite(position[corner].z)) { valid = false; break; }
 			}
@@ -1407,9 +1539,24 @@ static void VRHI_LoadWorld(const char *name) {
 				std::unordered_map<int, uint32_t>::iterator found = localVertices.find(source[corner]);
 				uint32_t local;
 				if (found == localVertices.end()) {
-					local = static_cast<uint32_t>(g_worldPositions.size());
+					local = static_cast<uint32_t>(g_worldVertices.size());
 					localVertices.emplace(source[corner], local);
-					g_worldPositions.push_back(position[corner]);
+					const bool validLightmapUV = surfaceLightmapLayer >= 0 &&
+						std::isfinite(vertices[corner].lightmap[0]) &&
+						std::isfinite(vertices[corner].lightmap[1]) &&
+						vertices[corner].lightmap[0] >= 0.0f &&
+						vertices[corner].lightmap[0] <= 1.0f &&
+						vertices[corner].lightmap[1] >= 0.0f &&
+						vertices[corner].lightmap[1] <= 1.0f;
+					VRHI_WorldVertex worldVertex;
+					worldVertex.position = position[corner];
+					worldVertex.lightmap = validLightmapUV
+						? glm::vec2(vertices[corner].lightmap[0], vertices[corner].lightmap[1])
+						: glm::vec2(0.0f);
+					worldVertex.lightmapLayer = validLightmapUV
+						? static_cast<float>(surfaceLightmapLayer) : -1.0f;
+					g_worldVertices.push_back(worldVertex);
+					g_worldPositions.push_back(worldVertex.position);
 				} else local = found->second;
 				g_worldIndexes.push_back(local);
 			}
@@ -1418,9 +1565,10 @@ static void VRHI_LoadWorld(const char *name) {
 		if (surfaceTriangles > 0) accepted++;
 		else skipped++;
 	}
-	g_worldLoaded = !g_worldPositions.empty() && !g_worldIndexes.empty();
-	VRHI_Printf(PRINT_ALL, "renderer_vrhi: BSP world '%s': models=1 surfaces=%d accepted=%d skipped=%d vertices=%zu indexes=%zu\n",
-		name, model.numSurfaces, accepted, skipped, g_worldPositions.size(), g_worldIndexes.size());
+	g_worldLoaded = !g_worldVertices.empty() && !g_worldIndexes.empty();
+	VRHI_Printf(PRINT_ALL, "renderer_vrhi: BSP world '%s': models=1 surfaces=%d accepted=%d skipped=%d vertices=%zu indexes=%zu lightmaps=%d\n",
+		name, model.numSurfaces, accepted, skipped, g_worldVertices.size(), g_worldIndexes.size(),
+		g_worldLightmapLayers);
 	g_ri.FS_FreeFile(fileData);
 	if (g_worldLoaded && g_deviceInitialized) VRHI_UploadWorldGeometry();
 }
@@ -1509,6 +1657,9 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		fd->width <= 0 || fd->height <= 0 || !std::isfinite(fd->fov_x) ||
 		!std::isfinite(fd->fov_y) || fd->fov_x <= 0.0f || fd->fov_y <= 0.0f) return;
 	if (!VRHI_CreateWorldDepth(g_frameViewportWidth, g_frameViewportHeight)) return;
+	const bool useLightmap = g_worldLightmapAvailable &&
+		g_worldLightmapTexture != VRHI_INVALID_HANDLE &&
+		g_worldLightmapPixelShader != VRHI_INVALID_HANDLE;
 	g_worldState = g_frameState;
 	g_worldState.SetColourAttachment(0, g_frameBackbuffer)
 		.SetDepthAttachment(g_worldDepthTexture)
@@ -1524,10 +1675,18 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		.SetStateFlags(VRHI_STATE_WRITE_RGB | VRHI_STATE_WRITE_A | VRHI_STATE_WRITE_Z |
 			VRHI_STATE_DEPTH_TEST_ENABLE | VRHI_STATE_DEPTH_TEST_LESS |
 			VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES)
-		.SetProgram(g_worldProgram)
-		.SetVertexBuffer(g_worldVertexBuffer, 0, 0, 0, static_cast<uint32_t>(g_worldPositions.size()))
+		.SetProgram(useLightmap ? g_worldLightmapProgram : g_worldSolidProgram)
+		.SetVertexBuffer(g_worldVertexBuffer, 0, 0, 0, static_cast<uint32_t>(g_worldVertices.size()))
 		.SetIndexBuffer(g_worldIndexBuffer, 0, 0, static_cast<uint32_t>(g_worldIndexes.size()))
+		.SetTextures({})
+		.SetSamplers({})
 		.DirtyAll();
+	if (useLightmap) {
+		g_worldState.SetTexture(0, { "u_lightmap", 0, g_worldLightmapTexture })
+			.SetSampler(0, { "u_lightmapSampler", 0,
+				VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
+				VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP });
+	}
 	g_worldDrawErrorBaseline = g_vhErrorCounter.load(std::memory_order_relaxed);
 	if (vhSetState(g_worldStateId, g_worldState)) {
 		vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
@@ -1535,8 +1694,8 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		g_worldDrawSubmitted = true;
 	} else {
 		VRHI_Printf(PRINT_WARNING,
-			"renderer_vrhi: world vhSetState failed (vertices=%zu indexes=%zu)\n",
-			g_worldPositions.size(), g_worldIndexes.size());
+			"renderer_vrhi: world vhSetState failed (vertices=%zu indexes=%zu lightmap=%s)\n",
+			g_worldVertices.size(), g_worldIndexes.size(), useLightmap ? "yes" : "no");
 	}
 }
 static void VRHI_SetColor(const float *rgba) {
