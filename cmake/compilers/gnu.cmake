@@ -11,17 +11,29 @@ set(ASM_SOURCES
     ${SOURCE_DIR}/asm/snapvector.c
 )
 
-add_compile_options(-Wall -Wimplicit -Wshadow
-    -Wstrict-prototypes -Wformat=2  -Wformat-security
-    -Wstrict-aliasing=2 -Wmissing-format-attribute
-    -Wdisabled-optimization -Werror-implicit-function-declaration)
-
-add_compile_options(-Wno-format-zero-length -Wno-format-nonliteral)
+if(IOQ3_ENABLE_WARNINGS)
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-Wall>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-Wimplicit>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-Wshadow>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-Wstrict-prototypes>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-Wformat=2>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-Wformat-security>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-Wstrict-aliasing=2>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-Wmissing-format-attribute>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-Wdisabled-optimization>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-Werror-implicit-function-declaration>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-Wno-format-zero-length>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-Wno-format-nonliteral>"
+    )
+else()
+    add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-w>")
+endif()
 
 # There are lots of instances of union based aliasing in the code
 # that rely on the compiler not optimising them away, so disable it
-add_compile_options(-fno-strict-aliasing)
+add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-fno-strict-aliasing>")
 
 # This is necessary to hide all symbols unless explicitly exported
 # via the Q_EXPORT macro
-add_compile_options(-fvisibility=hidden)
+add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-fvisibility=hidden>")

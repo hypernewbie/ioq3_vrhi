@@ -1,0 +1,51 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "llvm-clangcl-ninja-release",
+      "displayName": "LLVM clang-cl / Ninja / Release",
+      "description": "Windows LLVM build using the MSVC ABI and the shared MSVC CRT.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/llvm-clangcl-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "IOQ3_ENABLE_WARNINGS": "OFF",
+        "CMAKE_C_COMPILER": "clang-cl.exe",
+        "CMAKE_RC_COMPILER": "llvm-rc.exe",
+        "CMAKE_ASM_MASM_COMPILER": "llvm-ml.exe",
+        "CMAKE_ASM_MASM_FLAGS": "--m64",
+        "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreadedDLL",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "llvm-clang-ninja-release",
+      "displayName": "LLVM clang / Ninja / Release",
+      "description": "Windows LLVM build using GNU-style Clang flags and the MSVC ABI.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/llvm-clang-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "IOQ3_ENABLE_WARNINGS": "OFF",
+        "CMAKE_C_COMPILER": "clang.exe",
+        "CMAKE_RC_COMPILER": "llvm-rc.exe",
+        "CMAKE_ASM_MASM_COMPILER": "llvm-ml.exe",
+        "CMAKE_ASM_MASM_FLAGS": "--m64",
+        "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreadedDLL",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "llvm-clangcl-ninja-release",
+      "configurePreset": "llvm-clangcl-ninja-release",
+      "jobs": 32
+    },
+    {
+      "name": "llvm-clang-ninja-release",
+      "configurePreset": "llvm-clang-ninja-release",
+      "jobs": 32
+    }
+  ]
+}

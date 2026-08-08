@@ -1,6 +1,7 @@
 # MSVC compiler specific settings
 
-if(NOT CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+if(NOT CMAKE_C_COMPILER_ID STREQUAL "MSVC" AND
+   NOT CMAKE_C_SIMULATE_ID STREQUAL "MSVC")
     return()
 endif()
 
@@ -9,21 +10,40 @@ include(utils/arch)
 if(ARCH MATCHES "x86" OR ARCH MATCHES "x86_64")
     enable_language(ASM_MASM)
 
-    set(ASM_SOURCES
-        ${SOURCE_DIR}/asm/snapvector.asm
-        ${SOURCE_DIR}/asm/ftola.asm
-    )
+    if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+        # clang-cl cannot assemble the MASM snapvector/ftola sources with
+        # GNU-style inline assembly available in the corresponding C files.
+        set(ASM_SOURCES
+            ${SOURCE_DIR}/asm/snapvector.c
+            ${SOURCE_DIR}/asm/ftola.c
+        )
+    else()
+        set(ASM_SOURCES
+            ${SOURCE_DIR}/asm/snapvector.asm
+            ${SOURCE_DIR}/asm/ftola.asm
+        )
+    endif()
 endif()
 
 if(ARCH MATCHES "x86_64")
     list(APPEND ASM_SOURCES ${SOURCE_DIR}/asm/vm_x86_64.asm)
-    set_source_files_properties(
-        ${ASM_SOURCES}
-        PROPERTIES COMPILE_DEFINITIONS "idx64")
+    if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+        set_source_files_properties(
+            ${SOURCE_DIR}/asm/vm_x86_64.asm
+            PROPERTIES COMPILE_DEFINITIONS "idx64")
+    else()
+        set_source_files_properties(
+            ${ASM_SOURCES}
+            PROPERTIES COMPILE_DEFINITIONS "idx64")
+    endif()
 endif()
 
 # Baseline warnings
-add_compile_options("$<$<COMPILE_LANGUAGE:C>:/W4>")
+if(IOQ3_ENABLE_WARNINGS)
+    add_compile_options("$<$<COMPILE_LANGUAGE:C>:/W4>")
+else()
+    add_compile_options("$<$<COMPILE_LANGUAGE:C>:/W0>")
+endif()
 
 # C4267: 'var' : conversion from 'size_t' to 'type', possible loss of data
 # There are way too many of these to realistically deal with them
