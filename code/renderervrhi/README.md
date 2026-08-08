@@ -38,13 +38,22 @@ drawing every batch. Per-frame visible cluster/batch/index counts are reported a
 developer level, or every frame at `PRINT_ALL` with `r_vrhi_cullDebug 1`.
 A bounded first-stage shader-script diffuse lookup is supported for BSP maps:
 `scripts/*.shader` is scanned once per map, matching BSP shader names and taking
-the first non-special `map`/`clampmap` image stage into a copied cache. This
-is not full Quake shader/material parity; deform, fog, blend, additional
-stage/material semantics, PK3 material stages, area/door masking, and
-corresponding renderer parity remain unsupported and fall back to the existing
-lightmap/solid path. Script file count, per-file/aggregate text,
+the first non-special `map`/`clampmap` image stage into a copied cache. A stage
+is accepted only when its semantics match the fixed opaque diffuse pass: the
+default-value statements `blendFunc GL_ONE GL_ZERO` (exactly that pair),
+`rgbGen identity`, `alphaGen identity`, `depthWrite`, and
+`depthFunc lequal`/`less` are validated token-for-token (arguments are checked
+and a statement can never read past its stage), while alpha/additive blends,
+tcGen/tcMod variants, deform/fog/animMap/videoMap/normal/specular/portal/sky,
+and any malformed or incomplete sequence keep the shader on the existing
+lightmap/solid path. Multi-stage or multi-map shaders are never faked: only the
+first non-special `map`/`clampmap` TGA/JPG/JPEG/PNG candidate is used. This is
+not full Quake shader/material parity; PK3 material stages, area/door masking,
+and corresponding renderer parity remain unsupported and fall back to the
+existing lightmap/solid path. Script file count, per-file/aggregate text,
 token, candidate image, and decoded image memory are bounded, so malformed or
-oversized input is rejected safely.
+oversized input is rejected safely. The dependency-free parser lives in
+`vrhi_shader_script.h` and is covered by `tests/vrhi_shader_script_test.cpp`.
 
 Dynamic lights (`AddLightToScene`/`AddAdditiveLightToScene`) are stored as
 validated per-scene point lights under the engine's strict `MAX_DLIGHTS` cap

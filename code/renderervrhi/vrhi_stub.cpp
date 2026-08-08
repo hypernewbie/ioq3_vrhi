@@ -51,6 +51,7 @@
 #include "renderervrhi/vrhi_dlight.h"
 #include "renderervrhi/vrhi_font.h"
 #include "renderervrhi/vrhi_skin.h"
+#include "renderervrhi/vrhi_shader_script.h"
 
 // vrhi.h is the public header for the copied prebuilt VRHI library.  The
 // implementation deliberately uses only its device, swapchain, state,
@@ -358,8 +359,8 @@ static const size_t VRHI_MAX_WORLD_DIFFUSE_BYTES = 64u * 1024u * 1024u;
 static const int VRHI_MAX_SHADER_FILES = 256;
 static const size_t VRHI_MAX_SHADER_FILE_BYTES = 512u * 1024u;
 static const size_t VRHI_MAX_SHADER_TEXT_BYTES = 8u * 1024u * 1024u;
-static const size_t VRHI_MAX_SHADER_TOKENS = 131072;
-static const size_t VRHI_MAX_SHADER_TOKEN_BYTES = 1024;
+// Token count/length bounds now live in vrhi_shader_script.h alongside the
+// tokenizer that enforces them.
 // PVS cull state is a bounded, decoded CPU copy of the BSP node/leaf/plane/
 // leafsurface/visibility lumps. Normal Quake 3 maps stay far below these caps;
 // exceeding a cap disables culling (all-visible fallback) instead of allocating
@@ -2452,115 +2453,12 @@ static int VRHI_ReadLeafSurface(const byte *lumpData, int index) {
 	return LittleLong(disk);
 }
 
-static bool VRHI_ResolveDirectImagePath(const char *name, std::string *resolved) {
-	if (resolved != nullptr) resolved->clear();
-	if (name == nullptr || resolved == nullptr) return false;
-	size_t length = 0;
-	while (length < MAX_QPATH && name[length] != '\0') ++length;
-	if (length == 0 || length >= MAX_QPATH || name[0] == '/' || name[0] == '\\') return false;
-	std::string path(name, length);
-	if (path.find("..") != std::string::npos) return false;
-	const size_t slash = path.find_last_of("/\\");
-	const size_t dot = path.find_last_of('.');
-	const bool hasExtension = dot != std::string::npos &&
-		(slash == std::string::npos || dot > slash) && dot + 1 < path.size();
-	if (hasExtension) {
-		std::string ext = path.substr(dot + 1);
-		for (char &ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-		if (ext != "tga" && ext != "jpg" && ext != "jpeg" && ext != "png") return false;
-	}
-	// A bare name is intentionally retained as-is. The bounded loader below
-	// probes the four supported suffixes; explicit extensions are never rewritten.
-	*resolved = std::move(path);
-	return true;
-}
-
-struct VRHI_ShaderScriptToken {
-	std::string text;
-};
-
 static std::string VRHI_LowerASCII(const std::string &text) {
 	std::string lower = text;
 	for (char &ch : lower) {
 		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
 	}
 	return lower;
-}
-
-static bool VRHI_ShaderTokenIs(const VRHI_ShaderScriptToken &token,
-	const char *value) {
-	return VRHI_LowerASCII(token.text) == value;
-}
-
-static bool VRHI_TokenizeShaderScript(const byte *data, size_t size,
-	std::vector<VRHI_ShaderScriptToken> *tokens) {
-	if (data == nullptr || tokens == nullptr) return false;
-	tokens->clear();
-	size_t cursor = 0;
-	while (cursor < size) {
-		const unsigned char ch = data[cursor];
-		if (std::isspace(ch) || ch == '\0') {
-			++cursor;
-			continue;
-		}
-		if (ch == '/' && cursor + 1 < size && data[cursor + 1] == '/') {
-			cursor += 2;
-			while (cursor < size && data[cursor] != '\n') ++cursor;
-			continue;
-		}
-		if (ch == '/' && cursor + 1 < size && data[cursor + 1] == '*') {
-			cursor += 2;
-			bool closed = false;
-			while (cursor + 1 < size) {
-				if (data[cursor] == '*' && data[cursor + 1] == '/') {
-					cursor += 2;
-					closed = true;
-					break;
-				}
-				++cursor;
-			}
-			if (!closed) return false;
-			continue;
-		}
-		if (tokens->size() >= VRHI_MAX_SHADER_TOKENS) return false;
-		VRHI_ShaderScriptToken token;
-		if (ch == '{' || ch == '}') {
-			token.text.assign(1, static_cast<char>(ch));
-			++cursor;
-		} else if (ch == '"') {
-			++cursor;
-			while (cursor < size && data[cursor] != '"') {
-				if (data[cursor] == '\\' && cursor + 1 < size) ++cursor;
-				if (cursor >= size || token.text.size() >= VRHI_MAX_SHADER_TOKEN_BYTES) return false;
-				token.text.push_back(static_cast<char>(data[cursor++]));
-			}
-			if (cursor >= size) return false;
-			++cursor;
-		} else {
-			while (cursor < size && !std::isspace(data[cursor]) &&
-				data[cursor] != '{' && data[cursor] != '}') {
-				if (token.text.size() >= VRHI_MAX_SHADER_TOKEN_BYTES) return false;
-				token.text.push_back(static_cast<char>(data[cursor++]));
-			}
-		}
-		tokens->push_back(std::move(token));
-	}
-	return true;
-}
-
-static bool VRHI_ShaderPathIsSafe(const std::string &path) {
-	if (path.empty() || path.size() >= MAX_QPATH || path[0] == '/' ||
-		path[0] == '\\' || path.find(':') != std::string::npos) return false;
-	size_t begin = 0;
-	while (begin <= path.size()) {
-		const size_t end = path.find('/', begin);
-		const std::string part = path.substr(begin,
-			end == std::string::npos ? std::string::npos : end - begin);
-		if (part.empty() || part == "." || part == "..") return false;
-		if (end == std::string::npos) break;
-		begin = end + 1;
-	}
-	return true;
 }
 
 static bool VRHI_ResolveShaderScriptFile(const char *fileName,
@@ -2576,84 +2474,6 @@ static bool VRHI_ResolveShaderScriptFile(const char *fileName,
 	if (lower.size() < 7 || lower.compare(lower.size() - 7, 7, ".shader") != 0 ||
 		name.size() + 8 >= MAX_QPATH) return false;
 	*resolved = "scripts/" + name;
-	return true;
-}
-
-static bool VRHI_ShaderTokenIsUnsupported(const VRHI_ShaderScriptToken &token) {
-	const std::string lower = VRHI_LowerASCII(token.text);
-	static const char *unsupported[] = {
-		"blendfunc", "blend", "deform", "fogparms", "foggen",
-		"alphafunc", "alphagen", "rgbgen", "tcgen", "tcmod",
-		"animmap", "videomap", "normalmap", "specularmap", "depthwrite",
-		"depthfunc", "polygonoffset", "portal", "skyparms"
-	};
-	for (const char *value : unsupported) {
-		if (lower == value) return true;
-	}
-	return false;
-}
-
-static bool VRHI_ParseShaderBlock(const std::vector<VRHI_ShaderScriptToken> &tokens,
-	size_t begin, size_t end, std::string *candidate) {
-	if (candidate != nullptr) candidate->clear();
-	if (candidate == nullptr || begin >= end || end > tokens.size()) return false;
-	bool found = false;
-	for (size_t i = begin; i < end;) {
-		if (tokens[i].text != "{") {
-			if (VRHI_ShaderTokenIsUnsupported(tokens[i])) return false;
-			++i;
-			continue;
-		}
-		const size_t stageBegin = ++i;
-		int depth = 1;
-		while (i < end && depth > 0) {
-			if (tokens[i].text == "{") ++depth;
-			else if (tokens[i].text == "}") --depth;
-			++i;
-		}
-		if (depth != 0) return false;
-		const size_t stageEnd = i - 1;
-		for (size_t j = stageBegin; j < stageEnd; ++j) {
-			if (VRHI_ShaderTokenIsUnsupported(tokens[j])) return false;
-			if (!VRHI_ShaderTokenIs(tokens[j], "map") &&
-				!VRHI_ShaderTokenIs(tokens[j], "clampmap")) continue;
-			if (j + 1 >= stageEnd) return false;
-			const std::string &texture = tokens[++j].text;
-			if (!texture.empty() && texture[0] == '$') continue;
-			if (!VRHI_ShaderPathIsSafe(texture) ||
-				texture.find('\\') != std::string::npos) return false;
-			std::string path;
-			if (found || !VRHI_ResolveDirectImagePath(texture.c_str(), &path)) return false;
-			*candidate = std::move(path);
-			found = true;
-		}
-	}
-	return found;
-}
-
-static bool VRHI_ParseShaderScript(const byte *data, size_t size,
-	const std::unordered_map<std::string, bool> &wanted,
-	std::unordered_map<std::string, std::string> *results) {
-	std::vector<VRHI_ShaderScriptToken> tokens;
-	if (!VRHI_TokenizeShaderScript(data, size, &tokens) || results == nullptr) return false;
-	for (size_t i = 0; i < tokens.size();) {
-		const std::string shaderName = VRHI_LowerASCII(tokens[i++].text);
-		if (i >= tokens.size() || tokens[i].text != "{") continue;
-		const size_t bodyBegin = ++i;
-		int depth = 1;
-		while (i < tokens.size() && depth > 0) {
-			if (tokens[i].text == "{") ++depth;
-			else if (tokens[i].text == "}") --depth;
-			++i;
-		}
-		if (depth != 0) return false;
-		const size_t bodyEnd = i - 1;
-		if (wanted.find(shaderName) == wanted.end()) continue;
-		std::string path;
-		if (VRHI_ParseShaderBlock(tokens, bodyBegin, bodyEnd, &path)) {
-			results->emplace(shaderName, std::move(path));
-		}
-	}
 	return true;
 }
 
