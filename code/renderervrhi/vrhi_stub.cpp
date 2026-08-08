@@ -48,6 +48,7 @@
 #include "renderervrhi/vrhi_tga_decode.h"
 #include "renderervrhi/vrhi_image_decode.h"
 #include "renderervrhi/vrhi_dlight.h"
+#include "renderervrhi/vrhi_font.h"
 
 // vrhi.h is the public header for the copied prebuilt VRHI library.  The
 // implementation deliberately uses only its device, swapchain, state,
@@ -179,6 +180,24 @@ static std::unordered_map<qhandle_t, size_t> g_uiTextureByHandle;
 static std::unordered_map<qhandle_t, bool> g_uiTextureAttempts;
 static std::vector<byte> g_worldLightmapPixels;
 
+// Cinematic frames arrive as transient RGBA buffers (cols x rows x 4 bytes)
+// through UploadCinematic/DrawStretchRaw. Only the GPU texture is retained
+// under the strict client-slot cap and dimension/byte caps below; the caller's
+// frame pointer is copied for the upload and never kept, so no unbounded frame
+// data is retained. Slots are destroyed on Shutdown(qfalse) restart and
+// Shutdown(qtrue) final teardown and reset on no-device failures.
+static const int VRHI_MAX_CINEMATIC_CLIENTS = 8;
+static const int VRHI_MAX_CINEMATIC_DIMENSION = 2048;
+static const size_t VRHI_MAX_CINEMATIC_FRAME_BYTES = 16u * 1024u * 1024u;
+struct VRHI_CinematicTexture {
+	vhTexture texture = VRHI_INVALID_HANDLE;
+	int width = 0;
+	int height = 0;
+	bool uploaded = false;
+};
+static std::vector<VRHI_CinematicTexture> g_cinematicTextures(
+	VRHI_MAX_CINEMATIC_CLIENTS);
+
 // MD3 is intentionally a data-only model slice: compressed positions/normals
 // and material UVs are retained, while normal decoding/lighting and shader
 // stages remain outside this renderer's scope. The limits below are independent of
@@ -252,6 +271,7 @@ static bool g_worldLightmapAvailable = false;
 static bool g_worldLoaded = false;
 static bool g_worldShaderInitialized = false;
 static void VRHI_UploadUITextures(void);
+static void VRHI_DestroyCinematicTextures(void);
 static bool VRHI_FiniteVec3(const float *v);
 static bool VRHI_FiniteEntity(const refEntity_t &entity);
 static void VRHI_DestroySceneResources(bool clearSubmissions);
@@ -1370,6 +1390,27 @@ static void VRHI_DestroyUITextures(bool clearData) {
 	}
 }
 
+static void VRHI_DestroyCinematicTextures(void) {
+	// Cinematic slots retain only GPU textures (never frame data), so this is
+	// a full reset on both restart and final shutdown. Slots stay allocated so
+	// out-of-range client indices remain a strict no-op.
+	if (g_deviceInitialized) {
+		vhFinish();
+	}
+	for (VRHI_CinematicTexture &slot : g_cinematicTextures) {
+		if (slot.texture != VRHI_INVALID_HANDLE) {
+			vhDestroyTexture(slot.texture);
+			slot.texture = VRHI_INVALID_HANDLE;
+		}
+		slot.width = 0;
+		slot.height = 0;
+		slot.uploaded = false;
+	}
+	if (g_deviceInitialized) {
+		vhFinish();
+	}
+}
+
 static void VRHI_DestroyMD3Resources(bool clearData) {
 	if (!clearData) return;
 	g_md3Models.clear();
@@ -1555,6 +1596,7 @@ static void VRHI_Shutdown(qboolean destroyWindow) {
 		VRHI_DestroyWorldResources(true);
 		if (g_deviceInitialized) {
 			VRHI_DestroyUITextures(false);
+			VRHI_DestroyCinematicTextures();
 			vhFinish();
 		}
 		g_frameState = vhState();
@@ -1589,6 +1631,7 @@ static void VRHI_Shutdown(qboolean destroyWindow) {
 	VRHI_DestroyWorldResources(true);
 	VRHI_DestroyUI();
 	VRHI_DestroyMD3Resources(true);
+	VRHI_DestroyCinematicTextures();
 	if (g_deviceInitialized) {
 		vhFinish();
 		vhShutdown(false);
@@ -3972,8 +4015,8 @@ static void VRHI_SetColor(const float *rgba) {
 	}
 	g_uiColor = glm::vec4(rgba[0], rgba[1], rgba[2], rgba[3]);
 }
-static void VRHI_DrawStretchPic(float x, float y, float w, float h,
-	float s1, float t1, float s2, float t2, qhandle_t shader) {
+static void VRHI_DrawUIRect(float x, float y, float w, float h,
+	float s1, float t1, float s2, float t2, vhTexture texture) {
 	if (!g_deviceInitialized || !g_uiInitialized || !g_frameBackbufferReady ||
 		g_frameBackbuffer == VRHI_INVALID_HANDLE || g_frameViewportWidth <= 0 ||
 		g_frameViewportHeight <= 0 || !std::isfinite(x) || !std::isfinite(y) ||
@@ -3989,12 +4032,8 @@ static void VRHI_DrawStretchPic(float x, float y, float w, float h,
 		h / (float)g_frameViewportHeight);
 	const bool validUV = std::isfinite(s1) && std::isfinite(t1) &&
 		std::isfinite(s2) && std::isfinite(t2);
-	const std::unordered_map<qhandle_t, size_t>::const_iterator found =
-		g_uiTextureByHandle.find(shader);
 	const bool textured = validUV && !g_uiTexturedProgram.empty() &&
-		found != g_uiTextureByHandle.end() &&
-		found->second < g_uiTextures.size() &&
-		g_uiTextures[found->second].texture != VRHI_INVALID_HANDLE;
+		texture != VRHI_INVALID_HANDLE;
 	const glm::vec4 uv(s1, t1, s2, t2);
 	g_uiState.SetProgram(textured ? g_uiTexturedProgram : g_uiProgram)
 		.SetUniform(0, { "ui_rect", { rect } })
@@ -4002,7 +4041,6 @@ static void VRHI_DrawStretchPic(float x, float y, float w, float h,
 		.SetUniform(2, { "ui_color", { g_uiColor } });
 	g_uiState.SetTextures({}).SetSamplers({});
 	if (textured) {
-		const vhTexture texture = g_uiTextures[found->second].texture;
 		g_uiState.SetTexture(0, { "ui_texture", 0, texture })
 			.SetSampler(0, { "ui_sampler", 0,
 				VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
@@ -4016,31 +4054,167 @@ static void VRHI_DrawStretchPic(float x, float y, float w, float h,
 		g_uiDrawSubmitted = true;
 	} else {
 		VRHI_Printf(PRINT_WARNING,
-			"renderer_vrhi: UI draw vhSetState failed (shader=%d textured=%s)\n",
-			static_cast<int>(shader), textured ? "yes" : "no");
+			"renderer_vrhi: UI draw vhSetState failed (textured=%s)\n",
+			textured ? "yes" : "no");
 	}
 }
+
+static void VRHI_DrawStretchPic(float x, float y, float w, float h,
+	float s1, float t1, float s2, float t2, qhandle_t shader) {
+	// Missing/unsupported handles keep the existing solid-color fallback
+	// (texture == VRHI_INVALID_HANDLE), preserving DrawStretchPic semantics.
+	vhTexture texture = VRHI_INVALID_HANDLE;
+	const std::unordered_map<qhandle_t, size_t>::const_iterator found =
+		g_uiTextureByHandle.find(shader);
+	if (found != g_uiTextureByHandle.end() &&
+		found->second < g_uiTextures.size()) {
+		texture = g_uiTextures[found->second].texture;
+	}
+	VRHI_DrawUIRect(x, y, w, h, s1, t1, s2, t2, texture);
+}
+
+// Uploads one RGBA cinematic frame (cols x rows x 4 bytes) to the retained
+// GPU texture of a bounded client slot. The frame pointer is copied into the
+// upload buffer and never retained. Mirrors the GL2 semantics: the texture is
+// (re)created whenever the slot is missing or its dimensions change, and an
+// existing matching texture is updated only when dirty is true.
+static void VRHI_UploadCinematicFrame(int cols, int rows, const byte *data,
+	int client, qboolean dirty) {
+	if (client < 0 || client >= VRHI_MAX_CINEMATIC_CLIENTS) {
+		VRHI_Printf(PRINT_DEVELOPER,
+			"renderer_vrhi: cinematic client %d outside the %d-slot cap; dropped\n",
+			client, VRHI_MAX_CINEMATIC_CLIENTS);
+		return;
+	}
+	if (data == nullptr || cols <= 0 || rows <= 0) {
+		return;
+	}
+	if (cols > VRHI_MAX_CINEMATIC_DIMENSION ||
+		rows > VRHI_MAX_CINEMATIC_DIMENSION) {
+		VRHI_Printf(PRINT_DEVELOPER,
+			"renderer_vrhi: cinematic frame %dx%d exceeds the %dx%d dimension cap; dropped\n",
+			cols, rows, VRHI_MAX_CINEMATIC_DIMENSION,
+			VRHI_MAX_CINEMATIC_DIMENSION);
+		return;
+	}
+	const uint64_t frameBytes =
+		static_cast<uint64_t>(cols) * static_cast<uint64_t>(rows) * 4u;
+	if (frameBytes > VRHI_MAX_CINEMATIC_FRAME_BYTES) {
+		VRHI_Printf(PRINT_DEVELOPER,
+			"renderer_vrhi: cinematic frame %dx%d (%llu RGBA bytes) exceeds the %zu-byte cap; dropped\n",
+			cols, rows, static_cast<unsigned long long>(frameBytes),
+			VRHI_MAX_CINEMATIC_FRAME_BYTES);
+		return;
+	}
+	if (!g_deviceInitialized) {
+		return;
+	}
+
+	VRHI_CinematicTexture &slot = g_cinematicTextures[static_cast<size_t>(client)];
+	if (slot.texture == VRHI_INVALID_HANDLE || slot.width != cols ||
+		slot.height != rows) {
+		// Create (or recreate at a new size) the slot texture with this frame.
+		if (slot.texture != VRHI_INVALID_HANDLE) {
+			vhDestroyTexture(slot.texture);
+			vhFinish();
+			slot.texture = VRHI_INVALID_HANDLE;
+		}
+		slot.texture = vhAllocTexture();
+		if (slot.texture == VRHI_INVALID_HANDLE) {
+			VRHI_Printf(PRINT_WARNING,
+				"renderer_vrhi: cinematic client %d texture allocation failed\n",
+				client);
+			return;
+		}
+		vhMem *mem = new vhMem(static_cast<size_t>(frameBytes));
+		std::memcpy(mem->data(), data, mem->size());
+		const int32_t errorsBefore =
+			g_vhErrorCounter.load(std::memory_order_relaxed);
+		vhCreateTexture2D(slot.texture, "VRHI_Cinematic",
+			glm::ivec2(cols, rows), 1, nvrhi::Format::RGBA8_UNORM,
+			VRHI_TEXTURE_NONE | VRHI_SAMPLER_NONE, mem);
+		vhFinish();
+		if (g_vhErrorCounter.load(std::memory_order_relaxed) != errorsBefore) {
+			VRHI_Printf(PRINT_WARNING,
+				"renderer_vrhi: cinematic client %d upload failed; slot disabled\n",
+				client);
+			vhDestroyTexture(slot.texture);
+			vhFinish();
+			slot.texture = VRHI_INVALID_HANDLE;
+			slot.width = 0;
+			slot.height = 0;
+			slot.uploaded = false;
+			return;
+		}
+		slot.width = cols;
+		slot.height = rows;
+		slot.uploaded = true;
+		VRHI_Printf(PRINT_ALL,
+			"renderer_vrhi: cinematic client %d texture created (%dx%d RGBA)\n",
+			client, cols, rows);
+		return;
+	}
+
+	if (!dirty) {
+		// dirty=false with a matching texture keeps the last uploaded frame;
+		// a null data pointer is therefore safe here by construction.
+		return;
+	}
+	vhMem *mem = new vhMem(static_cast<size_t>(frameBytes));
+	std::memcpy(mem->data(), data, mem->size());
+	const int32_t errorsBefore =
+		g_vhErrorCounter.load(std::memory_order_relaxed);
+	vhUpdateTexture(slot.texture, 0, 0, 1, 1, mem);
+	vhFinish();
+	if (g_vhErrorCounter.load(std::memory_order_relaxed) != errorsBefore) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: cinematic client %d frame update failed; slot disabled\n",
+			client);
+		vhDestroyTexture(slot.texture);
+		vhFinish();
+		slot.texture = VRHI_INVALID_HANDLE;
+		slot.width = 0;
+		slot.height = 0;
+		slot.uploaded = false;
+	}
+}
+
 static void VRHI_DrawStretchRaw(int x, int y, int w, int h, int cols,
 	int rows, const byte *data, int client, qboolean dirty) {
-	(void)x;
-	(void)y;
-	(void)w;
-	(void)h;
-	(void)cols;
-	(void)rows;
-	(void)data;
-	(void)client;
-	(void)dirty;
+	if (client < 0 || client >= VRHI_MAX_CINEMATIC_CLIENTS) {
+		return;
+	}
+	VRHI_CinematicTexture &slot =
+		g_cinematicTextures[static_cast<size_t>(client)];
+	// DrawStretchRaw must be self-sufficient (the GL1 path also uploads): if
+	// the slot has no usable texture or its dimensions no longer match the
+	// current frame, (re)upload from this frame's data first.
+	if (slot.texture == VRHI_INVALID_HANDLE || !slot.uploaded ||
+		slot.width != cols || slot.height != rows) {
+		if (data == nullptr) {
+			return;
+		}
+		VRHI_UploadCinematicFrame(cols, rows, data, client, qtrue);
+	}
+	if (slot.texture == VRHI_INVALID_HANDLE || !slot.uploaded) {
+		return;
+	}
+	// Without the textured UI program there is nothing to sample; do not draw
+	// a solid-color box for video.
+	if (g_uiTexturedProgram.empty()) {
+		return;
+	}
+	VRHI_DrawUIRect(static_cast<float>(x), static_cast<float>(y),
+		static_cast<float>(w), static_cast<float>(h),
+		0.0f, 0.0f, 1.0f, 1.0f, slot.texture);
 }
 static void VRHI_UploadCinematic(int w, int h, int cols, int rows,
 	const byte *data, int client, qboolean dirty) {
+	// w/h are the on-screen dimensions and are ignored, matching the GL
+	// renderers; cols/rows are the RGBA frame dimensions actually uploaded.
 	(void)w;
 	(void)h;
-	(void)cols;
-	(void)rows;
-	(void)data;
-	(void)client;
-	(void)dirty;
+	VRHI_UploadCinematicFrame(cols, rows, data, client, dirty);
 }
 static int VRHI_MarkFragments(int numPoints, const vec3_t *points,
 	const vec3_t projection, int maxPoints, vec3_t pointBuffer,
@@ -4094,11 +4268,63 @@ static void VRHI_ModelBounds(qhandle_t model, vec3_t mins, vec3_t maxs) {
 }
 static void VRHI_RegisterFont(const char *fontName, int pointSize,
 	fontInfo_t *font) {
-	(void)fontName;
-	(void)pointSize;
-	if (font != nullptr) {
-		std::memset(font, 0, sizeof(*font));
+	// Fixed-cell fallback registration over the classic gfx/2d/bigchars
+	// atlas (256x256, 16x16 grid of fixed 16x16-pixel cells). This is NOT
+	// proportional or FreeType font parity: every glyph shares the single
+	// atlas shader handle and identical fixed metrics; the bounded point
+	// size only scales the fixed cell via glyphScale.
+	if (font == nullptr) {
+		return;
 	}
+	std::memset(font, 0, sizeof(*font));
+	VRHI_CopyString(font->name, sizeof(font->name),
+		fontName != nullptr ? fontName : "", "gfx/2d/bigchars");
+	font->glyphScale = VRHI_FontGlyphScale(pointSize);
+
+	const qhandle_t atlas = VRHI_RegisterShaderNoMip("gfx/2d/bigchars");
+	if (atlas == 0) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: RegisterFont('%s', %d): bigchars atlas shader registration failed; empty font fallback\n",
+			font->name, pointSize);
+		return;
+	}
+	// Without a decoded atlas image the glyph handles would draw solid boxes.
+	// Treat that as registration failure and keep the empty (invisible text)
+	// fallback so the UI never renders garbage.
+	if (g_uiTextureByHandle.find(atlas) == g_uiTextureByHandle.end()) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: RegisterFont('%s', %d): bigchars atlas image unavailable; empty font fallback\n",
+			font->name, pointSize);
+		return;
+	}
+
+	int populated = 0;
+	for (int cp = 0; cp < 256; ++cp) {
+		glyphInfo_t &glyph = font->glyphs[cp];
+		float s = 0.0f, t = 0.0f, s2 = 0.0f, t2 = 0.0f;
+		if (!VRHI_BigCharsCell(cp, &s, &t, &s2, &t2)) {
+			continue; // unreachable for 0..255; keeps the glyph zeroed otherwise
+		}
+		glyph.height = VRHI_FONT_GLYPH_HEIGHT;
+		glyph.top = VRHI_FONT_GLYPH_TOP;
+		glyph.bottom = VRHI_FONT_GLYPH_BOTTOM;
+		glyph.pitch = VRHI_FONT_GLYPH_PITCH;
+		glyph.xSkip = VRHI_FONT_GLYPH_XSKIP;
+		glyph.imageWidth = VRHI_FONT_GLYPH_IMAGE_WIDTH;
+		glyph.imageHeight = VRHI_FONT_GLYPH_IMAGE_HEIGHT;
+		glyph.s = s;
+		glyph.t = t;
+		glyph.s2 = s2;
+		glyph.t2 = t2;
+		glyph.glyph = atlas; // stable shared atlas handle for all codepoints
+		VRHI_CopyString(glyph.shaderName, sizeof(glyph.shaderName),
+			"gfx/2d/bigchars", "");
+		++populated;
+	}
+	VRHI_Printf(PRINT_ALL,
+		"renderer_vrhi: RegisterFont('%s', %d): bigchars fixed-cell fallback glyphs=%d scale=%g\n",
+		font->name, VRHI_FontClampPointSize(pointSize), populated,
+		static_cast<double>(font->glyphScale));
 }
 static void VRHI_RemapShader(const char *oldShader, const char *newShader,
 	const char *offsetTime) {
@@ -4139,6 +4365,10 @@ static qboolean VRHI_InPVS(const vec3_t p1, const vec3_t p2) {
 }
 static void VRHI_TakeVideoFrame(int h, int w, byte *captureBuffer,
 	byte *encodeBuffer, qboolean motionJpeg) {
+	// Deliberate, documented no-op: the renderer owns no framebuffer readback
+	// video-capture path. The engine's CL_TakeVideoFrame (cl_avi.c) passes
+	// caller-owned buffers; leaving them untouched is the safe fallback and
+	// matches the previous slice behavior exactly (no AVI capture support).
 	(void)h;
 	(void)w;
 	(void)captureBuffer;
@@ -4209,6 +4439,6 @@ extern "C" Q_EXPORT refexport_t *QDECL GetRefAPI(int apiVersion,
 	exports.TakeVideoFrame = VRHI_TakeVideoFrame;
 
 	VRHI_Printf(PRINT_ALL,
-		"renderer_vrhi: loaded (clear/present + bounded sprite/beam/poly scenes + direct-image UI + lightmapped/image PVS-culled BSP world)\n");
+		"renderer_vrhi: loaded (clear/present + bounded sprite/beam/poly scenes + direct-image UI + fixed-cell bigchars fonts + bounded RGBA cinematics + lightmapped/image PVS-culled BSP world)\n");
 	return &exports;
 }

@@ -80,12 +80,36 @@ after the static world. Registered direct image handles are reused when
 available, with a solid fallback. Scene CPU submissions and renderer-owned
 transient vertex/index buffers reset on ClearScene and are destroyed on restart
 and shutdown. RT_MODEL (including MD3 parsing and inline BSP submodels), rail,
-lightning, portal, fonts, cinematics, and video-capture resources remain
-explicit safe no-ops; no fake model parity is attempted. Shader registration admits bounded TGA/JPG/JPEG/PNG names (bare
+lightning, portal, and video-capture resources remain explicit safe no-ops; no
+fake model parity is attempted.
+
+`RegisterFont` is a documented fixed-cell fallback, NOT proportional/FreeType
+parity: it registers the classic `gfx/2d/bigchars` atlas (256x256, 16x16 grid
+of fixed 16x16-pixel cells, mapped exactly like SCR_DrawSmallChar) through
+`RegisterShaderNoMip`, populates all 256 `fontInfo_t` glyphs with a stable
+shared atlas handle, fixed height/top/bottom/pitch/xSkip/image dimensions, and
+16x16-cell UVs, and computes `glyphScale` from the point size (clamped to
+[8,128], 48 points = 1:1). If the atlas shader or its decoded image is
+unavailable the font stays an empty (invisible-text) fallback instead of
+drawing solid boxes. Shader registration admits bounded TGA/JPG/JPEG/PNG names (bare
 names probe `.tga`, `.jpg`, `.jpeg`, and `.png`; explicit supported extensions are not
 rewritten); the BSP-only first-stage script lookup uses the same image resolver,
 and all other material semantics remain unsupported and use the solid UI
-fallback. Every refexport callback is populated so the client, cgame,
+fallback.
+
+Cinematics (`UploadCinematic`/`DrawStretchRaw`) upload transient RGBA frames to
+retained per-client VRHI textures under a strict small client-slot cap (8), a
+2048-per-side dimension cap, and a 16 MiB per-frame byte cap; the caller's
+frame pointer is copied for the upload and never retained, so no unbounded
+frame data is kept. Inputs are validated (positive cols/rows, non-null RGBA
+data, in-range client, caps) and `dirty=false` with a matching texture keeps
+the last frame (null data is then safe by construction). `DrawStretchRaw` is
+self-sufficient like the GL1 path: it (re)uploads when the slot is empty or the
+frame dimensions changed, then draws a full-cell textured UI rectangle through
+the same UI state/program and UV/color semantics as `DrawStretchPic`. Slots are
+destroyed on `Shutdown(qfalse)` restart, `Shutdown(qtrue)` final teardown, and
+reset on no-device failures. `TakeVideoFrame` remains an explicit, documented
+no-op (no AVI capture). Every refexport callback is populated so the client, cgame,
 and UI cannot dereference a null renderer callback. Model, skin, and unsupported
 material registrations retain stable name-to-handle mappings; eligible UI image
 pixels are retained under bounded caps for video restart while their VRHI
@@ -97,5 +121,6 @@ BGR TGA when VRHI supports the readback. The dependency-free TGA decoder lives i
 are exposed by the focused `vrhi_image_decode.h` API and use puff/libjpeg
 target-locally. The TGA decoder is exercised standalone by
 `tests/vrhi_tga_decode_test.cpp` (any C++17 compiler; no engine or third-party
-dependencies). Resize/minimize failures are reported as warnings and are not
+dependencies), and the fixed-cell font UV/scale helpers are exercised
+standalone by `tests/vrhi_font_test.cpp`. Resize/minimize failures are reported as warnings and are not
 treated as fatal initialization errors.
