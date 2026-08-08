@@ -46,6 +46,30 @@ lightmap/solid path. Script file count, per-file/aggregate text,
 token, candidate image, and decoded image memory are bounded, so malformed or
 oversized input is rejected safely.
 
+Dynamic lights (`AddLightToScene`/`AddAdditiveLightToScene`) are stored as
+validated per-scene point lights under the engine's strict `MAX_DLIGHTS` cap
+(32) and reset on `ClearScene`, restart, and shutdown; non-finite origins,
+colors, or intensity, non-positive intensity, and negative color channels are
+rejected, and color channels above 1.0 are clamped. This is bounded vertex
+modulation, NOT full Quake lightmap/shader parity: each light contributes
+`clamp(1 - dist/radius, 0, 1)^2 * color` to a vertex and the final vertex
+color is `base * (1 + clamp(add, 0, 1))`, so surfaces brighten with a
+finite-distance falloff and never receive unbounded values. Before the static
+world draws, the existing world vertex color attribute is recomputed from its
+base white using this modulation through a persistent bounded scratch; only
+the color field changes, the static geometry and index buffer are never
+modified, and the update is enqueued before the draws so the same frame sees
+it. The identical modulation multiplies generated sprite/beam/poly/MD3 scene
+vertices before the dynamic upload. With no lights every path is a strict
+no-op (no CPU work, no VRHI commands). `LightForPoint` answers consistently
+from the submitted lights (byte-scale directed light plus a falloff-weighted
+direction; zeroed ambient), returning `qfalse` with zeroed outputs when no
+lights or a non-finite query point is supplied. There is no light grid, no
+shadowing, and no directionality; additive and regular lights add the same
+way, and per-frame submitted light counts are reported at developer level.
+The dependency-free math lives in `vrhi_dlight.h` and is exercised standalone
+by `tests/vrhi_dlight_test.cpp`.
+
 `Shutdown(qfalse)` flushes while retaining the device/window for a video restart;
 `Shutdown(qtrue)` finishes and destroys VRHI, input, the window, and SDL video in
 that order.

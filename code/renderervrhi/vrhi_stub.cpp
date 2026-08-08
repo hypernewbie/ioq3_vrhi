@@ -47,6 +47,7 @@
 #include "renderercommon/tr_public.h"
 #include "renderervrhi/vrhi_tga_decode.h"
 #include "renderervrhi/vrhi_image_decode.h"
+#include "renderervrhi/vrhi_dlight.h"
 
 // vrhi.h is the public header for the copied prebuilt VRHI library.  The
 // implementation deliberately uses only its device, swapchain, state,
@@ -110,6 +111,11 @@ static std::vector<polyVert_t> g_scenePolyVerts;
 static std::vector<VRHI_WorldVertex> g_sceneVertices;
 static std::vector<uint32_t> g_sceneIndexes;
 static std::vector<VRHI_SceneDraw> g_sceneDraws;
+// Per-scene dynamic point lights, validated at submission and stored under
+// the engine's strict MAX_DLIGHTS cap (tr_types.h). They are reset with the
+// rest of the scene storage in ClearScene and on restart, and modulate the
+// static world vertex color attribute plus the generated scene vertices.
+static std::vector<VRHI_DLight> g_sceneLights;
 static size_t g_sceneModelDraws = 0;
 static vhBuffer g_sceneVertexBuffer = VRHI_INVALID_HANDLE;
 static vhBuffer g_sceneIndexBuffer = VRHI_INVALID_HANDLE;
@@ -157,6 +163,10 @@ struct VRHI_WorldLeaf {
 	int32_t numLeafSurfaces = 0;
 };
 static std::vector<VRHI_WorldVertex> g_worldVertices;
+// Persistent bounded scratch for per-frame world vertex color modulation;
+// sized to the world vertex count once per map and reused, never reallocated
+// per frame. Only the color field changes; geometry stays untouched.
+static std::vector<VRHI_WorldVertex> g_worldLightedVertices;
 static std::vector<uint32_t> g_worldIndexes;
 static std::vector<VRHI_WorldBatch> g_worldBatches;
 static std::vector<VRHI_WorldDiffuseImage> g_worldDiffuseImages;
@@ -315,6 +325,9 @@ static const size_t VRHI_MAX_UI_TEXTURE_BYTES = 64u * 1024u * 1024u;
 // Scene input and generated geometry are fixed-capacity per-scene storage.
 // Add calls drop submissions at these limits rather than growing each frame.
 static const size_t VRHI_MAX_SCENE_ENTITIES = 4096u;
+// Strict per-scene dynamic light cap: the engine contract is MAX_DLIGHTS
+// (32, tr_types.h) and this renderer keeps the same bound.
+static const size_t VRHI_MAX_SCENE_LIGHTS = MAX_DLIGHTS;
 static const size_t VRHI_MAX_SCENE_POLYS = 4096u;
 static const size_t VRHI_MAX_SCENE_POLY_VERTICES = 65536u;
 static const size_t VRHI_MAX_SCENE_VERTICES = 131072u;
@@ -1052,6 +1065,7 @@ static void VRHI_DestroyWorldResources(bool clearGeometry) {
 	if (clearGeometry) {
 		g_worldPositions.clear();
 		g_worldVertices.clear();
+		g_worldLightedVertices.clear();
 		g_worldIndexes.clear();
 		g_worldBatches.clear();
 		g_worldDiffuseImages.clear();
@@ -1313,6 +1327,7 @@ static void VRHI_ResetSceneSubmissions(void) {
 	g_sceneVertices.clear();
 	g_sceneIndexes.clear();
 	g_sceneDraws.clear();
+	g_sceneLights.clear();
 	g_sceneModelDraws = 0;
 }
 
@@ -1331,6 +1346,8 @@ static void VRHI_ReserveSceneStorage(void) {
 		g_sceneIndexes.reserve(VRHI_MAX_SCENE_INDEXES);
 	if (g_sceneDraws.capacity() < VRHI_MAX_SCENE_DRAWS)
 		g_sceneDraws.reserve(VRHI_MAX_SCENE_DRAWS);
+	if (g_sceneLights.capacity() < VRHI_MAX_SCENE_LIGHTS)
+		g_sceneLights.reserve(VRHI_MAX_SCENE_LIGHTS);
 }
 
 static void VRHI_DestroyUITextures(bool clearData) {
@@ -3142,6 +3159,7 @@ static void VRHI_ClearScene(void) {
 	g_sceneVertices.clear();
 	g_sceneIndexes.clear();
 	g_sceneDraws.clear();
+	g_sceneLights.clear();
 	g_sceneModelDraws = 0;
 }
 static void VRHI_AddRefEntityToScene(const refEntity_t *entity) {
@@ -3197,9 +3215,23 @@ static void VRHI_AddPolyToScene(qhandle_t shader, int numVerts,
 		g_scenePolys.push_back(submission);
 	}
 }
+// Bounded additive modulation for one world-space position. Returns the
+// per-channel multiplier to apply to a base vertex color: 1 + add, where add
+// comes from every submitted light with finite-distance falloff and is
+// clamped to VRHI_DLIGHT_ADD_CAP. With no lights this returns exactly (1,1,1)
+// so callers are strict no-ops.
+static glm::vec3 VRHI_DLightModulation(const glm::vec3 &position) {
+	if (g_sceneLights.empty()) return glm::vec3(1.0f);
+	float add[3] = { 0.0f, 0.0f, 0.0f };
+	VRHI_DLightAdd(g_sceneLights.data(), g_sceneLights.size(),
+		position.x, position.y, position.z, add);
+	return glm::vec3(1.0f + add[0], 1.0f + add[1], 1.0f + add[2]);
+}
+
 static int VRHI_LightForPoint(vec3_t point, vec3_t ambientLight,
 	vec3_t directedLight, vec3_t lightDir) {
-	(void)point;
+	// Always zero every output first so a failed query can never leak stale
+	// or non-finite values into the caller.
 	if (ambientLight != nullptr) {
 		std::memset(ambientLight, 0, sizeof(vec3_t));
 	}
@@ -3209,23 +3241,94 @@ static int VRHI_LightForPoint(vec3_t point, vec3_t ambientLight,
 	if (lightDir != nullptr) {
 		std::memset(lightDir, 0, sizeof(vec3_t));
 	}
-	return qfalse;
+	// No light grid exists in this renderer; the query is answered from the
+	// submitted per-scene dynamic lights only, so no lights (or a non-finite
+	// query point) is the safe qfalse fallback.
+	if (point == nullptr || !VRHI_FiniteVec3(point) || g_sceneLights.empty()) {
+		return qfalse;
+	}
+	float add[3] = { 0.0f, 0.0f, 0.0f };
+	VRHI_DLightAdd(g_sceneLights.data(), g_sceneLights.size(),
+		point[0], point[1], point[2], add);
+	if (add[0] <= 0.0f && add[1] <= 0.0f && add[2] <= 0.0f) {
+		return qfalse;
+	}
+	if (directedLight != nullptr) {
+		// Byte scale matching the light-grid contract of the GL renderers;
+		// add is capped to [0,1] so 255 is full dynamic-light brightness.
+		directedLight[0] = add[0] * 255.0f;
+		directedLight[1] = add[1] * 255.0f;
+		directedLight[2] = add[2] * 255.0f;
+	}
+	if (lightDir != nullptr) {
+		// Falloff-weighted direction toward the contributing lights. A zero
+		// direction (query exactly on a light origin, or all lights at the
+		// query point) leaves the output zeroed instead of emitting a
+		// non-finite direction.
+		glm::vec3 direction(0.0f);
+		for (const VRHI_DLight &light : g_sceneLights) {
+			const float falloff = VRHI_DLightFalloff(light,
+				point[0], point[1], point[2]);
+			if (falloff <= 0.0f) continue;
+			const glm::vec3 delta(light.origin[0] - point[0],
+				light.origin[1] - point[1], light.origin[2] - point[2]);
+			const float distSquared = glm::dot(delta, delta);
+			if (!std::isfinite(distSquared) || distSquared <= 1.0e-6f) continue;
+			const float dist = std::sqrt(distSquared);
+			if (!std::isfinite(dist) || dist <= 1.0e-6f) continue;
+			direction += delta * (falloff / dist);
+		}
+		const float length = glm::length(direction);
+		if (length > 1.0e-6f && std::isfinite(length)) {
+			lightDir[0] = direction.x / length;
+			lightDir[1] = direction.y / length;
+			lightDir[2] = direction.z / length;
+		}
+	}
+	return qtrue;
 }
+
+// Validates one dynamic light submission and stores it under the strict
+// MAX_DLIGHTS cap. Non-finite origins/colors/intensity, non-positive
+// intensity, and negative color channels are rejected; color channels above
+// 1.0 are clamped so modulation stays bounded. additive is retained for API
+// parity: vertex modulation treats both kinds identically (both add light).
+static void VRHI_AddLightToSceneCommon(const vec3_t org, float intensity,
+	float r, float g, float b, bool additive) {
+	if (org == nullptr || !VRHI_FiniteVec3(org) || !std::isfinite(intensity) ||
+		intensity <= 0.0f || !std::isfinite(r) || !std::isfinite(g) ||
+		!std::isfinite(b) || r < 0.0f || g < 0.0f || b < 0.0f) {
+		VRHI_Printf(PRINT_DEVELOPER,
+			"renderer_vrhi: dropped invalid dynamic light (non-finite or non-positive)\n");
+		return;
+	}
+	VRHI_ReserveSceneStorage();
+	if (g_sceneLights.size() >= VRHI_MAX_SCENE_LIGHTS) {
+		VRHI_Printf(PRINT_DEVELOPER,
+			"renderer_vrhi: dynamic light dropped at MAX_DLIGHTS cap (%zu)\n",
+			static_cast<size_t>(VRHI_MAX_SCENE_LIGHTS));
+		return;
+	}
+	VRHI_DLight light;
+	light.origin[0] = org[0];
+	light.origin[1] = org[1];
+	light.origin[2] = org[2];
+	light.color[0] = r > 1.0f ? 1.0f : r;
+	light.color[1] = g > 1.0f ? 1.0f : g;
+	light.color[2] = b > 1.0f ? 1.0f : b;
+	light.radius = intensity;
+	light.additive = additive;
+	g_sceneLights.push_back(light);
+}
+
 static void VRHI_AddLightToScene(const vec3_t org, float intensity,
 	float r, float g, float b) {
-	(void)org;
-	(void)intensity;
-	(void)r;
-	(void)g;
-	(void)b;
+	VRHI_AddLightToSceneCommon(org, intensity, r, g, b, false);
 }
+
 static void VRHI_AddAdditiveLightToScene(const vec3_t org, float intensity,
 	float r, float g, float b) {
-	(void)org;
-	(void)intensity;
-	(void)r;
-	(void)g;
-	(void)b;
+	VRHI_AddLightToSceneCommon(org, intensity, r, g, b, true);
 }
 static glm::mat4 VRHI_QuakeViewMatrix(const refdef_t *fd) {
 	glm::mat4 quakeView(1.0f);
@@ -3285,6 +3388,14 @@ static VRHI_WorldVertex VRHI_SceneVertex(const glm::vec3 &position,
 	vertex.lightmap = glm::vec2(0.0f);
 	vertex.lightmapLayer = -1.0f;
 	vertex.color = color;
+	// The same bounded dynamic-light modulation that updates the static world
+	// vertex colors also modulates generated sprite/beam/poly/MD3 scene
+	// vertices; with no submitted lights this is a strict no-op.
+	if (!g_sceneLights.empty()) {
+		const glm::vec3 modulation = VRHI_DLightModulation(position);
+		vertex.color = glm::vec4(color.r * modulation.r, color.g * modulation.g,
+			color.b * modulation.b, color.a);
+	}
 	return vertex;
 }
 
@@ -3638,6 +3749,29 @@ static int VRHI_CullDebugEnabled(void) {
 	return cvar != nullptr ? cvar->integer : 0;
 }
 
+// Recomputes the static world vertex color attribute from the submitted
+// per-scene dynamic lights. Only the color field changes; positions, UVs,
+// lightmap layer, and the index buffer are never touched. The persistent
+// bounded scratch is sized to the world vertex count once per map, and the
+// update is enqueued before the world draws so command ordering makes it
+// visible to the same frame. Callers skip this entirely when no lights were
+// submitted, keeping the no-light path a strict no-op with zero VRHI work.
+static void VRHI_UpdateWorldVertexLighting(void) {
+	if (!g_worldLoaded || g_worldVertices.empty() ||
+		g_worldVertexBuffer == VRHI_INVALID_HANDLE) return;
+	if (g_worldLightedVertices.size() != g_worldVertices.size()) {
+		g_worldLightedVertices.resize(g_worldVertices.size());
+	}
+	for (size_t i = 0; i < g_worldVertices.size(); ++i) {
+		g_worldLightedVertices[i] = g_worldVertices[i];
+		g_worldLightedVertices[i].color =
+			glm::vec4(VRHI_DLightModulation(g_worldVertices[i].position), 1.0f);
+	}
+	vhMem *vertices = new vhMem(g_worldLightedVertices.size() * sizeof(VRHI_WorldVertex));
+	std::memcpy(vertices->data(), g_worldLightedVertices.data(), vertices->size());
+	vhUpdateVertexBuffer(g_worldVertexBuffer, vertices, 0, g_worldLightedVertices.size());
+}
+
 static void VRHI_RenderScene(const refdef_t *fd) {
 	if (fd == nullptr || (fd->rdflags & RDF_HYPERSPACE) != 0 ||
 		!g_deviceInitialized || !g_frameBackbufferReady ||
@@ -3680,6 +3814,15 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 			g_worldCameraLeaf, g_worldCameraCluster, g_worldVisibleClusters,
 			g_worldVisibleBatches, g_worldVisibleIndexes, g_worldIndexes.size());
 	}
+	// Dynamic-light diagnostics: report the submitted per-scene light count
+	// whenever it is non-zero so developer runs can prove lights reached the
+	// renderer and were capped at MAX_DLIGHTS.
+	if (!g_sceneLights.empty()) {
+		VRHI_Printf(PRINT_DEVELOPER,
+			"renderer_vrhi: dynamic lights=%zu/%zu (bounded vertex modulation, add cap %.2f)\n",
+			g_sceneLights.size(), static_cast<size_t>(VRHI_MAX_SCENE_LIGHTS),
+			static_cast<double>(VRHI_DLIGHT_ADD_CAP));
+	}
 	const bool useLightmap = g_worldLightmapAvailable &&
 		g_worldLightmapTexture != VRHI_INVALID_HANDLE &&
 		g_worldLightmapPixelShader != VRHI_INVALID_HANDLE;
@@ -3710,6 +3853,13 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 	}
 	const vhState worldBaseState = g_worldState;
 	g_worldDrawErrorBaseline = g_vhErrorCounter.load(std::memory_order_relaxed);
+	// Per-scene dynamic lights modulate the static world vertex color
+	// attribute in place before the static world draws. With no lights this
+	// is a strict no-op; with lights, the enqueued update shares the world
+	// draw error accounting below so failures surface in EndFrame's report.
+	if (!g_sceneLights.empty() && g_worldVertexBuffer != VRHI_INVALID_HANDLE) {
+		VRHI_UpdateWorldVertexLighting();
+	}
 	bool submitted = false;
 	for (size_t batchIndex = 0; batchIndex < g_worldBatches.size(); ++batchIndex) {
 		const VRHI_WorldBatch &batch = g_worldBatches[batchIndex];
@@ -3755,9 +3905,9 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 	}
 	if (VRHI_BuildSceneGeometry(fd) && VRHI_EnsureSceneBuffers()) {
 		VRHI_Printf(PRINT_DEVELOPER,
-			"renderer_vrhi: scene submissions: entities=%zu polys=%zu modelDraws=%zu draws=%zu vertices=%zu indexes=%zu\n",
+			"renderer_vrhi: scene submissions: entities=%zu polys=%zu modelDraws=%zu draws=%zu vertices=%zu indexes=%zu lights=%zu\n",
 			g_sceneEntities.size(), g_scenePolys.size(), g_sceneModelDraws, g_sceneDraws.size(),
-			g_sceneVertices.size(), g_sceneIndexes.size());
+			g_sceneVertices.size(), g_sceneIndexes.size(), g_sceneLights.size());
 		for (const VRHI_SceneDraw &draw : g_sceneDraws) {
 			const vhTexture texture = VRHI_SceneTexture(draw.shader);
 			const bool textured = texture != VRHI_INVALID_HANDLE &&
