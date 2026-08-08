@@ -82,9 +82,11 @@ static vhShader g_worldVertexShader = VRHI_INVALID_HANDLE;
 static vhShader g_worldSolidPixelShader = VRHI_INVALID_HANDLE;
 static vhShader g_worldLightmapPixelShader = VRHI_INVALID_HANDLE;
 static vhShader g_worldDiffusePixelShader = VRHI_INVALID_HANDLE;
+static vhShader g_worldOverlayPixelShader = VRHI_INVALID_HANDLE;
 static vhProgram g_worldSolidProgram;
 static vhProgram g_worldLightmapProgram;
 static vhProgram g_worldDiffuseProgram;
+static vhProgram g_worldOverlayProgram;
 static vhState g_worldState;
 static const vhStateId g_worldStateId = 3;
 static vhBuffer g_worldVertexBuffer = VRHI_INVALID_HANDLE;
@@ -148,6 +150,10 @@ struct VRHI_WorldBatch {
 	uint32_t firstIndex = 0;
 	uint32_t indexCount = 0;
 	int diffuseImage = -1;
+	uint8_t stageCount = 0;
+	int stageImages[VRHI_SHADER_MAX_STAGES] = { -1, -1, -1, -1 };
+	uint8_t stageBlend[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_BLEND_OPAQUE,
+		VRHI_SHADER_BLEND_OPAQUE, VRHI_SHADER_BLEND_OPAQUE, VRHI_SHADER_BLEND_OPAQUE };
 };
 struct VRHI_InlineBSPModel {
 	bool valid = false;
@@ -196,9 +202,9 @@ static std::vector<VRHI_WorldDiffuseImage> g_worldDiffuseImages;
 // stale index after a map reload.
 static std::vector<VRHI_InlineBSPModel> g_inlineBSPModels;
 static std::unordered_map<qhandle_t, size_t> g_inlineBSPModelByHandle;
-// Script results are map-scoped. Values are copied qpaths, never pointers into
-// FS_ListFiles/FS_ReadFile storage; an empty value is a cached miss.
-static std::unordered_map<std::string, std::string> g_worldShaderScriptPaths;
+// Script results are map-scoped. Stage paths are copied qpaths, never pointers
+// into FS_ListFiles/FS_ReadFile storage; missing or rejected scripts are absent.
+static std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > g_worldShaderScriptStages;
 static bool g_worldShaderScriptsScanned = false;
 static std::vector<VRHI_UITexture> g_uiTextures;
 static std::unordered_map<qhandle_t, size_t> g_uiTextureByHandle;
@@ -373,9 +379,9 @@ static const int VRHI_MAX_WORLD_LIGHTMAP_LAYERS = 1024;
 static const int VRHI_MAX_WORLD_DIFFUSE_IMAGES = 256;
 static const int VRHI_MAX_WORLD_DIFFUSE_DIMENSION = 2048;
 static const size_t VRHI_MAX_WORLD_DIFFUSE_BYTES = 64u * 1024u * 1024u;
-// Shader scripts are an intentionally small first-stage lookup, not a full
-// Quake shader parser. Every list, file, aggregate text, and token stream is
-// bounded before parsing or retaining a candidate path.
+// Shader scripts are an intentionally small bounded multi-stage lookup, not a
+// full Quake shader parser. Every list, file, aggregate text, and token stream
+// is bounded before parsing or retaining candidate stage paths.
 static const int VRHI_MAX_SHADER_FILES = 256;
 static const size_t VRHI_MAX_SHADER_FILE_BYTES = 512u * 1024u;
 static const size_t VRHI_MAX_SHADER_TEXT_BYTES = 8u * 1024u * 1024u;
@@ -1122,6 +1128,17 @@ float4 main(PSInput input) : SV_Target
 }
 )";
 
+static const char *VRHI_WorldOverlayPixelSource = R"(
+Texture2D<float4> u_diffuse : register(t0, VRHI_STAGE_SPACE);
+SamplerState u_diffuseSampler : register(s0, VRHI_STAGE_SPACE);
+struct PSInput { float4 position : SV_Position; float2 diffuse : TEXCOORD0; float2 lightmap : TEXCOORD1; float lightmapLayer : TEXCOORD2; float4 color : TEXCOORD3; };
+[shader("pixel")]
+float4 main(PSInput input) : SV_Target
+{
+    return u_diffuse.Sample(u_diffuseSampler, input.diffuse) * input.color;
+}
+)";
+
 static const char *VRHI_WorldDiffusePixelSource = R"(
 Texture2D<float4> u_diffuse : register(t0, VRHI_STAGE_SPACE);
 SamplerState u_diffuseSampler : register(s0, VRHI_STAGE_SPACE);
@@ -1248,6 +1265,10 @@ static void VRHI_DestroyWorldResources(bool clearGeometry) {
 		vhDestroyShader(g_worldDiffusePixelShader);
 		g_worldDiffusePixelShader = VRHI_INVALID_HANDLE;
 	}
+	if (g_worldOverlayPixelShader != VRHI_INVALID_HANDLE) {
+		vhDestroyShader(g_worldOverlayPixelShader);
+		g_worldOverlayPixelShader = VRHI_INVALID_HANDLE;
+	}
 	for (VRHI_WorldDiffuseImage &image : g_worldDiffuseImages) {
 		if (image.texture != VRHI_INVALID_HANDLE) {
 			vhDestroyTexture(image.texture);
@@ -1257,6 +1278,7 @@ static void VRHI_DestroyWorldResources(bool clearGeometry) {
 	g_worldSolidProgram.clear();
 	g_worldLightmapProgram.clear();
 	g_worldDiffuseProgram.clear();
+	g_worldOverlayProgram.clear();
 	g_worldLightmapAvailable = false;
 	g_worldLightmapLayers = 0;
 	g_worldLightmapPixels.clear();
@@ -1289,7 +1311,7 @@ static void VRHI_DestroyWorldResources(bool clearGeometry) {
 		g_worldDiffuseImages.clear();
 		g_inlineBSPModels.clear();
 		g_inlineBSPModelByHandle.clear();
-		g_worldShaderScriptPaths.clear();
+		g_worldShaderScriptStages.clear();
 		g_worldShaderScriptsScanned = false;
 		g_worldLoaded = false;
 	}
@@ -1305,6 +1327,7 @@ static bool VRHI_InitializeWorldShader(void) {
 	std::vector<uint32_t> solidPixelSpirv;
 	std::vector<uint32_t> lightmapPixelSpirv;
 	std::vector<uint32_t> diffusePixelSpirv;
+	std::vector<uint32_t> overlayPixelSpirv;
 	std::string error;
 	if (!vhCompileShader("VRHI_WorldVertex", VRHI_WorldVertexSource,
 		VRHI_SHADER_STAGE_VERTEX | VRHI_SHADER_SM_6_0, vertexSpirv, "main",
@@ -1334,14 +1357,22 @@ static bool VRHI_InitializeWorldShader(void) {
 			"renderer_vrhi: diffuse shader unavailable; TGA surfaces use lightmap/solid fallback: %s\n",
 			diffuseError.c_str());
 	}
+	std::string overlayError;
+	const bool overlayCompiled = vhCompileShader("VRHI_WorldOverlayPixel",
+		VRHI_WorldOverlayPixelSource, VRHI_SHADER_STAGE_PIXEL | VRHI_SHADER_SM_6_0,
+		overlayPixelSpirv, "main", {}, {}, &overlayError);
+	if (!overlayCompiled) VRHI_Printf(PRINT_WARNING,
+		"renderer_vrhi: overlay shader unavailable: %s\n", overlayError.c_str());
 	g_worldVertexShader = vhAllocShader();
 	g_worldSolidPixelShader = vhAllocShader();
 	if (lightmapCompiled) g_worldLightmapPixelShader = vhAllocShader();
 	if (diffuseCompiled) g_worldDiffusePixelShader = vhAllocShader();
+	if (overlayCompiled) g_worldOverlayPixelShader = vhAllocShader();
 	if (g_worldVertexShader == VRHI_INVALID_HANDLE ||
 		g_worldSolidPixelShader == VRHI_INVALID_HANDLE ||
 		(lightmapCompiled && g_worldLightmapPixelShader == VRHI_INVALID_HANDLE) ||
-		(diffuseCompiled && g_worldDiffusePixelShader == VRHI_INVALID_HANDLE)) {
+		(diffuseCompiled && g_worldDiffusePixelShader == VRHI_INVALID_HANDLE) ||
+		(overlayCompiled && g_worldOverlayPixelShader == VRHI_INVALID_HANDLE)) {
 		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: world shader allocation failed\n");
 		VRHI_DestroyWorldResources(false);
 		return false;
@@ -1359,6 +1390,10 @@ static bool VRHI_InitializeWorldShader(void) {
 		vhCreateShader(g_worldDiffusePixelShader, "VRHI_WorldDiffusePixel",
 			VRHI_SHADER_STAGE_PIXEL, diffusePixelSpirv, "main");
 	}
+	if (overlayCompiled) {
+		vhCreateShader(g_worldOverlayPixelShader, "VRHI_WorldOverlayPixel",
+			VRHI_SHADER_STAGE_PIXEL, overlayPixelSpirv, "main");
+	}
 	vhFinish();
 	if (g_vhErrorCounter.load(std::memory_order_relaxed) != errorsBefore) {
 		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: world shader creation failed\n");
@@ -1373,6 +1408,10 @@ static bool VRHI_InitializeWorldShader(void) {
 	if (diffuseCompiled) {
 		g_worldDiffuseProgram = vhCreateGfxProgram(g_worldVertexShader,
 			g_worldDiffusePixelShader);
+	}
+	if (overlayCompiled) {
+		g_worldOverlayProgram = vhCreateGfxProgram(g_worldVertexShader,
+			g_worldOverlayPixelShader);
 	}
 	g_worldShaderInitialized = true;
 	VRHI_Printf(PRINT_ALL, "renderer_vrhi: static BSP world shaders ready (lightmap=%s diffuse=%s)\n",
@@ -2624,28 +2663,21 @@ static bool VRHI_ResolveShaderScriptFile(const char *fileName,
 }
 
 static void VRHI_ScanShaderScripts(const std::vector<std::string> &shaderNames) {
-	g_worldShaderScriptPaths.clear();
+	g_worldShaderScriptStages.clear();
 	g_worldShaderScriptsScanned = true;
 	std::unordered_map<std::string, bool> wanted;
 	char **fileList = nullptr;
 	void *activeFileData = nullptr;
 	try {
-		for (const std::string &name : shaderNames) {
-			if (!name.empty()) {
-				const std::string lower = VRHI_LowerASCII(name);
-				wanted.emplace(lower, true);
-				g_worldShaderScriptPaths.emplace(lower, std::string());
-			}
-		}
+		for (const std::string &name : shaderNames)
+			if (!name.empty()) wanted.emplace(VRHI_LowerASCII(name), true);
 		if (g_ri.FS_ListFiles == nullptr || g_ri.FS_FreeFileList == nullptr ||
 			g_ri.FS_ReadFile == nullptr || g_ri.FS_FreeFile == nullptr) return;
 		int fileCount = 0;
 		fileList = g_ri.FS_ListFiles("scripts", ".shader", &fileCount);
 		if (fileList == nullptr) return;
 		if (fileCount < 0 || fileCount > VRHI_MAX_SHADER_FILES) {
-			VRHI_Printf(PRINT_WARNING,
-				"renderer_vrhi: shader script scan skipped; file count cap exceeded (%d)\n",
-				fileCount);
+			VRHI_Printf(PRINT_WARNING, "renderer_vrhi: shader script scan skipped; file count cap exceeded (%d)\n", fileCount);
 			g_ri.FS_FreeFileList(fileList);
 			return;
 		}
@@ -2660,50 +2692,29 @@ static void VRHI_ScanShaderScripts(const std::vector<std::string> &shaderNames) 
 				activeFileData = nullptr;
 				continue;
 			}
-			bool parsed = false;
 			try {
 				const size_t fileSize = static_cast<size_t>(fileSizeLong);
-				if (fileSize <= VRHI_MAX_SHADER_FILE_BYTES &&
-					totalText <= VRHI_MAX_SHADER_TEXT_BYTES - fileSize) {
+				if (fileSize <= VRHI_MAX_SHADER_FILE_BYTES && totalText <= VRHI_MAX_SHADER_TEXT_BYTES - fileSize) {
 					totalText += fileSize;
-					std::unordered_map<std::string, std::string> parsedResults;
-					parsed = VRHI_ParseShaderScript(static_cast<const byte *>(activeFileData),
-						fileSize, wanted, &parsedResults);
-					if (parsed) {
-						for (auto &result : parsedResults) {
-							auto found = g_worldShaderScriptPaths.find(result.first);
-							if (found != g_worldShaderScriptPaths.end() && found->second.empty()) {
-								found->second = std::move(result.second);
-							}
-						}
+					std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > parsedResults;
+					if (VRHI_ParseShaderScriptStages(static_cast<const byte *>(activeFileData), fileSize, wanted, &parsedResults)) {
+						for (auto &result : parsedResults)
+							if (g_worldShaderScriptStages.find(result.first) == g_worldShaderScriptStages.end())
+								g_worldShaderScriptStages.emplace(result.first, std::move(result.second));
 					}
 				} else {
-					VRHI_Printf(PRINT_WARNING,
-						"renderer_vrhi: shader script scan text cap reached at '%s'\n",
-						qpath.c_str());
+					VRHI_Printf(PRINT_WARNING, "renderer_vrhi: shader script scan text cap reached at '%s'\n", qpath.c_str());
 				}
-			} catch (...) {
-				parsed = false;
-			}
+			} catch (...) {}
 			g_ri.FS_FreeFile(activeFileData);
 			activeFileData = nullptr;
 		}
 		g_ri.FS_FreeFileList(fileList);
 		fileList = nullptr;
 	} catch (...) {
-		if (activeFileData != nullptr && g_ri.FS_FreeFile != nullptr) {
-			g_ri.FS_FreeFile(activeFileData);
-			activeFileData = nullptr;
-		}
-		if (fileList != nullptr && g_ri.FS_FreeFileList != nullptr) {
-			g_ri.FS_FreeFileList(fileList);
-			fileList = nullptr;
-		}
-		// Keep a complete miss cache after allocation or malformed-input failure.
-		g_worldShaderScriptPaths.clear();
-		for (const std::string &name : shaderNames) {
-			if (!name.empty()) g_worldShaderScriptPaths.emplace(VRHI_LowerASCII(name), std::string());
-		}
+		if (activeFileData != nullptr && g_ri.FS_FreeFile != nullptr) g_ri.FS_FreeFile(activeFileData);
+		if (fileList != nullptr && g_ri.FS_FreeFileList != nullptr) g_ri.FS_FreeFileList(fileList);
+		g_worldShaderScriptStages.clear();
 	}
 }
 
@@ -2762,27 +2773,9 @@ static bool VRHI_DecodeDirectImage(const char *name, int maxDimension,
 	return false;
 }
 
-static bool VRHI_LoadDiffuseTGA(const char *shaderName, int *imageIndex) {
+static bool VRHI_StoreDiffuseImage(const std::string &path,
+	const vrhi_image::DecodeResult &decoded, bool scriptResolved, int *imageIndex) {
 	if (imageIndex != nullptr) *imageIndex = -1;
-	std::string path;
-	vrhi_image::DecodeResult decoded;
-	bool scriptResolved = false;
-	if (!VRHI_DecodeDirectImage(shaderName, VRHI_MAX_WORLD_DIFFUSE_DIMENSION,
-		VRHI_MAX_WORLD_DIFFUSE_BYTES, &path, &decoded)) {
-		std::string shaderKey;
-		if (shaderName != nullptr) {
-			size_t length = 0;
-			while (length < MAX_QPATH && shaderName[length] != '\0') ++length;
-			if (length > 0 && length < MAX_QPATH) shaderKey = VRHI_LowerASCII(
-				std::string(shaderName, length));
-		}
-		const auto found = g_worldShaderScriptPaths.find(shaderKey);
-		if (!g_worldShaderScriptsScanned || found == g_worldShaderScriptPaths.end() ||
-			found->second.empty() || !VRHI_DecodeDirectImage(found->second.c_str(),
-				VRHI_MAX_WORLD_DIFFUSE_DIMENSION, VRHI_MAX_WORLD_DIFFUSE_BYTES,
-				&path, &decoded)) return false;
-		scriptResolved = true;
-	}
 	for (size_t i = 0; i < g_worldDiffuseImages.size(); ++i) {
 		if (g_worldDiffuseImages[i].path == path) {
 			if (scriptResolved) g_worldDiffuseImages[i].scriptResolved = true;
@@ -2794,20 +2787,70 @@ static bool VRHI_LoadDiffuseTGA(const char *shaderName, int *imageIndex) {
 	const size_t pixelBytes = decoded.rgba.size();
 	size_t existingBytes = 0;
 	for (const VRHI_WorldDiffuseImage &image : g_worldDiffuseImages) existingBytes += image.pixels.size();
-	if (pixelBytes > VRHI_MAX_WORLD_DIFFUSE_BYTES ||
-		existingBytes > VRHI_MAX_WORLD_DIFFUSE_BYTES - pixelBytes) return false;
+	if (pixelBytes > VRHI_MAX_WORLD_DIFFUSE_BYTES || existingBytes > VRHI_MAX_WORLD_DIFFUSE_BYTES - pixelBytes) return false;
 	VRHI_WorldDiffuseImage image;
 	image.path = path;
 	image.width = decoded.width;
 	image.height = decoded.height;
 	image.scriptResolved = scriptResolved;
-	image.pixels = std::move(decoded.rgba);
+	image.pixels = decoded.rgba;
 	g_worldDiffuseImages.push_back(std::move(image));
 	const int index = static_cast<int>(g_worldDiffuseImages.size() - 1);
 	if (imageIndex != nullptr) *imageIndex = index;
 	VRHI_Printf(PRINT_ALL, "renderer_vrhi: decoded %sBSP diffuse '%s' (%dx%d, %zu bytes)\n",
-		scriptResolved ? "script-resolved " : "", path.c_str(), decoded.width,
-		decoded.height, pixelBytes);
+		scriptResolved ? "script-resolved " : "", path.c_str(), decoded.width, decoded.height, pixelBytes);
+	return true;
+}
+
+static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
+	uint8_t *blends, int *stageCount) {
+	if (images == nullptr || blends == nullptr || stageCount == nullptr) return false;
+	*stageCount = 0;
+	for (size_t i = 0; i < VRHI_SHADER_MAX_STAGES; ++i) { images[i] = -1; blends[i] = VRHI_SHADER_BLEND_OPAQUE; }
+	std::vector<VRHI_ShaderStage> stages;
+	std::string directPath;
+	vrhi_image::DecodeResult directDecoded;
+	bool scriptResolved = false;
+	if (VRHI_DecodeDirectImage(shaderName, VRHI_MAX_WORLD_DIFFUSE_DIMENSION,
+		VRHI_MAX_WORLD_DIFFUSE_BYTES, &directPath, &directDecoded)) {
+		VRHI_ShaderStage direct;
+		direct.path = directPath;
+		stages.push_back(std::move(direct));
+	} else {
+		std::string key;
+		if (shaderName != nullptr) {
+			size_t length = 0;
+			while (length < MAX_QPATH && shaderName[length] != '\0') ++length;
+			if (length > 0 && length < MAX_QPATH) key = VRHI_LowerASCII(std::string(shaderName, length));
+		}
+		const auto found = g_worldShaderScriptStages.find(key);
+		if (!g_worldShaderScriptsScanned || found == g_worldShaderScriptStages.end() || found->second.empty()) return false;
+		stages = found->second;
+		scriptResolved = true;
+	}
+	for (size_t i = 0; i < stages.size() && i < VRHI_SHADER_MAX_STAGES; ++i) {
+		vrhi_image::DecodeResult decoded;
+		std::string path;
+		if (i == 0 && !scriptResolved) { path = directPath; decoded = std::move(directDecoded); }
+		else if (!VRHI_DecodeDirectImage(stages[i].path.c_str(), VRHI_MAX_WORLD_DIFFUSE_DIMENSION,
+			VRHI_MAX_WORLD_DIFFUSE_BYTES, &path, &decoded)) return false;
+		if (!VRHI_StoreDiffuseImage(path, decoded, scriptResolved, &images[i])) return false;
+		blends[i] = static_cast<uint8_t>(stages[i].blendMode);
+	}
+	*stageCount = static_cast<int>(stages.size());
+	if (scriptResolved)
+		VRHI_Printf(PRINT_DEVELOPER, "renderer_vrhi: material '%s' stages=%d\n",
+			shaderName != nullptr ? shaderName : "", *stageCount);
+	return *stageCount > 0;
+}
+
+static bool VRHI_LoadDiffuseTGA(const char *shaderName, int *imageIndex) {
+	int images[VRHI_SHADER_MAX_STAGES];
+	uint8_t blends[VRHI_SHADER_MAX_STAGES];
+	int count = 0;
+	if (imageIndex != nullptr) *imageIndex = -1;
+	if (!VRHI_LoadDiffuseStages(shaderName, images, blends, &count)) return false;
+	if (imageIndex != nullptr) *imageIndex = images[0];
 	return true;
 }
 
@@ -3343,10 +3386,11 @@ static void VRHI_LoadWorld(const char *name) {
 			surface.lightmapNum >= 0 && surface.lightmapNum < g_worldLightmapLayers
 			? surface.lightmapNum : -1;
 		int diffuseImage = -1;
-		// Direct image probing remains first. If it misses, this map-scoped cache contains
-		// only a first-stage script map/clampmap image candidate; all other shader
-		// semantics retain the lightmap/solid fallback.
-		VRHI_LoadDiffuseTGA(shader.shader, &diffuseImage);
+		int stageImages[VRHI_SHADER_MAX_STAGES] = { -1, -1, -1, -1 };
+		uint8_t stageBlend[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		int stageCount = 0;
+		VRHI_LoadDiffuseStages(shader.shader, stageImages, stageBlend, &stageCount);
+		diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 		if (surface.surfaceType == MST_PATCH) {
 			VRHI_PatchMesh patch;
 			if (!VRHI_TessellatePatch(vertsData, vertCount, surface, &patch) ||
@@ -3375,6 +3419,11 @@ static void VRHI_LoadWorld(const char *name) {
 			batch.firstIndex = firstIndex;
 			batch.indexCount = static_cast<uint32_t>(patch.indexes.size());
 			batch.diffuseImage = diffuseImage;
+			batch.stageCount = static_cast<uint8_t>(stageCount);
+			for (int stage = 0; stage < stageCount; ++stage) {
+				batch.stageImages[stage] = stageImages[stage];
+				batch.stageBlend[stage] = stageBlend[stage];
+			}
 			g_worldBatches.push_back(batch);
 			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
 			accepted++;
@@ -3460,6 +3509,11 @@ static void VRHI_LoadWorld(const char *name) {
 			batch.firstIndex = surfaceFirstIndex;
 			batch.indexCount = static_cast<uint32_t>(g_worldIndexes.size()) - surfaceFirstIndex;
 			batch.diffuseImage = diffuseImage;
+			batch.stageCount = static_cast<uint8_t>(stageCount);
+			for (int stage = 0; stage < stageCount; ++stage) {
+				batch.stageImages[stage] = stageImages[stage];
+				batch.stageBlend[stage] = stageBlend[stage];
+			}
 			g_worldBatches.push_back(batch);
 			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
 			accepted++;
@@ -3544,14 +3598,17 @@ static void VRHI_LoadWorld(const char *name) {
 		}
 	}
 	VRHI_RefreshInlineModelHandles();
+	int multiStageBatches = 0;
+	for (const VRHI_WorldBatch &batch : g_worldBatches)
+		if (batch.stageCount > 1) ++multiStageBatches;
 	g_worldLoaded = !g_worldVertices.empty() && !g_worldIndexes.empty();
 	// Per-batch visibility stamps are rebuilt whenever the batch list changes.
 	g_worldBatchMarked.assign(g_worldBatches.size(), 0);
 	g_worldVisEpoch = 0;
 	VRHI_Printf(PRINT_ALL,
-		"renderer_vrhi: BSP world '%s': models=%d inlineAccepted=%d inlineSkipped=%d surfaces=%d accepted=%d skipped=%d vertices=%zu indexes=%zu lightmaps=%d diffuse=%zu batches=%zu cull=%s planes=%d nodes=%d leafs=%d leafsurfaces=%d clusters=%d vis=%s\n",
+		"renderer_vrhi: BSP world '%s': models=%d inlineAccepted=%d inlineSkipped=%d surfaces=%d accepted=%d skipped=%d vertices=%zu indexes=%zu lightmaps=%d diffuse=%zu batches=%zu multistage=%d cull=%s planes=%d nodes=%d leafs=%d leafsurfaces=%d clusters=%d vis=%s\n",
 		name, modelCount, inlineAccepted, inlineSkipped, model.numSurfaces, accepted, skipped, g_worldVertices.size(), g_worldIndexes.size(),
-		g_worldLightmapLayers, g_worldDiffuseImages.size(), g_worldBatches.size(),
+		g_worldLightmapLayers, g_worldDiffuseImages.size(), g_worldBatches.size(), multiStageBatches,
 		cullLumpsValid ? (g_worldVisAvailable ? "pvs" : "fallback-novis") : "fallback-lumps",
 		planeCount, nodeCount, leafCount, leafSurfaceCount, g_worldNumClusters,
 		g_worldVisAvailable ? "yes" : "no");
@@ -4401,43 +4458,64 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 	for (size_t batchIndex = 0; batchIndex < g_worldBatches.size(); ++batchIndex) {
 		const VRHI_WorldBatch &batch = g_worldBatches[batchIndex];
 		if (batch.indexCount == 0) continue;
-		// PVS culling skips unmarked batches; the static vertex/index buffers
-		// and the uint32 index buffer contents are never modified per frame.
 		if (cullActive && g_worldBatchMarked[batchIndex] != g_worldVisEpoch) continue;
-		const bool useDiffuse = g_worldDiffusePixelShader != VRHI_INVALID_HANDLE &&
-			batch.diffuseImage >= 0 &&
-			static_cast<size_t>(batch.diffuseImage) < g_worldDiffuseImages.size() &&
-			g_worldDiffuseImages[batch.diffuseImage].texture != VRHI_INVALID_HANDLE;
-		g_worldState = worldBaseState;
-		g_worldState.SetProgram(useDiffuse ? g_worldDiffuseProgram :
-			(useLightmap ? g_worldLightmapProgram : g_worldSolidProgram));
-		if (useDiffuse) {
-			const vhTexture diffuse = g_worldDiffuseImages[batch.diffuseImage].texture;
-			g_worldState.SetTexture(0, { "u_diffuse", 0, diffuse })
-				.SetSampler(0, { "u_diffuseSampler", 0,
-					VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
-					VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_WRAP });
-			if (useLightmap) {
-				g_worldState.SetTexture(1, { "u_lightmap", 1, g_worldLightmapTexture })
-					.SetSampler(1, { "u_lightmapSampler", 1,
-						VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
-						VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP });
+		const int declaredCount = batch.stageCount > VRHI_SHADER_MAX_STAGES ? 0 : batch.stageCount;
+		const bool baseImageValid = declaredCount > 0 && batch.stageImages[0] >= 0 &&
+			static_cast<size_t>(batch.stageImages[0]) < g_worldDiffuseImages.size() &&
+			g_worldDiffuseImages[batch.stageImages[0]].texture != VRHI_INVALID_HANDLE;
+		// Upload/creation failure must return to the existing lightmap/solid
+		// path rather than dropping the whole BSP batch.
+		const int count = baseImageValid && g_worldDiffusePixelShader != VRHI_INVALID_HANDLE
+			? declaredCount : 0;
+		for (int stage = 0; stage <= count; ++stage) {
+			const bool materialStage = stage < count;
+			const int imageIndex = materialStage ? batch.stageImages[stage] : -1;
+			const bool textured = materialStage && imageIndex >= 0 &&
+				static_cast<size_t>(imageIndex) < g_worldDiffuseImages.size() &&
+				g_worldDiffuseImages[imageIndex].texture != VRHI_INVALID_HANDLE;
+			if (materialStage && !textured) break;
+			if (!materialStage && count > 0) continue;
+			const bool overlay = materialStage && stage > 0;
+			const bool useDiffuse = textured && g_worldDiffusePixelShader != VRHI_INVALID_HANDLE;
+			if (overlay && g_worldOverlayPixelShader == VRHI_INVALID_HANDLE) continue;
+			g_worldState = worldBaseState;
+			if (overlay) {
+				const uint64_t blend = batch.stageBlend[stage] == VRHI_SHADER_BLEND_ADDITIVE
+					? VRHI_STATE_BLEND_ADD : VRHI_STATE_BLEND_ALPHA;
+				// Overlay stages redraw the batch's own triangles, so their depth
+				// equals the base pass depth just written for the same geometry.
+				// A strict LESS test would discard every overlay fragment; LEQUAL
+				// keeps same-surface overlays visible while nearer geometry still
+				// occludes them. Depth writes stay off for the overlay pass.
+				g_worldState.SetProgram(g_worldOverlayProgram)
+					.SetStateFlags(VRHI_STATE_WRITE_RGB | VRHI_STATE_WRITE_A |
+						VRHI_STATE_DEPTH_TEST_ENABLE | VRHI_STATE_DEPTH_TEST_LEQUAL |
+						VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES | blend);
+			} else {
+				g_worldState.SetProgram(useDiffuse ? g_worldDiffuseProgram :
+					(useLightmap ? g_worldLightmapProgram : g_worldSolidProgram));
+				if (useLightmap && !useDiffuse)
+					g_worldState.SetTexture(0, { "u_lightmap", 0, g_worldLightmapTexture })
+						.SetSampler(0, { "u_lightmapSampler", 0, VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
+							VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP });
 			}
-		} else if (useLightmap) {
-			g_worldState.SetTexture(0, { "u_lightmap", 0, g_worldLightmapTexture })
-				.SetSampler(0, { "u_lightmapSampler", 0,
-					VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
-					VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP });
-		}
-		if (vhSetState(g_worldStateId, g_worldState)) {
-			if (!submitted) vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
-			vhDrawIndexed(g_worldStateId, batch.indexCount, 1, batch.firstIndex);
-			submitted = true;
-		} else {
-			VRHI_Printf(PRINT_WARNING,
-				"renderer_vrhi: world batch vhSetState failed (first=%u indexes=%u diffuse=%s lightmap=%s)\n",
-				batch.firstIndex, batch.indexCount, useDiffuse ? "yes" : "no",
-				useLightmap ? "yes" : "no");
+			if (textured) {
+				const vhTexture diffuse = g_worldDiffuseImages[imageIndex].texture;
+				g_worldState.SetTexture(0, { "u_diffuse", 0, diffuse })
+					.SetSampler(0, { "u_diffuseSampler", 0, VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
+						VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_WRAP });
+				if (!overlay && useLightmap)
+					g_worldState.SetTexture(1, { "u_lightmap", 1, g_worldLightmapTexture })
+						.SetSampler(1, { "u_lightmapSampler", 1, VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
+							VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP });
+			}
+			if (vhSetState(g_worldStateId, g_worldState)) {
+				if (!submitted) vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
+				vhDrawIndexed(g_worldStateId, batch.indexCount, 1, batch.firstIndex);
+				submitted = true;
+			} else VRHI_Printf(PRINT_WARNING,
+				"renderer_vrhi: world material stage state failed (first=%u stage=%d)\n",
+				batch.firstIndex, stage);
 		}
 	}
 	if (VRHI_BuildSceneGeometry(fd) && VRHI_EnsureSceneBuffers()) {

@@ -40,25 +40,22 @@ culling only skips indexed ranges per batch. When visibility is absent or
 malformed, or the camera leaf cannot be resolved, the renderer falls back to
 drawing every batch. Per-frame visible cluster/batch/index counts are reported at
 developer level, or every frame at `PRINT_ALL` with `r_vrhi_cullDebug 1`.
-A bounded first-stage shader-script diffuse lookup is supported for BSP maps:
-`scripts/*.shader` is scanned once per map, matching BSP shader names and taking
-the first non-special `map`/`clampmap` image stage into a copied cache. A stage
-is accepted only when its semantics match the fixed opaque diffuse pass: the
-default-value statements `blendFunc GL_ONE GL_ZERO` (exactly that pair),
-`rgbGen identity`, `alphaGen identity`, `depthWrite`, and
-`depthFunc lequal`/`less` are validated token-for-token (arguments are checked
-and a statement can never read past its stage), while alpha/additive blends,
-tcGen/tcMod variants, deform/fog/animMap/videoMap/normal/specular/portal/sky,
-and any malformed or incomplete sequence keep the shader on the existing
-lightmap/solid path. Multi-stage or multi-map shaders are never faked: only the
-first non-special `map`/`clampmap` TGA/JPG/JPEG/PNG candidate is used. This is
-not full Quake shader/material parity; PK3 material stages, shader-stage
-area/door masking, and corresponding renderer parity remain unsupported and
-fall back to the existing lightmap/solid path (the client `refdef.areamask`
-door culling is a separate mechanism and IS honored during PVS leaf
-traversal, see above). Script file count, per-file/aggregate text,
-token, candidate image, and decoded image memory are bounded, so malformed or
-oversized input is rejected safely. The dependency-free parser lives in
+A bounded simple multi-stage shader-script material slice is supported for
+static BSP maps: `scripts/*.shader` is scanned once per map and matching names
+copy at most four direct-image stages (`map`/`clampmap`, TGA/JPG/JPEG/PNG) into a
+cache. Stage 0 is opaque (no blend or exact `GL_ONE GL_ZERO`); later stages may
+use only `blend`/source-alpha blending or `GL_ONE GL_ONE` additive blending.
+The parser validates allowlisted identity/depth statements token-for-token and
+rejects tcGen/tcMod, deform/fog/animMap/videoMap/normal/specular/portal/sky,
+special-only maps, malformed statements, and stage/path/image caps. Static BSP
+batches retain copied stage descriptors; stage 0 uses diffuse x lightmap and
+overlays preserve image alpha without lightmap modulation. Inline BSP/model
+scene draws intentionally retain only stage 0 to keep the bounded scene path
+simple. This is not full Quake shader/material parity; unsupported scripts
+fall back to the existing lightmap/solid path. The client `refdef.areamask`
+door culling remains a separate mechanism and IS honored during PVS traversal.
+Script file count, per-file/aggregate text, token, stage, candidate image, and
+decoded image memory are bounded. The dependency-free parser lives in
 `vrhi_shader_script.h` and is covered by `tests/vrhi_shader_script_test.cpp`.
 
 Dynamic lights (`AddLightToScene`/`AddAdditiveLightToScene`) are stored as
@@ -146,9 +143,9 @@ shared atlas handle, fixed height/top/bottom/pitch/xSkip/image dimensions, and
 unavailable the font stays an empty (invisible-text) fallback instead of
 drawing solid boxes. Shader registration admits bounded TGA/JPG/JPEG/PNG names (bare
 names probe `.tga`, `.jpg`, `.jpeg`, and `.png`; explicit supported extensions are not
-rewritten); the BSP-only first-stage script lookup uses the same image resolver,
-and all other material semantics remain unsupported and use the solid UI
-fallback.
+rewritten); static BSP shader scripts use the same resolver for their bounded
+four-stage material slice, while unsupported UI material semantics use the
+solid UI fallback.
 
 Cinematics (`UploadCinematic`/`DrawStretchRaw`) upload transient RGBA frames to
 retained per-client VRHI textures under a strict small client-slot cap (8), a

@@ -1,12 +1,13 @@
 // Standalone, dependency-free unit test for the VRHI bounded shader-script
-// first-stage parser (code/renderervrhi/vrhi_shader_script.h). No engine
-// headers, no filesystem, no third-party libraries: the test feeds shader
-// script text in memory and asserts tokenization, comment handling, caps,
-// the safe opaque allowlist (blendFunc GL_ONE GL_ZERO, rgbGen/alphaGen
-// identity, depthWrite, depthFunc lequal/less), and the continued rejection
-// of alpha/additive blends, tcGen/tcMod variants, deform/fog/animMap/
-// videoMap/normal/specular/portal/sky, malformed statements, and multi-map
-// shaders.
+// parser (code/renderervrhi/vrhi_shader_script.h). No engine headers, no
+// filesystem, no third-party libraries: the test feeds shader script text in
+// memory and asserts tokenization, comment handling, caps, the safe opaque
+// allowlist (blendFunc GL_ONE GL_ZERO, rgbGen/alphaGen identity, depthWrite,
+// depthFunc lequal/less), the continued rejection of alpha/additive blends,
+// tcGen/tcMod variants, deform/fog/animMap/videoMap/normal/specular/portal/
+// sky, malformed statements, and multi-map shaders, plus the bounded
+// multi-stage slice (VRHI_ParseShaderScriptStages: at most four direct-image
+// stages, stage 0 opaque, later stages source-alpha or additive).
 //
 // Build and run (any C++11-or-later compiler):
 //   clang++ -std=c++17 -O1 -Wall -Wextra -Werror tests/vrhi_shader_script_test.cpp -o vrhi_shader_script_test && ./vrhi_shader_script_test
@@ -314,6 +315,42 @@ void testWantedFilteringAndNames() {
 	CHECK_EQ_INT(results2.size(), 0u);
 }
 
+void testSimpleMultiStageExtraction() {
+	const std::string text = script(
+		"{ map textures/base.tga depthWrite }\n"
+		"{ map textures/alpha.png blendFunc blend }\n"
+		"{ clampmap textures/add.jpg blendFunc GL_ONE GL_ONE }");
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(text), text.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+	CHECK_EQ_INT(stages.size(), 3u);
+	if (stages.size() == 3) {
+		CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+		CHECK_EQ_INT(stages[0].blendMode, VRHI_SHADER_BLEND_OPAQUE);
+		CHECK_EQ_STR(stages[1].path, "textures/alpha.png");
+		CHECK_EQ_INT(stages[1].blendMode, VRHI_SHADER_BLEND_ALPHA);
+		CHECK_EQ_INT(stages[2].blendMode, VRHI_SHADER_BLEND_ADDITIVE);
+	}
+	const std::string badStage0 = script("{ map textures/base.tga blendFunc blend }\n{ map textures/a.png blendFunc blend }");
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > rejected;
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(badStage0), badStage0.size(), wanted, &rejected));
+	CHECK_EQ_INT(rejected.size(), 0u);
+	const std::string badUnsupported = script("{ map textures/base.tga }\n{ map textures/a.png blendFunc blend tcMod scroll 1 1 }");
+	rejected.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(badUnsupported), badUnsupported.size(), wanted, &rejected));
+	CHECK_EQ_INT(rejected.size(), 0u);
+	const std::string tooMany = script(
+		"{ map textures/0.tga } { map textures/1.tga blendFunc blend } "
+		"{ map textures/2.tga blendFunc blend } { map textures/3.tga blendFunc blend } "
+		"{ map textures/4.tga blendFunc blend }");
+	rejected.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(tooMany), tooMany.size(), wanted, &rejected));
+	CHECK_EQ_INT(rejected.size(), 0u);
+}
+
 void testBlockLevelBoundaries() {
 	// Direct block-level checks: the allowlist validator never reads past the
 	// stage, so a truncated statement at stage end rejects instead of
@@ -369,6 +406,7 @@ int main() {
 	testMalformedStructure();
 	testWantedFilteringAndNames();
 	testBlockLevelBoundaries();
+	testSimpleMultiStageExtraction();
 	testPathSafetyHelpers();
 
 	if (g_failures != 0) {

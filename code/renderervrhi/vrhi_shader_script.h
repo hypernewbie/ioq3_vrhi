@@ -1,12 +1,22 @@
 /*
 ===========================================================================
-VRHI bounded Quake shader-script first-stage parser.
+VRHI bounded Quake shader-script parser.
 
 Dependency-free (C++11) helper shared by renderer_vrhi and its standalone
-unit test. It parses the small subset of Quake 3 shader scripts that is
-semantically equivalent to the renderer's fixed opaque diffuse pass, so
-otherwise opaque first-stage BSP shader definitions no longer fall back to
-the lightmap/solid path. It is intentionally NOT a shader/material parser:
+unit test. It exposes two slices:
+
+  - VRHI_ParseShaderScript / VRHI_ParseShaderBlock: the conservative
+    first-stage opaque-diffuse lookup described below;
+  - VRHI_ParseShaderScriptStages / VRHI_ParseSimpleShaderBlock: the bounded
+    simple multi-stage material slice (at most VRHI_SHADER_MAX_STAGES
+    direct-image stages, stage 0 opaque, later stages source-alpha or
+    additive) used by static BSP batches.
+
+Both share the same tokenizer and bounds. The first-stage helper parses the
+small subset of Quake 3 shader scripts that is semantically equivalent to
+the renderer's fixed opaque diffuse pass, so otherwise opaque first-stage
+BSP shader definitions no longer fall back to the lightmap/solid path. It
+is intentionally NOT a shader/material parser:
 
   - tokenization mirrors the GL renderers' GetToken loop: whitespace and
     NULs separate tokens, '//' line comments and slash-star block comments
@@ -44,6 +54,18 @@ input buffer, so no FS storage can be referenced after FS_FreeFile.
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+// Bounded simple material stages accepted by the VRHI BSP path.
+static const std::size_t VRHI_SHADER_MAX_STAGES = 4;
+enum VRHI_ShaderBlendMode {
+	VRHI_SHADER_BLEND_OPAQUE = 0,
+	VRHI_SHADER_BLEND_ALPHA = 1,
+	VRHI_SHADER_BLEND_ADDITIVE = 2
+};
+struct VRHI_ShaderStage {
+	std::string path;
+	int blendMode = VRHI_SHADER_BLEND_OPAQUE;
+};
 
 // Strict bounds, independent of the legacy qfiles.h limits so malformed or
 // hostile files cannot consume unbounded memory inside the renderer. The
@@ -325,6 +347,105 @@ inline bool VRHI_ParseShaderScript(const unsigned char *data, std::size_t size,
 		if (VRHI_ParseShaderBlock(tokens, bodyBegin, bodyEnd, &path)) {
 			results->emplace(shaderName, std::move(path));
 		}
+	}
+	return true;
+}
+
+// Parses one bounded shader body for the deliberately small multi-stage
+// material slice. Every stage has exactly one real map and no stage may use
+// unsupported shader semantics. Stage zero is opaque; subsequent stages may
+// use only source-alpha or additive blending. This remains separate from the
+// conservative first-stage helper above.
+inline bool VRHI_ParseSimpleShaderBlock(
+	const std::vector<VRHI_ShaderScriptToken> &tokens, std::size_t begin,
+	std::size_t end, std::vector<VRHI_ShaderStage> *stages) {
+	if (stages != nullptr) stages->clear();
+	if (stages == nullptr || begin >= end || end > tokens.size()) return false;
+	for (std::size_t i = begin; i < end;) {
+		if (tokens[i].text != "{" || stages->size() >= VRHI_SHADER_MAX_STAGES) return false;
+		const std::size_t stageBegin = ++i;
+		int depth = 1;
+		while (i < end && depth > 0) {
+			if (tokens[i].text == "{") ++depth;
+			else if (tokens[i].text == "}") --depth;
+			++i;
+		}
+		if (depth != 0) return false;
+		const std::size_t stageEnd = i - 1;
+		VRHI_ShaderStage stage;
+		bool foundMap = false;
+		bool blendSpecified = false;
+		for (std::size_t j = stageBegin; j < stageEnd;) {
+			if (tokens[j].text == "{" || tokens[j].text == "}") return false;
+			const std::string keyword = VRHI_ShaderLowerASCII(tokens[j].text);
+			if (keyword == "map" || keyword == "clampmap") {
+				if (foundMap || j + 1 >= stageEnd) return false;
+				const std::string &texture = tokens[j + 1].text;
+				if (texture.empty() || texture[0] == '$' ||
+					!VRHI_ShaderPathIsSafe(texture) ||
+					texture.find('\\') != std::string::npos ||
+					!VRHI_ResolveDirectImagePath(texture.c_str(), &stage.path)) return false;
+				foundMap = true;
+				j += 2;
+				continue;
+			}
+			if (keyword == "blendfunc") {
+				if (blendSpecified || j + 1 >= stageEnd) return false;
+				const std::string arg = VRHI_ShaderLowerASCII(tokens[j + 1].text);
+				std::size_t consumed = 0;
+				if (arg == "blend") {
+					stage.blendMode = VRHI_SHADER_BLEND_ALPHA;
+					consumed = 2;
+				} else {
+					if (j + 2 >= stageEnd) return false;
+					const std::string dst = VRHI_ShaderLowerASCII(tokens[j + 2].text);
+					if (arg == "gl_src_alpha" && dst == "gl_one_minus_src_alpha")
+						stage.blendMode = VRHI_SHADER_BLEND_ALPHA;
+					else if (arg == "gl_one" && dst == "gl_one")
+						stage.blendMode = VRHI_SHADER_BLEND_ADDITIVE;
+					else if (arg == "gl_one" && dst == "gl_zero")
+						stage.blendMode = VRHI_SHADER_BLEND_OPAQUE;
+					else return false;
+					consumed = 3;
+				}
+				blendSpecified = true;
+				j += consumed;
+				continue;
+			}
+			const std::size_t consumed = VRHI_ShaderAllowlistedStatement(tokens, j, stageEnd);
+			if (consumed == std::numeric_limits<std::size_t>::max() || consumed == 0) return false;
+			j += consumed;
+		}
+		if (!foundMap || (stages->empty() && stage.blendMode != VRHI_SHADER_BLEND_OPAQUE) ||
+			(!stages->empty() && (!blendSpecified || stage.blendMode == VRHI_SHADER_BLEND_OPAQUE))) return false;
+		stages->push_back(std::move(stage));
+	}
+	return !stages->empty();
+}
+
+// Parses every wanted shader and copies all accepted stage paths into results.
+inline bool VRHI_ParseShaderScriptStages(
+	const unsigned char *data, std::size_t size,
+	const std::unordered_map<std::string, bool> &wanted,
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > *results) {
+	std::vector<VRHI_ShaderScriptToken> tokens;
+	if (results == nullptr || !VRHI_TokenizeShaderScript(data, size, &tokens)) return false;
+	for (std::size_t i = 0; i < tokens.size();) {
+		const std::string shaderName = VRHI_ShaderLowerASCII(tokens[i++].text);
+		if (i >= tokens.size() || tokens[i].text != "{") continue;
+		const std::size_t bodyBegin = ++i;
+		int depth = 1;
+		while (i < tokens.size() && depth > 0) {
+			if (tokens[i].text == "{") ++depth;
+			else if (tokens[i].text == "}") --depth;
+			++i;
+		}
+		if (depth != 0) return false;
+		const std::size_t bodyEnd = i - 1;
+		if (wanted.find(shaderName) == wanted.end()) continue;
+		std::vector<VRHI_ShaderStage> stages;
+		if (VRHI_ParseSimpleShaderBlock(tokens, bodyBegin, bodyEnd, &stages))
+			results->emplace(shaderName, std::move(stages));
 	}
 	return true;
 }
