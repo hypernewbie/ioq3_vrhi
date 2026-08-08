@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Run isolated, hidden-window OpenArena image smoke tests.
 
-The current capture uses ioquake3's stock screenshot command. It proves asset
-provisioning, renderer startup, demo playback, screenshot output, and teardown.
-It is not yet an authoritative final-present capture; that capture path will be
-added before backend parity is gated.
+Captures come from the active renderer's own ``screenshot`` command. The GL
+renderers use their stock screenshot paths; renderer_vrhi registers a
+renderer-owned command that reads the bound backbuffer in EndFrame and writes a
+validated 24-bit BGR TGA, which is that slice's authoritative final-present
+capture. Runs under the ``vrhi`` renderer therefore report
+``authoritative_capture: true``; GL runs still prove asset provisioning,
+renderer startup, demo playback, screenshot output, and teardown, but are not a
+final-present oracle.
 """
 
 from __future__ import annotations
@@ -240,6 +244,17 @@ def provision_assets() -> None:
         raise RuntimeError(f"asset provisioning failed with exit code {result.returncode}")
 
 
+def is_authoritative_capture(renderer: str) -> bool:
+    """Return whether the renderer's screenshot is a final-present readback.
+
+    renderer_vrhi owns its ``screenshot`` command and reads the bound
+    backbuffer in EndFrame, so its captures are authoritative for the rendered
+    clear/UI frame. The GL renderers' stock screenshot paths are not treated as
+    final-present oracles.
+    """
+    return renderer == "vrhi"
+
+
 def build_command(engine: Path, home: Path, renderer: str, scene: Scene) -> list[str]:
     command = [
         str(engine),
@@ -355,7 +370,10 @@ def run_one(
         "stderr": str(stderr_path),
         "screenshot": str(screenshot),
         "screenshot_exists": screenshot.is_file(),
-        "authoritative_capture": False,
+        # Mechanism-based: a vrhi run's capture is the renderer-owned backbuffer
+        # readback even when this particular run failed to write the file (that
+        # failure is reported separately via screenshot_exists/error).
+        "authoritative_capture": is_authoritative_capture(renderer),
     }
 
     if timed_out:
@@ -533,7 +551,7 @@ def main() -> int:
     report = {
         "schema": 2,
         "test": "stock_screenshot_smoke_suite",
-        "authoritative_capture": False,
+        "authoritative_capture": is_authoritative_capture(args.renderer),
         "engine": str(engine),
         "renderer": args.renderer,
         "manifest": str(args.manifest.resolve()),
