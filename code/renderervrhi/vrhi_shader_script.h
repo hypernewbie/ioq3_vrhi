@@ -52,6 +52,15 @@ input buffer, so no FS storage can be referenced after FS_FreeFile.
 // material sample without touching vertex colour, lightmaps, or blend
 // classification. Every other generator keeps the existing dynamic fallback.
 // The conservative first-stage helper still requires identity only.
+//
+// The bounded stage-local `depthWrite` slice extends the same simple
+// multi-stage parser: the bare `depthWrite` keyword inside a stage sets a
+// stage-local flag that is carried through the world/scene material and draw
+// state. It never changes blend classification or sort order; the adapter
+// keeps the default translucent behavior (depth test on, depth write off)
+// and applies WRITE_Z only to stages/draws that explicitly declared
+// depthWrite. Opaque draws keep their existing depth-write behavior, so a
+// shader without the keyword renders exactly as before.
 ===========================================================================
 */
 #ifndef __VRHI_SHADER_SCRIPT_H
@@ -100,6 +109,12 @@ struct VRHI_ShaderStage {
 	float rgbConst[3] = { 1.0f, 1.0f, 1.0f };
 	bool alphaGenConst = false;
 	float alphaConst = 1.0f;
+	// Bounded per-stage depthWrite (the bare `depthWrite` keyword inside the
+	// stage): the stage-local flag is carried into the world/scene draw state.
+	// The adapter's default translucent behavior is depth-test-on/
+	// depth-write-off; WRITE_Z is applied only when this flag is set. Opaque
+	// draws keep their existing depth-write behavior.
+	bool depthWrite = false;
 };
 
 // Strict bounds, independent of the legacy qfiles.h limits so malformed or
@@ -577,6 +592,16 @@ inline bool VRHI_ParseSimpleShaderBlock(
 				}
 				blendSpecified = true;
 				j += consumed;
+				continue;
+			}
+			if (keyword == "depthwrite") {
+				// Bounded per-stage depthWrite: the bare keyword sets the
+				// stage-local depth-write flag carried into the draw state. It
+				// never changes blend classification, and it consumes exactly
+				// one token so a following directive (map, blendFunc, ...)
+				// still parses normally.
+				stage.depthWrite = true;
+				j += 1;
 				continue;
 			}
 			const std::size_t consumed = VRHI_ShaderAllowlistedStatement(tokens, j, stageEnd);

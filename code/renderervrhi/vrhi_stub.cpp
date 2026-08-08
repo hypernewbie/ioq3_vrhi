@@ -130,6 +130,11 @@ struct VRHI_SceneDraw {
 	float rgbConstColor[3] = { 1.0f, 1.0f, 1.0f };
 	uint8_t alphaConst = 0;
 	float alphaConstValue = 1.0f;
+	// Bounded per-draw depthWrite carried from the base stage's explicit
+	// `depthWrite` script statement. The default translucent behavior is
+	// depth-test-on/depth-write-off; WRITE_Z is applied only when this flag
+	// is set. Opaque draws keep writing depth as before.
+	bool depthWrite = false;
 };
 static std::vector<VRHI_SceneEntity> g_sceneEntities;
 static std::vector<VRHI_ScenePoly> g_scenePolys;
@@ -176,8 +181,15 @@ struct VRHI_WorldBatch {
 		{ 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f } };
 	uint8_t stageAlphaConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 	float stageAlphaConstValue[VRHI_SHADER_MAX_STAGES] = { 1.0f, 1.0f, 1.0f, 1.0f };
+	// Per-stage bounded depthWrite (the bare `depthWrite` keyword inside the
+	// stage), carried from the parsed stage data to the draw state.
+	// Translucent base and overlay stages test depth but only write it when
+	// this flag is set; the opaque base stage keeps the existing
+	// depth-write behavior.
+	uint8_t stageDepthWrite[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 	// A non-opaque stage zero is a translucent world batch. It is rendered
-	// after opaque batches in back-to-front order with depth writes disabled.
+	// after opaque batches in back-to-front order with depth writes disabled
+	// unless a stage explicitly declares depthWrite.
 	bool translucent = false;
 };
 struct VRHI_InlineBSPModel {
@@ -204,6 +216,10 @@ struct VRHI_SceneShaderMaterial {
 	float rgbConstColor[3] = { 1.0f, 1.0f, 1.0f };
 	uint8_t alphaConst = 0;
 	float alphaConstValue = 1.0f;
+	// Base-stage bounded depthWrite (explicit `depthWrite` in the shader
+	// script stage). The scene draw applies WRITE_Z for its translucent pass
+	// only when this flag is set; opaque draws keep writing depth.
+	uint8_t depthWrite = 0;
 };
 // Minimal, decoded copies of the BSP PVS traversal state. Values are
 // byte-swapped out of the on-disk little-endian form at load time and copied
@@ -2960,7 +2976,7 @@ static void VRHI_ReportUnresolvedMaterial(const char *shaderName, const char *re
 static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 	uint8_t *blends, int *stageCount, uint8_t *rgbConstFlags,
 	float (*rgbConstColor)[3], uint8_t *alphaConstFlags,
-	float *alphaConstValues) {
+	float *alphaConstValues, uint8_t *depthWriteFlags = nullptr) {
 	if (images == nullptr || blends == nullptr || stageCount == nullptr) return false;
 	*stageCount = 0;
 	for (size_t i = 0; i < VRHI_SHADER_MAX_STAGES; ++i) {
@@ -2974,6 +2990,7 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 		}
 		if (alphaConstFlags != nullptr) alphaConstFlags[i] = 0;
 		if (alphaConstValues != nullptr) alphaConstValues[i] = 1.0f;
+		if (depthWriteFlags != nullptr) depthWriteFlags[i] = 0;
 	}
 	std::vector<VRHI_ShaderStage> stages;
 	std::string directPath;
@@ -3021,23 +3038,13 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 		}
 		if (alphaConstFlags != nullptr) alphaConstFlags[i] = stages[i].alphaGenConst ? 1 : 0;
 		if (alphaConstValues != nullptr) alphaConstValues[i] = stages[i].alphaConst;
+		if (depthWriteFlags != nullptr) depthWriteFlags[i] = stages[i].depthWrite ? 1 : 0;
 	}
 	*stageCount = static_cast<int>(stages.size());
 	if (scriptResolved)
 		VRHI_Printf(PRINT_DEVELOPER, "renderer_vrhi: material '%s' stages=%d\n",
 			shaderName != nullptr ? shaderName : "", *stageCount);
 	return *stageCount > 0;
-}
-
-static bool VRHI_LoadDiffuseTGA(const char *shaderName, int *imageIndex) {
-	int images[VRHI_SHADER_MAX_STAGES];
-	uint8_t blends[VRHI_SHADER_MAX_STAGES];
-	int count = 0;
-	if (imageIndex != nullptr) *imageIndex = -1;
-	if (!VRHI_LoadDiffuseStages(shaderName, images, blends, &count,
-		nullptr, nullptr, nullptr, nullptr)) return false;
-	if (imageIndex != nullptr) *imageIndex = images[0];
-	return true;
 }
 
 static void VRHI_UploadUITextures(void) {
@@ -3625,8 +3632,10 @@ static void VRHI_LoadWorld(const char *name) {
 			{ 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f } };
 		uint8_t stageAlphaConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		float stageAlphaConstValue[VRHI_SHADER_MAX_STAGES] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		uint8_t stageDepthWrite[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		VRHI_LoadDiffuseStages(shader.shader, stageImages, stageBlend, &stageCount,
-			stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue);
+			stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
+			stageDepthWrite);
 		diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 		if (surface.surfaceType == MST_PATCH) {
 			VRHI_PatchMesh patch;
@@ -3667,6 +3676,7 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageRgbConstColor[stage][2] = stageRgbConstColor[stage][2];
 				batch.stageAlphaConst[stage] = stageAlphaConst[stage];
 				batch.stageAlphaConstValue[stage] = stageAlphaConstValue[stage];
+				batch.stageDepthWrite[stage] = stageDepthWrite[stage];
 			}
 			g_worldBatches.push_back(batch);
 			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
@@ -3764,6 +3774,7 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageRgbConstColor[stage][2] = stageRgbConstColor[stage][2];
 				batch.stageAlphaConst[stage] = stageAlphaConst[stage];
 				batch.stageAlphaConstValue[stage] = stageAlphaConstValue[stage];
+				batch.stageDepthWrite[stage] = stageDepthWrite[stage];
 			}
 			g_worldBatches.push_back(batch);
 			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
@@ -3814,13 +3825,56 @@ static void VRHI_LoadWorld(const char *name) {
 			const int surfaceLightmapLayer = lightmapLumpValid &&
 				(shader.surfaceFlags & SURF_NOLIGHTMAP) == 0 && surface.lightmapNum >= 0 &&
 				surface.lightmapNum < g_worldLightmapLayers ? surface.lightmapNum : -1;
-			int diffuseImage = -1;
-			VRHI_LoadDiffuseTGA(shader.shader, &diffuseImage);
+			// Inline BSP surfaces resolve their material through the same bounded
+			// script-stage table as the static world batches, so the model-local
+			// batch carries the base stage's image/blend/const/depthWrite metadata
+			// into the scene draws (VRHI_AppendInlineBSPModel applies stage zero's
+			// blend and depthWrite to the translucent scene pass). The direct-image
+			// fallback is preserved: a name that is neither a direct image nor a
+			// scanned script stage leaves stageCount at zero and the batch keeps
+			// the default opaque/solid behavior. SceneTexture's direct-image early
+			// return reads this pre-resolved draw state, so the metadata must live
+			// on the batch rather than being re-derived from the script table.
+			int stageImages[VRHI_SHADER_MAX_STAGES] = { -1, -1, -1, -1 };
+			uint8_t stageBlend[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+			int stageCount = 0;
+			uint8_t stageRgbConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+			float stageRgbConstColor[VRHI_SHADER_MAX_STAGES][3] = {
+				{ 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f },
+				{ 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f } };
+			uint8_t stageAlphaConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+			float stageAlphaConstValue[VRHI_SHADER_MAX_STAGES] = { 1.0f, 1.0f, 1.0f, 1.0f };
+			uint8_t stageDepthWrite[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+			VRHI_LoadDiffuseStages(shader.shader, stageImages, stageBlend, &stageCount,
+				stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
+				stageDepthWrite);
+			const int diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 			VRHI_InlineBSPModel surfaceModel;
 			if (!VRHI_BuildInlineSurface(vertsData, vertCount, indexesData, indexCount,
 				surface, surfaceLightmapLayer, diffuseImage, &surfaceModel) ||
 				surfaceModel.vertices.empty() || surfaceModel.indexes.empty() ||
 				surfaceModel.batches.empty()) continue;
+			// Copy the decoded stage metadata into the model-local batch exactly
+			// like the static world batches. The inline scene-draw path consumes
+			// only stage zero (image/blend/const/depthWrite); the remaining stages
+			// are retained for consistency and the existing single-stage inline
+			// rendering scope is unchanged.
+			for (VRHI_WorldBatch &batch : surfaceModel.batches) {
+				batch.stageCount = static_cast<uint8_t>(stageCount);
+				batch.translucent = stageCount > 0 &&
+					stageBlend[0] != VRHI_SHADER_BLEND_OPAQUE;
+				for (int stage = 0; stage < stageCount; ++stage) {
+					batch.stageImages[stage] = stageImages[stage];
+					batch.stageBlend[stage] = stageBlend[stage];
+					batch.stageRgbConst[stage] = stageRgbConst[stage];
+					batch.stageRgbConstColor[stage][0] = stageRgbConstColor[stage][0];
+					batch.stageRgbConstColor[stage][1] = stageRgbConstColor[stage][1];
+					batch.stageRgbConstColor[stage][2] = stageRgbConstColor[stage][2];
+					batch.stageAlphaConst[stage] = stageAlphaConst[stage];
+					batch.stageAlphaConstValue[stage] = stageAlphaConstValue[stage];
+					batch.stageDepthWrite[stage] = stageDepthWrite[stage];
+				}
+			}
 			if (inlineModel.vertices.size() > VRHI_MAX_INLINE_VERTICES - surfaceModel.vertices.size() ||
 				inlineModel.indexes.size() > VRHI_MAX_INLINE_INDEXES - surfaceModel.indexes.size() ||
 				inlineModel.batches.size() > VRHI_MAX_INLINE_BATCHES - surfaceModel.batches.size() ||
@@ -4150,7 +4204,8 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	size_t indexCount, int diffuseImage = -1, bool lightmapped = false,
 	bool translucent = false, uint8_t blendMode = VRHI_SHADER_BLEND_OPAQUE,
 	uint8_t rgbConst = 0, const float *rgbConstColor = nullptr,
-	uint8_t alphaConst = 0, float alphaConstValue = 1.0f) {
+	uint8_t alphaConst = 0, float alphaConstValue = 1.0f,
+	bool depthWrite = false) {
 	if (indexCount == 0 || firstIndex > UINT32_MAX || indexCount > UINT32_MAX ||
 		g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) return false;
 	VRHI_SceneDraw draw;
@@ -4169,6 +4224,7 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	}
 	draw.alphaConst = alphaConst;
 	draw.alphaConstValue = alphaConstValue;
+	draw.depthWrite = depthWrite;
 	g_sceneDraws.push_back(draw);
 	return true;
 }
@@ -4246,9 +4302,11 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 			{ 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f } };
 		uint8_t stageAlphaConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		float stageAlphaConstValue[VRHI_SHADER_MAX_STAGES] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		uint8_t stageDepthWrite[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		if (!shaderName.empty())
 			VRHI_LoadDiffuseStages(shaderName.c_str(), images, blends, &stageCount,
-				stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue);
+				stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
+				stageDepthWrite);
 		if (stageCount > 0) {
 			material.diffuseImage = images[0];
 			material.blendMode = blends[0];
@@ -4258,6 +4316,7 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 			material.rgbConstColor[2] = stageRgbConstColor[0][2];
 			material.alphaConst = stageAlphaConst[0];
 			material.alphaConstValue = stageAlphaConstValue[0];
+			material.depthWrite = stageDepthWrite[0];
 		}
 		g_sceneShaderDiffuseByHandle.emplace(draw->shader, material);
 		if (material.diffuseImage >= 0) VRHI_UploadWorldDiffuse();
@@ -4274,6 +4333,7 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 	draw->rgbConstColor[2] = material.rgbConstColor[2];
 	draw->alphaConst = material.alphaConst;
 	draw->alphaConstValue = material.alphaConstValue;
+	draw->depthWrite = material.depthWrite != 0;
 	return image.texture;
 }
 
@@ -4453,7 +4513,8 @@ static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4
 			if (!VRHI_AppendSceneDraw(entity.customShader, firstIndex, scratchIndexes.size(),
 				batch.diffuseImage, lightmapped, color.a < 0.999f, blendMode,
 				rgbConst, batch.stageRgbConstColor[0],
-				alphaConst, batch.stageAlphaConstValue[0])) {
+				alphaConst, batch.stageAlphaConstValue[0],
+				batch.stageDepthWrite[0] != 0)) {
 				g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
 				g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
 				continue;
@@ -4930,14 +4991,16 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 			if (overlay || blended) {
 				const uint64_t blend = VRHI_BlendStateForMode(batch.stageBlend[stage]);
 				// Translucent base stages are rendered after opaque geometry in
-				// back-to-front order. They test depth but never write it. Overlay
-				// stages redraw the same surface, so LEQUAL keeps them visible.
+				// back-to-front order. They test depth but never write it unless
+				// the stage explicitly declares `depthWrite`; overlay stages
+				// redraw the same surface, so LEQUAL keeps them visible.
 				g_worldState.SetProgram(overlay ? g_worldOverlayProgram :
 					(useDiffuse ? g_worldDiffuseProgram : g_worldSolidProgram))
 					.SetStateFlags(VRHI_STATE_WRITE_RGB | VRHI_STATE_WRITE_A |
 						VRHI_STATE_DEPTH_TEST_ENABLE |
 						(overlay ? VRHI_STATE_DEPTH_TEST_LEQUAL : VRHI_STATE_DEPTH_TEST_LESS) |
-						VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES | blend);
+						VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES | blend |
+						(batch.stageDepthWrite[stage] ? VRHI_STATE_WRITE_Z : 0));
 			} else {
 				g_worldState.SetProgram(useDiffuse ? g_worldDiffuseProgram :
 					(useLightmap ? g_worldLightmapProgram : g_worldSolidProgram));
@@ -5025,10 +5088,16 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 				g_worldLightmapPixelShader != VRHI_INVALID_HANDLE;
 			g_worldState = worldBaseState;
 			const uint64_t sceneBlend = VRHI_BlendStateForMode(draw.blendMode);
+			// Translucent scene draws keep the default depth-test-on/
+			// depth-write-off behavior; WRITE_Z is added only when the base
+			// stage explicitly declared depthWrite. Opaque draws keep writing
+			// depth as before.
 			const uint64_t sceneFlags = VRHI_STATE_WRITE_RGB | VRHI_STATE_WRITE_A |
 				VRHI_STATE_DEPTH_TEST_ENABLE | VRHI_STATE_DEPTH_TEST_LESS |
 				VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES |
-				(draw.translucent ? sceneBlend : VRHI_STATE_WRITE_Z);
+				(draw.translucent
+					? (sceneBlend | (draw.depthWrite ? VRHI_STATE_WRITE_Z : 0))
+					: VRHI_STATE_WRITE_Z);
 			g_worldState.SetProgram(textured ? g_worldDiffuseProgram :
 				(lightmapped ? g_worldLightmapProgram : g_worldSolidProgram))
 				.SetStateFlags(sceneFlags)

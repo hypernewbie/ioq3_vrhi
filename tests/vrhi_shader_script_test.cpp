@@ -6,8 +6,10 @@
 // depthFunc lequal/less), malformed statements, and multi-map shaders, plus
 // the bounded multi-stage slice (VRHI_ParseShaderScriptStages: at most four
 // direct-image/static-first-frame stages, common transparent blend modes,
-// ignored-but-bounded UV/time modifiers, and the bounded static const
-// generators rgbGen const / alphaGen const).
+// ignored-but-bounded UV/time modifiers, the bounded static const
+// generators rgbGen const / alphaGen const, and the stage-local depthWrite
+// flag that the adapter applies as WRITE_Z only for explicitly requesting
+// stages/draws).
 //
 // Build and run (any C++11-or-later compiler):
 //   clang++ -std=c++17 -O1 -Wall -Wextra -Werror tests/vrhi_shader_script_test.cpp -o vrhi_shader_script_test && ./vrhi_shader_script_test
@@ -607,6 +609,87 @@ void testConstGenerators() {
 	}
 }
 
+void testStageDepthWrite() {
+	// Bounded per-stage depthWrite: the bare keyword sets the stage-local
+	// flag in the simple multi-stage slice; every stage without it keeps
+	// depth-write disabled (the adapter's default translucent behavior is
+	// depth-test-on/depth-write-off). The flag never changes blend
+	// classification: stage zero stays opaque, later stages keep their
+	// declared/default alpha blend.
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	const std::string depthWriteStages = script(
+		"{ map textures/base.tga depthWrite }\n"
+		"{ map textures/alpha.png blendFunc blend }\n"
+		"{ map textures/overlay.tga blendFunc blend depthWrite }");
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(depthWriteStages), depthWriteStages.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			CHECK(stages[0].depthWrite);
+			CHECK(!stages[1].depthWrite);
+			CHECK(stages[2].depthWrite);
+			CHECK_EQ_INT(stages[0].blendMode, VRHI_SHADER_BLEND_OPAQUE);
+			CHECK_EQ_INT(stages[1].blendMode, VRHI_SHADER_BLEND_ALPHA);
+			CHECK_EQ_INT(stages[2].blendMode, VRHI_SHADER_BLEND_ALPHA);
+		}
+	}
+	// Keyword matching is case-insensitive, like every other directive.
+	const std::string upper = script(
+		"{ map textures/base.tga DEPTHWRITE }\n"
+		"{ map textures/a.png blendFunc blend }\n");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(upper), upper.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 2u);
+		if (stages.size() == 2) {
+			CHECK(stages[0].depthWrite);
+			CHECK(!stages[1].depthWrite);
+		}
+	}
+	// The default for every stage is depth-write disabled, including
+	// translucent overlay stages with no explicit depthWrite.
+	const std::string noFlag = script(
+		"{ map textures/base.tga }\n{ map textures/glow.tga blendFunc add }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(noFlag), noFlag.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 2u);
+		if (stages.size() == 2) {
+			CHECK(!stages[0].depthWrite);
+			CHECK(!stages[1].depthWrite);
+		}
+	}
+	// The conservative first-stage opaque helper still accepts depthWrite as
+	// part of the fixed opaque diffuse pass (it consumes exactly one token).
+	bool ok = false;
+	CHECK_EQ_STR(candidateBody("{ map textures/foo/bar.tga depthWrite }", &ok),
+		"textures/foo/bar.tga");
+	CHECK(ok);
+	// depthWrite consumes exactly one token, so a following directive on the
+	// same stage still parses normally and the flag stays set.
+	const std::string mixed = script(
+		"{ map textures/base.tga depthWrite blendFunc blend }\n");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(mixed), mixed.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(stages[0].depthWrite);
+			CHECK_EQ_INT(stages[0].blendMode, VRHI_SHADER_BLEND_ALPHA);
+		}
+	}
+}
+
 void testConsoleScriptResolution() {
 	// OpenArena defines the in-game console background as a script shader
 	// (scripts/oanew.shader): `console { { map textures/sfx/logo256.tga } }`.
@@ -675,6 +758,7 @@ int main() {
 	testBlockLevelBoundaries();
 	testSimpleMultiStageExtraction();
 	testConstGenerators();
+	testStageDepthWrite();
 	testConsoleScriptResolution();
 	testPathSafetyHelpers();
 
