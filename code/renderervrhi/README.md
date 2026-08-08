@@ -12,7 +12,10 @@ window, and SDL video in that order.
 
 Model, skin, shader, image, world, scene, UI, font, cinematic, screenshot, and
 video-capture resources are intentionally not implemented yet. Their complete
-refexport callbacks are safe no-ops (or return an empty handle) so the client,
-cgame, and UI cannot dereference a null renderer callback. Resize/minimize
-failures are reported as warnings and are not treated as fatal initialization
-errors.
+refexport callbacks are safe no-ops so the client, cgame, and UI cannot
+dereference a null renderer callback. The registration callbacks (models,
+skins, shaders) return stable nonzero engine-local handles with the same
+name-to-handle semantics as the GL renderers, so engine code that treats
+qhandle_t 0 as a load failure proceeds normally; only the name->handle mapping
+is retained, never image, model, or world data. Resize/minimize failures are
+reported as warnings and are not treated as fatal initialization errors.

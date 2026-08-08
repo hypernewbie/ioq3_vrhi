@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 
 #include "q_shared.h"
 #include "renderercommon/tr_public.h"
@@ -444,21 +445,53 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 // Registration, scene, image, and UI resources are intentionally not part of
 // this first slice. Every callback is nevertheless populated so the client,
 // cgame, and UI can safely exercise the renderer without NULL dereferences.
+//
+// The four registration callbacks return stable engine-local qhandles so the
+// client, cgame, and UI see successful registrations (qhandle_t 0 means
+// failure). The handle policy mirrors the GL renderers: each handle space is
+// independent, the first handle is 1, the same name always resolves to the
+// same handle, and NULL/empty names fail with 0. No image, model, or world
+// data is actually loaded or kept beyond the name->handle mapping.
+static qhandle_t VRHI_RegisterName(
+	std::unordered_map<std::string, qhandle_t> &handles, const char *name,
+	const char *kind) {
+	if (name == nullptr || name[0] == '\0') {
+		VRHI_Printf(PRINT_ALL, "renderer_vrhi: %s: NULL name\n", kind);
+		return 0;
+	}
+
+	std::unordered_map<std::string, qhandle_t>::const_iterator it =
+		handles.find(name);
+	if (it != handles.end()) {
+		return it->second;
+	}
+
+	// Handles start at 1 and are never released or reused, so they stay stable
+	// for the lifetime of the renderer DLL.
+	const qhandle_t handle = static_cast<qhandle_t>(handles.size() + 1);
+	handles.emplace(name, handle);
+	VRHI_Printf(PRINT_DEVELOPER,
+		"renderer_vrhi: %s('%s') -> no-op handle %d\n", kind, name, handle);
+	return handle;
+}
+
+static std::unordered_map<std::string, qhandle_t> g_modelHandles;
+static std::unordered_map<std::string, qhandle_t> g_skinHandles;
+static std::unordered_map<std::string, qhandle_t> g_shaderHandles;
+
 static qhandle_t VRHI_RegisterModel(const char *name) {
-	(void)name;
-	return 0;
+	return VRHI_RegisterName(g_modelHandles, name, "RegisterModel");
 }
 static qhandle_t VRHI_RegisterSkin(const char *name) {
-	(void)name;
-	return 0;
+	return VRHI_RegisterName(g_skinHandles, name, "RegisterSkin");
 }
 static qhandle_t VRHI_RegisterShader(const char *name) {
-	(void)name;
-	return 0;
+	return VRHI_RegisterName(g_shaderHandles, name, "RegisterShader");
 }
 static qhandle_t VRHI_RegisterShaderNoMip(const char *name) {
-	(void)name;
-	return 0;
+	// RegisterShader and RegisterShaderNoMip share one handle space, mirroring
+	// the GL renderers where both paths resolve through the same shader table.
+	return VRHI_RegisterName(g_shaderHandles, name, "RegisterShaderNoMip");
 }
 static void VRHI_LoadWorld(const char *name) {
 	(void)name;
