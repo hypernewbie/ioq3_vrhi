@@ -10,12 +10,15 @@ per engine frame. `Shutdown(qfalse)` flushes while retaining the device/window
 for a video restart; `Shutdown(qtrue)` finishes and destroys VRHI, input, the
 window, and SDL video in that order.
 
-Model, skin, shader, image, world, scene, UI, font, cinematic, screenshot, and
+Model, skin, shader, image, world, scene, UI, font, cinematic, and
 video-capture resources are intentionally not implemented yet. Their complete
 refexport callbacks are safe no-ops so the client, cgame, and UI cannot
-dereference a null renderer callback. The registration callbacks (models,
-skins, shaders) return stable nonzero engine-local handles with the same
-name-to-handle semantics as the GL renderers, so engine code that treats
-qhandle_t 0 as a load failure proceeds normally; only the name->handle mapping
-is retained, never image, model, or world data. Resize/minimize failures are
-reported as warnings and are not treated as fatal initialization errors.
+dereference a null renderer callback. The renderer-owned `screenshot` command
+arms a clear-only backbuffer capture ticket; EndFrame synchronously reads the
+bound backbuffer and writes a validated 24-bit BGR TGA when VRHI supports the
+readback. The registration callbacks (models, skins, shaders) return stable
+nonzero engine-local handles with the same name-to-handle semantics as the GL
+renderers, so engine code that treats qhandle_t 0 as a load failure proceeds
+normally; only the name->handle mapping is retained, never image, model, or
+world data. Resize/minimize failures are reported as warnings and are not
+treated as fatal initialization errors.

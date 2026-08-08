@@ -33,15 +33,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "q_shared.h"
 #include "renderercommon/tr_public.h"
 
 // vrhi.h is the public header for the copied prebuilt VRHI library.  The
-// implementation deliberately uses only its device, swapchain, state, and
-// clear/present entry points for now.
+// implementation deliberately uses only its device, swapchain, state,
+// clear/readback/present entry points for now.
 #include <vrhi.h>
 
 namespace {
@@ -53,11 +55,20 @@ static bool g_sdlVideoActive = false;
 static bool g_sdlVideoOwned = false;
 static bool g_inputInitialized = false;
 static bool g_deviceInitialized = false;
+static bool g_screenshotCommandRegistered = false;
+static bool g_captureRequest = false;
+static std::string g_captureName;
+static bool g_frameBackbufferReady = false;
 static int g_windowWidth = 1280;
 static int g_windowHeight = 720;
 static vhState g_frameState;
 static vhTexture g_frameBackbuffer = VRHI_INVALID_HANDLE;
 static const vhStateId g_frameStateId = 1;
+
+// Keep the generated qpath within MAX_QPATH while allowing the command to
+// accept only a basename.  The prefix and suffix are fixed and never come
+// from the command line.
+static const size_t VRHI_MAX_SCREENSHOT_NAME = MAX_QPATH - 16;
 
 static void VRHI_FormatMessage(char *buffer, size_t bufferSize,
 	const char *format, va_list args) {
@@ -258,6 +269,256 @@ static bool VRHI_RefreshSwapchain(void) {
 	return true;
 }
 
+static bool VRHI_IsSafeScreenshotName(const char *name) {
+	if (name == nullptr || name[0] == '\0') {
+		return false;
+	}
+
+	size_t length = 0;
+	for (const unsigned char *cursor =
+		reinterpret_cast<const unsigned char *>(name);
+		*cursor != '\0'; ++cursor) {
+		if (!((*cursor >= 'a' && *cursor <= 'z') ||
+			(*cursor >= 'A' && *cursor <= 'Z') ||
+			(*cursor >= '0' && *cursor <= '9') ||
+			*cursor == '_' || *cursor == '-')) {
+			return false;
+		}
+		++length;
+		if (length > VRHI_MAX_SCREENSHOT_NAME) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static const char *VRHI_TextureFormatName(nvrhi::Format format) {
+	const char *name = vhGetFormat(format).name;
+	return name != nullptr ? name : "UNKNOWN";
+}
+
+static bool VRHI_IsScreenshotFormat(nvrhi::Format format, bool *inputBGRA) {
+	if (inputBGRA != nullptr) {
+		*inputBGRA = false;
+	}
+
+	switch (format) {
+	case nvrhi::Format::RGBA8_UNORM:
+	case nvrhi::Format::SRGBA8_UNORM:
+		return true;
+	case nvrhi::Format::BGRA8_UNORM:
+	case nvrhi::Format::SBGRA8_UNORM:
+	case nvrhi::Format::BGRX8_UNORM:
+	case nvrhi::Format::SBGRX8_UNORM:
+		if (inputBGRA != nullptr) {
+			*inputBGRA = true;
+		}
+		return true;
+	default:
+		return false;
+	}
+}
+
+static void VRHI_Screenshot_f(void) {
+	const int argc = g_ri.Cmd_Argc != nullptr ? g_ri.Cmd_Argc() : 0;
+	const char *name = "shot";
+	if (argc > 2) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: screenshot: expected an optional safe name "
+			"(alphanumeric, underscore, or hyphen)\n");
+		return;
+	}
+	if (argc == 2) {
+		name = g_ri.Cmd_Argv != nullptr ? g_ri.Cmd_Argv(1) : nullptr;
+		if (!VRHI_IsSafeScreenshotName(name)) {
+			VRHI_Printf(PRINT_WARNING,
+				"renderer_vrhi: screenshot: invalid name '%s'; expected "
+				"alphanumeric, underscore, or hyphen\n",
+				name != nullptr ? name : "(null)");
+			return;
+		}
+	}
+
+	// The command never accepts a qpath.  It stores only a validated basename;
+	// EndFrame supplies the fixed screenshots/ prefix and .tga suffix.
+	g_captureName = name;
+	g_captureRequest = true;
+	VRHI_Printf(PRINT_DEVELOPER,
+		"renderer_vrhi: screenshot '%s' queued for the next cleared backbuffer\n",
+		g_captureName.c_str());
+}
+
+static void VRHI_RegisterScreenshotCommand(void) {
+	if (!g_screenshotCommandRegistered && g_ri.Cmd_AddCommand != nullptr) {
+		g_ri.Cmd_AddCommand("screenshot", VRHI_Screenshot_f);
+		g_screenshotCommandRegistered = true;
+	}
+}
+
+static void VRHI_RemoveScreenshotCommand(void) {
+	if (g_screenshotCommandRegistered && g_ri.Cmd_RemoveCommand != nullptr) {
+		g_ri.Cmd_RemoveCommand("screenshot");
+	}
+	g_screenshotCommandRegistered = false;
+}
+
+static bool VRHI_WriteScreenshot(const std::string &name,
+	const std::vector<byte> &tga, int width, int height) {
+	if (!VRHI_IsSafeScreenshotName(name.c_str())) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: screenshot '%s': invalid internal name; write refused\n",
+			name.c_str());
+		return false;
+	}
+	if (tga.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: screenshot '%s': write failed for %dx%d TGA; "
+			"file is too large (%zu bytes)\n",
+			name.c_str(), width, height, tga.size());
+		return false;
+	}
+
+	const std::string path = "screenshots/" + name + ".tga";
+	if (g_ri.FS_WriteFile == nullptr) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: screenshot '%s': write failed for %s; "
+			"FS_WriteFile is unavailable\n", name.c_str(), path.c_str());
+		return false;
+	}
+
+	g_ri.FS_WriteFile(path.c_str(), tga.data(), static_cast<int>(tga.size()));
+	if (g_ri.FS_FileExists == nullptr || !g_ri.FS_FileExists(path.c_str())) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: screenshot '%s': write failed for %s; "
+			"filesystem did not confirm the output\n", name.c_str(), path.c_str());
+		return false;
+	}
+
+	VRHI_Printf(PRINT_ALL, "renderer_vrhi: wrote %s (%dx%d)\n",
+		path.c_str(), width, height);
+	return true;
+}
+
+static bool VRHI_CaptureBackbuffer(void) {
+	const std::string name = g_captureName;
+	const vhTexture backbuffer = g_frameBackbuffer;
+	if (backbuffer == VRHI_INVALID_HANDLE) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: screenshot '%s' pending: invalid backbuffer handle "
+			"0x%08x\n", name.c_str(), backbuffer);
+		return false;
+	}
+
+	std::vector<vhTextureMipInfo> mipInfo;
+	const vhTexInfo info = vhGetTextureInfo(backbuffer, &mipInfo);
+	if (info.dimensions.x <= 0 || info.dimensions.y <= 0 ||
+		info.dimensions.z != 1 || info.arrayLayers != 1 ||
+		info.target != nvrhi::TextureDimension::Texture2D ||
+		mipInfo.empty()) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: screenshot '%s': invalid texture metadata for "
+			"backbuffer handle 0x%08x (target=%d dimensions=%dx%dx%d "
+			"layers=%d mips=%zu)\n", name.c_str(), backbuffer,
+			static_cast<int>(info.target), info.dimensions.x, info.dimensions.y,
+			info.dimensions.z, info.arrayLayers, mipInfo.size());
+		return false;
+	}
+
+	bool inputBGRA = false;
+	if (!VRHI_IsScreenshotFormat(info.format, &inputBGRA)) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: screenshot '%s': unsupported backbuffer format %s "
+			"(%d) for handle 0x%08x; expected a 4-byte RGBA/BGRA UNORM or "
+			"sRGB texture\n", name.c_str(), VRHI_TextureFormatName(info.format),
+			static_cast<int>(info.format), backbuffer);
+		return false;
+	}
+	const vhFormatInfo formatInfo = vhGetFormat(info.format);
+	if (formatInfo.elementSize != 4 || formatInfo.compressionBlockWidth > 1 ||
+		formatInfo.compressionBlockHeight > 1) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: screenshot '%s': unsupported backbuffer format %s "
+			"(%d) for handle 0x%08x; expected an uncompressed 4-byte format\n",
+			name.c_str(), VRHI_TextureFormatName(info.format),
+			static_cast<int>(info.format), backbuffer);
+		return false;
+	}
+
+	const vhTextureMipInfo &baseMip = mipInfo[0];
+	const uint64_t width = static_cast<uint64_t>(info.dimensions.x);
+	const uint64_t height = static_cast<uint64_t>(info.dimensions.y);
+	const uint64_t rowBytes = width * 4;
+	const uint64_t outputPixels = width * height;
+	if (width > 65535 || height > 65535 ||
+		rowBytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+		outputPixels >
+			(static_cast<uint64_t>(std::numeric_limits<size_t>::max()) - 18) / 3 ||
+		baseMip.pitch <= 0 ||
+		static_cast<uint64_t>(baseMip.pitch) < rowBytes ||
+		baseMip.slice_size <= 0 ||
+		static_cast<uint64_t>(baseMip.slice_size) >
+			static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+		static_cast<uint64_t>(baseMip.slice_size) <
+			static_cast<uint64_t>(baseMip.pitch) * height) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: screenshot '%s': invalid readback layout for "
+			"backbuffer handle 0x%08x (dimensions=%ux%u pitch=%d slice=%lld)\n",
+			name.c_str(), backbuffer, static_cast<unsigned>(width),
+			static_cast<unsigned>(height), baseMip.pitch,
+			static_cast<long long>(baseMip.slice_size));
+		return false;
+	}
+
+	const size_t expectedReadbackBytes = static_cast<size_t>(baseMip.slice_size);
+	const size_t outputBytes = 18 + static_cast<size_t>(outputPixels) * 3;
+	vhMem readback;
+	const int32_t errorsBefore = g_vhErrorCounter.load(std::memory_order_relaxed);
+	vhReadTextureSlow(backbuffer, 0, 0, &readback);
+	vhFinish();
+	const int32_t errorsAfter = g_vhErrorCounter.load(std::memory_order_relaxed);
+	if (errorsAfter != errorsBefore || readback.size() != expectedReadbackBytes) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: screenshot '%s': readback failed for backbuffer "
+			"handle 0x%08x; got %zu bytes, expected %zu (VRHI errors %+d)\n",
+			name.c_str(), backbuffer, readback.size(), expectedReadbackBytes,
+			static_cast<int>(errorsAfter - errorsBefore));
+		return false;
+	}
+
+	std::vector<byte> tga(outputBytes, 0);
+	tga[2] = 2; // uncompressed true-color image
+	tga[12] = static_cast<byte>(width & 0xff);
+	tga[13] = static_cast<byte>((width >> 8) & 0xff);
+	tga[14] = static_cast<byte>(height & 0xff);
+	tga[15] = static_cast<byte>((height >> 8) & 0xff);
+	tga[16] = 24; // BGR, with alpha deliberately discarded
+	tga[17] = 0x20; // top-left origin
+
+	// VRHI readback rows are ordered from the top of the 2D image; preserve
+	// that order and advertise it in the TGA descriptor rather than scaling or
+	// depending on alpha.
+	for (size_t y = 0; y < static_cast<size_t>(height); ++y) {
+		const byte *src = readback.data() + y * static_cast<size_t>(baseMip.pitch);
+		byte *dst = tga.data() + 18 + y * static_cast<size_t>(width) * 3;
+		for (size_t x = 0; x < static_cast<size_t>(width); ++x) {
+			const byte *pixel = src + x * 4;
+			if (inputBGRA) {
+				dst[0] = pixel[0];
+				dst[1] = pixel[1];
+				dst[2] = pixel[2];
+			} else {
+				dst[0] = pixel[2];
+				dst[1] = pixel[1];
+				dst[2] = pixel[0];
+			}
+			dst += 3;
+		}
+	}
+
+	return VRHI_WriteScreenshot(name, tga, static_cast<int>(width),
+		static_cast<int>(height));
+}
+
 static void VRHI_FillConfig(glconfig_t *config) {
 	if (config == nullptr) {
 		return;
@@ -296,6 +557,9 @@ static void VRHI_FillConfig(glconfig_t *config) {
 static void VRHI_BeginRegistration(glconfig_t *config) {
 	int requestedWidth;
 	int requestedHeight;
+	VRHI_RegisterScreenshotCommand();
+	g_frameBackbufferReady = false;
+	g_frameBackbuffer = VRHI_INVALID_HANDLE;
 	if (!VRHI_EnsureSDLVideo()) {
 		return;
 	}
@@ -358,9 +622,21 @@ static void VRHI_Shutdown(qboolean destroyWindow) {
 			vhFinish();
 		}
 		g_frameState = vhState();
+		g_frameBackbufferReady = false;
 		g_frameBackbuffer = VRHI_INVALID_HANDLE;
 		return;
 	}
+
+	// A request is an engine-side ticket, not a VRHI command.  Do not leave it
+	// pointing at a destroyed swapchain; a final shutdown cancels it explicitly.
+	if (g_captureRequest) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: screenshot '%s' canceled during final shutdown\n",
+			g_captureName.c_str());
+		g_captureRequest = false;
+		g_captureName.clear();
+	}
+	VRHI_RemoveScreenshotCommand();
 
 	if (g_deviceInitialized) {
 		// vhShutdown also waits internally, but the explicit finish makes this
@@ -381,6 +657,7 @@ static void VRHI_Shutdown(qboolean destroyWindow) {
 		g_window = nullptr;
 	}
 	g_windowHandle = nullptr;
+	g_frameBackbufferReady = false;
 	g_frameBackbuffer = VRHI_INVALID_HANDLE;
 	g_frameState = vhState();
 
@@ -393,6 +670,8 @@ static void VRHI_Shutdown(qboolean destroyWindow) {
 
 static void VRHI_BeginFrame(stereoFrame_t stereoFrame) {
 	(void)stereoFrame;
+	g_frameBackbufferReady = false;
+	g_frameBackbuffer = VRHI_INVALID_HANDLE;
 	if (!g_deviceInitialized) {
 		return;
 	}
@@ -419,6 +698,7 @@ static void VRHI_BeginFrame(stereoFrame_t stereoFrame) {
 		return;
 	}
 	vhClear(g_frameStateId, VRHI_CLEAR_COLOR);
+	g_frameBackbufferReady = true;
 }
 
 static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
@@ -433,13 +713,34 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 	}
 
 	// The client may call BeginFrame twice for stereo, but EndFrame is called
-	// once for the engine frame. Present exactly once here.
+	// once for the engine frame. Present exactly once here. Screenshot capture
+	// is deliberately synchronous and happens before this present, outside any
+	// renderer timing path.
+	if (g_captureRequest) {
+		if (g_frameBackbufferReady) {
+			if (VRHI_CaptureBackbuffer()) {
+				// Only a verified readback and write consume the ticket. Any
+				// transient swapchain/readback failure retries next frame.
+				g_captureRequest = false;
+				g_captureName.clear();
+			}
+		} else {
+			VRHI_Printf(PRINT_WARNING,
+				"renderer_vrhi: screenshot '%s' pending: no cleared backbuffer "
+				"is available this frame (handle=0x%08x)\n",
+				g_captureName.c_str(), g_frameBackbuffer);
+		}
+	}
+
 	if (!vhFrame()) {
 		const glm::uvec2 size = vhGetWindowSize();
 		VRHI_Printf(PRINT_WARNING,
 			"renderer_vrhi: vhFrame present/resize failed (%ux%u); "
 			"window may be minimized or resized\n", size.x, size.y);
 	}
+	// Never let a later EndFrame reuse a framebuffer from after present.
+	g_frameBackbufferReady = false;
+	g_frameBackbuffer = VRHI_INVALID_HANDLE;
 }
 
 // Registration, scene, image, and UI resources are intentionally not part of
