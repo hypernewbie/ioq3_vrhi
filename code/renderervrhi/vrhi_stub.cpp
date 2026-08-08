@@ -3648,6 +3648,12 @@ static void VRHI_AddRefEntityToScene(const refEntity_t *entity) {
 		return;
 	}
 	if (entity->reType < 0 || entity->reType >= RT_MAX_REF_ENTITY_TYPE) return;
+	// RF_THIRD_PERSON marks entities that must NOT draw through the player's
+	// eyes (the player's own body, other players seen only in mirrors). VRHI
+	// renders only the primary view: it has no mirror/portal pipeline
+	// (RT_PORTALSURFACE is a no-op), so third-person-only entities would
+	// otherwise appear as a ghost copy following the camera. Cull them here.
+	if (entity->renderfx & RF_THIRD_PERSON) return;
 	// RT_MODEL is handled during BuildSceneGeometry for MD3 and mapped inline
 	// BSP '*N' handles; BSP model 0 remains on the static world path.
 	// RT_LIGHTNING/RT_RAIL_CORE/RT_RAIL_RINGS ride the bounded camera-facing
@@ -3814,8 +3820,15 @@ static void VRHI_AddAdditiveLightToScene(const vec3_t org, float intensity,
 }
 static glm::mat4 VRHI_QuakeViewMatrix(const refdef_t *fd) {
 	glm::mat4 quakeView(1.0f);
+	// World->camera rotation: result row r must be basis_r . v (basis_0=forward,
+	// basis_1=right, basis_2=up). For a GLM column-major matrix that means
+	// element [col][row] = viewaxis[row][col] (the transpose of the naive
+	// storage). The earlier viewaxis[column][row] form applied the INVERSE
+	// rotation, which still produced valid-looking single yaw views
+	// (R_z(t)^T == R_z(-t), and yaw 180 is its own inverse) but inverted
+	// every other orientation, so real mouse-look orbited the world.
 	for (int column = 0; column < 3; ++column) {
-		for (int row = 0; row < 3; ++row) quakeView[column][row] = fd->viewaxis[column][row];
+		for (int row = 0; row < 3; ++row) quakeView[column][row] = fd->viewaxis[row][column];
 		quakeView[3][column] = -fd->vieworg[0] * fd->viewaxis[column][0] -
 			fd->vieworg[1] * fd->viewaxis[column][1] - fd->vieworg[2] * fd->viewaxis[column][2];
 	}
