@@ -4,8 +4,7 @@ This is the first, deliberately API-neutral benchmark harness for the
 OpenGL 2 and VRHI backends. It is independent of the image smoke tests in
 `tests/image/`.
 
-The harness knows nothing about renderer internals, cvars, or window
-policies. It only:
+The harness knows nothing about renderer internals or cvars. It only:
 
 1. launches a backend command in a fresh process per trial,
 2. hands the process a documented environment contract,
@@ -13,6 +12,10 @@ policies. It only:
 4. discards explicit warmup samples, keeps measured samples,
 5. computes median/mean/p90/p95/p99/MAD/min/max and per-trial spread,
 6. writes raw JSONL plus a summary report under `temp/benchmark/` (ignored).
+
+An opt-in real-engine mode (see below) adds machine-specific plumbing and
+safe common engine args entirely from the command line; all of it defaults
+off so fake backends and unit callers see only the plain contract.
 
 **No GL2/VRHI equivalence is claimed.** This harness reports raw timings
 only; it is not a correctness or parity oracle. Both manifest backends
@@ -67,6 +70,18 @@ python tests/benchmark/run_benchmark.py \
   --order abba --trials 3 --warmup 3 --samples 15 --timeout 120
 ```
 
+Real engine trials (pinned assets, isolated homes, safe common args):
+
+```text
+python tools/get_openarena.py download   # once: pinned assets into temp/assets
+python tests/benchmark/run_benchmark.py \
+  --engine build/llvm-clangcl-release/Release/ioquake3.exe \
+  --backend opengl2 --workload demo-frame \
+  --asset-root temp/assets/openarena-0.8.8 \
+  --no-audio --windowed --vsync-off --fixed-timing --hidden \
+  --trials 3 --warmup 3 --samples 15 --timeout 120
+```
+
 Run with seeded randomized backend order:
 
 ```text
@@ -80,6 +95,40 @@ Unit tests (dependency-free, `unittest`):
 ```text
 python -m unittest discover -s tests/benchmark -p "test_*.py" -v
 ```
+
+## Real-engine trials (opt-in, machine-specific plumbing on the CLI)
+
+The harness core stays API-neutral (env vars + JSONL stdout contract, no
+cvar knowledge). When you actually run the real engine you additionally
+need machine-specific plumbing. All of it is opt-in and lives on the
+command line — never in `workloads.json`:
+
+| Flag | Effect |
+| ---- | ------ |
+| `--asset-root DIR` | Pinned asset root containing the base game directory. Adds `+set fs_basepath DIR` and `+set com_basegame baseoa` to every trial command. Fail-fast validation that `DIR/baseoa` exists. |
+| `--basegame NAME` | Base game directory inside `--asset-root` (default `baseoa`). |
+| `--home-root DIR` | Parent for per-trial isolated `fs_homepath` directories (default `<run root>/homes`, itself under `temp/benchmark`). |
+| `--hidden` | Hide the engine window (Windows: no console window plus periodic hiding of the SDL window; no-op on POSIX). |
+| `--no-audio` | `s_initsound 0`, `s_volume 0`, and `SDL_AUDIODRIVER=dummy`. |
+| `--windowed` | `r_fullscreen 0`. |
+| `--vsync-off` | `r_swapInterval 0` (no swap wait). |
+| `--fixed-timing` | Decouple engine frame timing from display and user config: `sv_cheats 1`, `com_maxfps 0`, `fixedtime 0`, `timescale 1`, `cl_timeNudge 0`. |
+
+Trial command composition stays `engine executable` + engine prefix +
+backend args + workload args, so a backend's own `+set cl_renderer ...`
+still wins and the workload's `+demo` runs last.
+
+**Every trial gets a fresh, empty home directory.** The default home root
+is `<run root>/homes` (the run root is a unique timestamped directory under
+`temp/benchmark`), and each trial home is
+`<home root>/<backend>__<workload>/trial-<n>/home`. No user `q3config.cfg`
+or leftover state is ever reused, and each home is recorded on the trial
+outcome and in `summary.json` (`engine_options`).
+
+Machine-specific paths are deliberately absent from `workloads.json`: the
+manifest stays a pinned, read-only contract. Provision the pinned OpenArena
+assets once with `python tools/get_openarena.py download` and point
+`--asset-root` at `temp/assets/openarena-0.8.8`.
 
 ## Order modes
 
@@ -111,9 +160,9 @@ use the nearest-rank method.
   tree is killed (`taskkill /T /F` on Windows, terminate/kill elsewhere).
 - Processes are created in a fresh process group on Windows and are always
   cleaned up, including on exceptions and Ctrl-C.
-- The harness deliberately implements **no visible-window policy**; backend
-  commands own their window behavior (windowless modes, sound disabling,
-  etc. belong in backend/workload args).
+- Window policy stays opt-in: the harness creates no console window and
+  hides the engine's SDL window only when `--hidden` is passed; otherwise
+  it imposes none (backend commands own their window behavior).
 - All outputs are written below the git-ignored `temp/` directory.
 
 ## The immutable workload manifest

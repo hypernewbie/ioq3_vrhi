@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""API-neutral benchmark harness for ioq3 backends (first scaffold).
+"""API-neutral benchmark harness for ioq3 backends.
 
 Launches a backend command in a fresh process per trial, consumes JSONL
 timing lines (producer/finalize/optional GPU) from stdout, discards explicit
@@ -9,11 +9,14 @@ are written under temp/benchmark/ (git-ignored).
 
 Deliberate boundaries:
 
-- The harness is API-neutral: it knows nothing about renderer internals,
-  cvars, or window policies. It only launches a command, sets documented
-  environment variables, and reads the documented JSONL contract.
-- No visible-window policy lives here; backend commands own their window
-  behavior (e.g. windowless modes).
+- The harness is API-neutral: it knows nothing about renderer internals or
+  cvars. It only launches a command, sets documented environment variables,
+  and reads the documented JSONL contract.
+- An opt-in real-engine mode adds machine-specific plumbing entirely from
+  the command line (--asset-root, --home-root) and safe common engine args
+  (--hidden/--no-audio/--windowed/--vsync-off/--fixed-timing). All of it
+  defaults off, so fake backends and unit callers see the plain contract.
+  Machine-specific paths are never hard-coded into workloads.json.
 - This harness does NOT claim OpenGL-versus-VRHI equivalence. It reports
   raw timings only.
 """
@@ -21,6 +24,8 @@ Deliberate boundaries:
 from __future__ import annotations
 
 import argparse
+import ctypes
+from ctypes import wintypes
 import json
 import os
 import queue
@@ -45,15 +50,55 @@ _EOF = object()
 _WAIT = object()
 
 
-def _windows_process_flags() -> tuple[int, object | None]:
+def _windows_process_flags(
+    hidden: bool = False,
+) -> tuple[int, object | None]:
     """Windows: a fresh process group so a timeout can kill the whole tree.
 
-    Deliberately no CREATE_NO_WINDOW / ShowWindow here: visible-window
-    policy belongs to the backend commands, not this harness.
+    With hidden=True the child also gets no console window and an
+    SW_HIDE startup hint (the engine's own window is hidden afterwards by
+    hide_process_windows). Window policy stays opt-in: the default remains
+    fully neutral.
     """
     if os.name != "nt":
         return 0, None
-    return subprocess.CREATE_NEW_PROCESS_GROUP, None
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP
+    startupinfo = None
+    if hidden:
+        flags |= subprocess.CREATE_NO_WINDOW
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+    return flags, startupinfo
+
+
+def hide_process_windows(pid: int) -> int:
+    """Hide every top-level window owned by pid; return the count touched.
+
+    Windows only; no-op elsewhere. ioquake3 creates its SDL window after
+    startup, so the process-creation hint alone is not enough.
+    """
+    if os.name != "nt":
+        return 0
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+    )
+    hidden = 0
+
+    @callback_type
+    def callback(hwnd: int, _lparam: int) -> bool:
+        nonlocal hidden
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid:
+            user32.ShowWindow(hwnd, 0)  # SW_HIDE
+            hidden += 1
+        return True
+
+    user32.EnumWindows(callback, 0)
+    return hidden
 
 
 def terminate_process_tree(process: subprocess.Popen[object]) -> None:
@@ -111,6 +156,9 @@ def run_trial(
     timeout: float,
     trial_dir: Path,
     environment: dict[str, str],
+    home: Path | None = None,
+    engine_args: Sequence[str] = (),
+    hidden: bool = False,
 ) -> dict[str, object]:
     """Run one fresh backend process and classify its JSONL samples.
 
@@ -118,12 +166,20 @@ def run_trial(
     `samples` are measured; anything after that is extra (counted, excluded
     from statistics). The process is always cleaned up, even on exceptions
     and timeouts.
+
+    Optional real-engine plumbing (all defaults keep the API-neutral
+    behavior): `home` is a fresh, isolated fs_homepath directory created
+    before launch and recorded on the outcome; `engine_args` is the engine
+    argument prefix inserted between the executable and the backend args;
+    `hidden` hides the child's windows on Windows (opt-in window policy).
     """
     trial_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = trial_dir / "stdout.log"
     stderr_path = trial_dir / "stderr.log"
-    command = config.build_command(engine, backend, workload)
-    flags, startupinfo = _windows_process_flags()
+    if home is not None:
+        home.mkdir(parents=True, exist_ok=True)
+    command = config.build_command(engine, backend, workload, engine_args)
+    flags, startupinfo = _windows_process_flags(hidden)
     started = time.monotonic()
 
     outcome: dict[str, object] = {
@@ -135,6 +191,8 @@ def run_trial(
         "duration_seconds": 0.0,
         "error": None,
         "warning": None,
+        "home": str(home) if home is not None else None,
+        "engine_args": list(engine_args),
         "warmup_count": 0,
         "measured_count": 0,
         "extra_count": 0,
@@ -188,6 +246,8 @@ def run_trial(
                         _record_line(item, outcome)
 
                 if process.poll() is None:
+                    if hidden:
+                        hide_process_windows(process.pid)
                     if time.monotonic() >= deadline:
                         outcome["timed_out"] = True
                         terminate_process_tree(process)
@@ -406,6 +466,49 @@ def parse_args() -> argparse.Namespace:
         "--run-root", type=Path, default=DEFAULT_RUN_ROOT,
         help="parent directory for runs (default: temp/benchmark)",
     )
+    parser.add_argument(
+        "--asset-root", type=Path, default=None,
+        help="pinned asset root containing the base game directory (e.g. "
+        "temp/assets/openarena-0.8.8). Machine-specific: supplied on the "
+        "command line only, never stored in workloads.json. Adds +set "
+        "fs_basepath/com_basegame to every trial command.",
+    )
+    parser.add_argument(
+        "--basegame", default=config.BASE_GAME_DEFAULT,
+        help="base game directory inside --asset-root "
+        f"(default: {config.BASE_GAME_DEFAULT})",
+    )
+    parser.add_argument(
+        "--home-root", type=Path, default=None,
+        help="parent for per-trial isolated fs_homepath directories "
+        "(default: <run root>/homes, itself under temp/benchmark). "
+        "Every trial gets a fresh, empty home; no user q3config.cfg is "
+        "ever reused.",
+    )
+    parser.add_argument(
+        "--hidden", action="store_true",
+        help="hide the engine window (Windows: no console window plus "
+        "periodic hiding of the SDL window); no-op on POSIX",
+    )
+    parser.add_argument(
+        "--no-audio", action="store_true",
+        help="disable engine audio (s_initsound 0, s_volume 0, "
+        "SDL_AUDIODRIVER=dummy)",
+    )
+    parser.add_argument(
+        "--windowed", action="store_true",
+        help="run windowed instead of fullscreen (r_fullscreen 0)",
+    )
+    parser.add_argument(
+        "--vsync-off", action="store_true",
+        help="disable swap interval (r_swapInterval 0)",
+    )
+    parser.add_argument(
+        "--fixed-timing", action="store_true",
+        help="decouple engine frame timing from display and user config "
+        "(sv_cheats 1, com_maxfps 0, fixedtime 0, timescale 1, "
+        "cl_timeNudge 0)",
+    )
     return parser.parse_args()
 
 
@@ -439,6 +542,18 @@ def main() -> int:
     engine = find_engine(args.engine)
     plan = config.plan_order([b.name for b in backends], trials, order, seed)
 
+    engine_opts = config.EngineOptions(
+        asset_root=args.asset_root,
+        home_root=args.home_root,
+        basegame=args.basegame,
+        hidden=args.hidden,
+        no_audio=args.no_audio,
+        windowed=args.windowed,
+        vsync_off=args.vsync_off,
+        fixed_timing=args.fixed_timing,
+    )
+    engine_opts.validate()
+
     for backend in backends:
         if not backend.jsonl_support:
             print(
@@ -452,6 +567,7 @@ def main() -> int:
     )
     run_root.mkdir(parents=True, exist_ok=False)
     raw_path = run_root / "raw.jsonl"
+    home_root = engine_opts.resolved_home_root(run_root)
 
     by_backend = {b.name: b for b in backends}
     trial_counts: dict[str, int] = defaultdict(int)
@@ -464,6 +580,7 @@ def main() -> int:
         f"[bench] manifest: {manifest.path} sha256={manifest.sha256}\n"
         f"[bench] order={order} seed={seed} trials={trials} "
         f"warmup={warmup} samples={samples} timeout={timeout:g}s\n"
+        f"[bench] engine options: {json.dumps(engine_opts.as_dict(home_root))}\n"
         f"[bench] execution order: {' > '.join(plan)}"
     )
 
@@ -479,7 +596,10 @@ def main() -> int:
                     / f"{backend_name}__{workload.name}"
                     / f"trial-{trial_number}"
                 )
-                environment = os.environ.copy()
+                home = config.trial_home(
+                    home_root, backend_name, workload.name, trial_number
+                )
+                environment = engine_opts.environment(os.environ.copy())
                 environment.update(
                     config.benchmark_env(backend_name, warmup, samples)
                 )
@@ -492,6 +612,9 @@ def main() -> int:
                     timeout,
                     trial_dir,
                     environment,
+                    home=home,
+                    engine_args=engine_opts.command_prefix(home),
+                    hidden=engine_opts.hidden,
                 )
                 outcome["trial"] = trial_number
                 outcomes_by_cell[(backend_name, workload.name)].append(outcome)
@@ -546,6 +669,7 @@ def main() -> int:
             "samples": samples,
             "timeout_seconds": timeout,
         },
+        "engine_options": engine_opts.as_dict(home_root),
         "execution_order": plan,
         "results": cells,
     }

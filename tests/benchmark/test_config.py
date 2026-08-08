@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from benchmark_config import (  # noqa: E402
     Backend,
+    EngineOptions,
     Workload,
     benchmark_env,
     build_command,
@@ -19,6 +20,7 @@ from benchmark_config import (  # noqa: E402
     plan_order,
     resolve_backends,
     resolve_workloads,
+    trial_home,
     validate_run_config,
 )
 from benchmark_protocol import (  # noqa: E402
@@ -264,6 +266,78 @@ class RunConfigTests(unittest.TestCase):
                 ENV_SAMPLES: "15",
                 ENV_BACKEND: "opengl2",
             },
+        )
+
+
+class EngineOptionsTests(unittest.TestCase):
+    def test_default_is_fully_neutral(self) -> None:
+        opts = EngineOptions()
+        self.assertEqual(opts.command_prefix(None), [])
+        self.assertEqual(opts.environment({"A": "1"}), {"A": "1"})
+        self.assertIsNone(opts.resolved_asset_root())
+        self.assertEqual(
+            opts.resolved_home_root(Path("run")), Path("run") / "homes"
+        )
+        self.assertEqual(opts.as_dict(Path("run/homes"))["asset_root"], None)
+
+    def test_asset_root_and_home_are_cli_only_paths(self) -> None:
+        opts = EngineOptions(asset_root=Path("assets"), basegame="baseoa")
+        prefix = opts.command_prefix(Path("home/trial-1"))
+        self.assertEqual(prefix[0], "+set")
+        self.assertEqual(prefix[prefix.index("fs_basepath") + 1],
+                         str(Path("assets").resolve()))
+        self.assertEqual(prefix[prefix.index("com_basegame") + 1], "baseoa")
+        self.assertEqual(prefix[prefix.index("fs_homepath") + 1],
+                         str(Path("home/trial-1")))
+
+    def test_flag_cvars(self) -> None:
+        cases = (
+            (EngineOptions(no_audio=True),
+             ("s_initsound", "0", "s_volume", "0")),
+            (EngineOptions(windowed=True), ("r_fullscreen", "0")),
+            (EngineOptions(vsync_off=True), ("r_swapInterval", "0")),
+            (EngineOptions(fixed_timing=True),
+             ("sv_cheats", "1", "com_maxfps", "0", "fixedtime", "0",
+              "timescale", "1", "cl_timeNudge", "0")),
+        )
+        for opts, expected in cases:
+            prefix = opts.command_prefix(None)
+            self.assertEqual(prefix, ["+set"] + list(expected))
+
+    def test_no_audio_env_override(self) -> None:
+        env = EngineOptions(no_audio=True).environment({"SDL_AUDIODRIVER": "x"})
+        self.assertEqual(env["SDL_AUDIODRIVER"], "dummy")
+
+    def test_validate_requires_basegame_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            opts = EngineOptions(asset_root=root, basegame="baseoa")
+            with self.assertRaises(ValueError):
+                opts.validate()
+            (root / "baseoa").mkdir()
+            opts.validate()  # must not raise
+            with self.assertRaises(ValueError):
+                EngineOptions(asset_root=root, basegame="bad name").validate()
+
+    def test_trial_home_layout_and_uniqueness(self) -> None:
+        root = Path("homes")
+        a1 = trial_home(root, "opengl2", "demo-frame", 1)
+        a2 = trial_home(root, "opengl2", "demo-frame", 2)
+        b1 = trial_home(root, "vrhi", "demo-frame", 1)
+        self.assertEqual(a1, root / "opengl2__demo-frame" / "trial-1" / "home")
+        self.assertEqual(len({a1, a2, b1}), 3)
+
+    def test_build_command_with_engine_args_order(self) -> None:
+        command = build_command(
+            Path("engine.exe"),
+            Backend("b", ("+set", "cl_renderer", "opengl2")),
+            Workload("w", ("+demo", "d1")),
+            engine_args=("+set", "fs_homepath", "H"),
+        )
+        self.assertEqual(
+            command,
+            ["engine.exe", "+set", "fs_homepath", "H",
+             "+set", "cl_renderer", "opengl2", "+demo", "d1"],
         )
 
 

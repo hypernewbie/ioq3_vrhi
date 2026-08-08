@@ -7,11 +7,13 @@ import tempfile
 import time
 from pathlib import Path
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import benchmark_config as config  # noqa: E402
 import benchmark_protocol as protocol  # noqa: E402
+import run_benchmark  # noqa: E402
 from run_benchmark import run_trial  # noqa: E402
 
 # Emits warmup + samples lines, but never more than 5 total (so an
@@ -57,6 +59,15 @@ FAKE_GARBAGE = (
 )
 
 FAKE_STDERR = "import sys; sys.stderr.write('backend warning\\n'); sys.stderr.flush()\n"
+
+# Writes a marker file into the fresh home directory (env FAKE_HOME), then
+# emits a valid sample.
+FAKE_HOME_WRITER = r"""
+import json, os, sys
+open(os.path.join(os.environ["FAKE_HOME"], "marker.txt"), "w").write("fresh\n")
+print(json.dumps({"event": "sample", "producer_seconds": 0.01,
+                  "finalize_seconds": 0.002}), flush=True)
+"""
 
 FAKE_OVERFLOW = r"""
 import json, os, sys
@@ -219,6 +230,100 @@ class TrialRunnerTests(unittest.TestCase):
             self.assertIsNone(result.sample.gpu_seconds)
             self.assertGreaterEqual(result.sample.producer_seconds, 0.0)
             self.assertGreaterEqual(result.sample.finalize_seconds, 0.0)
+
+    def test_engine_args_flow_into_command_before_backend_args(self) -> None:
+        # python-flag engine args keep the fake python backend functional and
+        # prove run_trial inserts the engine prefix ahead of the backend args.
+        environment = self.env_base.copy()
+        environment.update(config.benchmark_env("fake", 0, 1))
+        backend = config.Backend(name="argv", args=("-c", FAKE_ENGINE))
+        engine_args = ["-B", "-X", "utf8"]
+        outcome = run_trial(
+            self.engine, backend, self.workload, 0, 1, 30.0,
+            self._tmp / "argv-trial", environment, engine_args=engine_args,
+        )
+        self.assertIsNone(outcome["error"])
+        self.assertEqual(outcome["engine_args"], engine_args)
+        self.assertEqual(
+            outcome["command"],
+            [sys.executable, "-B", "-X", "utf8", "-c", FAKE_ENGINE],
+        )
+
+    def test_realistic_engine_args_appear_verbatim_in_command(self) -> None:
+        # Real engine args are not python options, so the fake exits early;
+        # the point is only that they reach the command unchanged and ahead
+        # of the backend args.
+        environment = self.env_base.copy()
+        environment.update(config.benchmark_env("fake", 0, 1))
+        backend = config.Backend(name="argv", args=("-c", FAKE_ENGINE))
+        engine_args = ["+set", "fs_homepath", "H", "+set", "com_maxfps", "0"]
+        outcome = run_trial(
+            self.engine, backend, self.workload, 0, 1, 30.0,
+            self._tmp / "argv-real", environment, engine_args=engine_args,
+        )
+        self.assertEqual(
+            outcome["command"],
+            [sys.executable] + engine_args + ["-c", FAKE_ENGINE],
+        )
+        self.assertEqual(outcome["engine_args"], engine_args)
+
+    def test_trial_home_is_created_fresh_and_recorded(self) -> None:
+        home = self._tmp / "homes" / "opengl2__demo-frame" / "trial-1" / "home"
+        environment = self.env_base.copy()
+        environment.update(config.benchmark_env("fake", 0, 1))
+        environment["FAKE_HOME"] = str(home)
+        backend = config.Backend(name="home", args=("-c", FAKE_HOME_WRITER))
+        outcome = run_trial(
+            self.engine, backend, self.workload, 0, 1, 30.0,
+            self._tmp / "home-trial", environment, home=home,
+        )
+        self.assertIsNone(outcome["error"])
+        self.assertEqual(outcome["home"], str(home))
+        self.assertTrue(home.is_dir())
+        self.assertTrue((home / "marker.txt").is_file())
+
+    def test_default_trial_home_is_none(self) -> None:
+        outcome = self.run_trial(warmup=0, samples=1)
+        self.assertIsNone(outcome["home"])
+        self.assertEqual(outcome["engine_args"], [])
+
+
+class ParseArgsTests(unittest.TestCase):
+    def test_engine_flags_parse(self) -> None:
+        argv = [
+            "run_benchmark.py",
+            "--asset-root", "temp/assets/openarena-0.8.8",
+            "--basegame", "baseoa",
+            "--home-root", "temp/benchmark/homes",
+            "--hidden", "--no-audio", "--windowed",
+            "--vsync-off", "--fixed-timing",
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            args = run_benchmark.parse_args()
+        self.assertEqual(
+            str(args.asset_root), os.path.join("temp", "assets", "openarena-0.8.8")
+        )
+        self.assertEqual(args.basegame, "baseoa")
+        self.assertEqual(
+            str(args.home_root), os.path.join("temp", "benchmark", "homes")
+        )
+        self.assertTrue(args.hidden)
+        self.assertTrue(args.no_audio)
+        self.assertTrue(args.windowed)
+        self.assertTrue(args.vsync_off)
+        self.assertTrue(args.fixed_timing)
+
+    def test_engine_flags_default_off(self) -> None:
+        with mock.patch.object(sys, "argv", ["run_benchmark.py"]):
+            args = run_benchmark.parse_args()
+        self.assertIsNone(args.asset_root)
+        self.assertIsNone(args.home_root)
+        self.assertFalse(args.hidden)
+        self.assertFalse(args.no_audio)
+        self.assertFalse(args.windowed)
+        self.assertFalse(args.vsync_off)
+        self.assertFalse(args.fixed_timing)
+        self.assertEqual(args.basegame, config.BASE_GAME_DEFAULT)
 
 
 if __name__ == "__main__":

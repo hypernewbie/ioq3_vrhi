@@ -17,6 +17,20 @@ from typing import Any, Sequence
 
 from benchmark_protocol import ENV_BACKEND, ENV_JSONL, ENV_SAMPLES, ENV_WARMUP
 
+# Opt-in real-engine cvars. Machine-specific paths (asset root, home root)
+# never appear here: they are passed on the command line at run time.
+BASE_GAME_DEFAULT = "baseoa"
+NO_AUDIO_CVARS = ("s_initsound", "0", "s_volume", "0")
+WINDOWED_CVARS = ("r_fullscreen", "0")
+VSYNC_OFF_CVARS = ("r_swapInterval", "0")
+FIXED_TIMING_CVARS = (
+    "sv_cheats", "1",
+    "com_maxfps", "0",
+    "fixedtime", "0",
+    "timescale", "1",
+    "cl_timeNudge", "0",
+)
+
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 SCHEMA = 1
 KNOWN_FIELDS = {"producer_seconds", "finalize_seconds", "gpu_seconds"}
@@ -49,6 +63,113 @@ class Manifest:
     workloads: tuple[Workload, ...]
     path: Path
     sha256: str
+
+
+@dataclass(frozen=True)
+class EngineOptions:
+    """Opt-in real-engine launch options; all paths are machine-specific.
+
+    Every field defaults to the API-neutral empty state: no extra command
+    arguments and no environment overrides. Machine-specific paths (asset
+    root, home root) come from the command line only; they never belong in
+    the committed manifest (see workloads.json).
+    """
+
+    asset_root: Path | None = None
+    home_root: Path | None = None
+    basegame: str = BASE_GAME_DEFAULT
+    hidden: bool = False
+    no_audio: bool = False
+    windowed: bool = False
+    vsync_off: bool = False
+    fixed_timing: bool = False
+
+    def resolved_asset_root(self) -> Path | None:
+        if self.asset_root is None:
+            return None
+        return self.asset_root.expanduser().resolve()
+
+    def resolved_home_root(self, run_root: Path) -> Path:
+        """Parent for per-trial isolated homes (default: under the run
+        root, which itself lives under temp/benchmark)."""
+        if self.home_root is None:
+            return run_root / "homes"
+        return self.home_root.expanduser().resolve()
+
+    def validate(self) -> None:
+        """Fail fast on obviously unusable engine options."""
+        root = self.resolved_asset_root()
+        if root is None:
+            return
+        if not SAFE_NAME.fullmatch(self.basegame):
+            raise ValueError(f"unsafe base game name: {self.basegame!r}")
+        if not (root / self.basegame).is_dir():
+            raise ValueError(
+                f"asset root {root} does not contain a {self.basegame!r} "
+                "directory (provision it with tools/get_openarena.py download)"
+            )
+
+    def command_prefix(self, home: Path | None) -> list[str]:
+        """Engine argument prefix (+set cvar pairs) for one trial.
+
+        Empty when fully neutral. The prefix always precedes backend and
+        workload args in the final command, so a backend's own +set (e.g.
+        cl_renderer) still wins on the command line.
+        """
+        args: list[str] = []
+        root = self.resolved_asset_root()
+        if root is not None:
+            args += ["+set", "fs_basepath", str(root),
+                     "+set", "com_basegame", self.basegame]
+        if home is not None:
+            args += ["+set", "fs_homepath", str(home)]
+        if self.no_audio:
+            args += ["+set"] + list(NO_AUDIO_CVARS)
+        if self.windowed:
+            args += ["+set"] + list(WINDOWED_CVARS)
+        if self.vsync_off:
+            args += ["+set"] + list(VSYNC_OFF_CVARS)
+        if self.fixed_timing:
+            args += ["+set"] + list(FIXED_TIMING_CVARS)
+        return args
+
+    def environment(self, base: dict[str, str]) -> dict[str, str]:
+        """The API-neutral environment plus opt-in overrides."""
+        env = dict(base)
+        if self.no_audio:
+            env["SDL_AUDIODRIVER"] = "dummy"
+        return env
+
+    def as_dict(self, home_root: Path) -> dict[str, object]:
+        """Provenance for the summary report."""
+        root = self.resolved_asset_root()
+        return {
+            "asset_root": str(root) if root is not None else None,
+            "home_root": str(home_root),
+            "basegame": self.basegame,
+            "hidden": self.hidden,
+            "no_audio": self.no_audio,
+            "windowed": self.windowed,
+            "vsync_off": self.vsync_off,
+            "fixed_timing": self.fixed_timing,
+        }
+
+
+def trial_home(
+    home_root: Path, backend_name: str, workload_name: str, trial_number: int
+) -> Path:
+    """Fresh, isolated fs_homepath directory for one trial.
+
+    The run root is a unique timestamped directory, so a home produced
+    here never existed before this invocation; each trial therefore starts
+    with an empty home (no user q3config.cfg, no leftover state).
+    """
+    return (
+        home_root
+        / f"{backend_name}__{workload_name}"
+        / f"trial-{trial_number}"
+        / "home"
+    )
 
 
 def _check_safe_name(label: str, value: str) -> None:
@@ -233,9 +354,25 @@ def validate_run_config(
         )
 
 
-def build_command(engine: Path, backend: Backend, workload: Workload) -> list[str]:
-    """API-neutral command: engine executable + backend args + workload args."""
-    return [str(engine)] + list(backend.args) + list(workload.args)
+def build_command(
+    engine: Path,
+    backend: Backend,
+    workload: Workload,
+    engine_args: Sequence[str] = (),
+) -> list[str]:
+    """API-neutral command: engine executable + optional engine prefix +
+    backend args + workload args.
+
+    engine_args is the opt-in real-engine prefix (fs_basepath/fs_homepath
+    and safe cvar pairs); it defaults to empty so the plain concatenation
+    contract is unchanged.
+    """
+    return (
+        [str(engine)]
+        + list(engine_args)
+        + list(backend.args)
+        + list(workload.args)
+    )
 
 
 def plan_order(
