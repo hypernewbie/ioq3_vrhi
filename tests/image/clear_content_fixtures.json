@@ -1,0 +1,132 @@
+{
+  "schema": 1,
+  "description": "Synthetic RGB8 frames that pin the clear-only vs renderer-output boundary for the dependency-free frame classifier. Each fixture generates a small in-memory frame and asserts the expected class; no engine, Vulkan, or GL is required.",
+  "defaults": {
+    "width": 64,
+    "height": 64,
+    "seed": 20260808,
+    "expected_clear_color": [9, 14, 22]
+  },
+  "fixtures": [
+    {
+      "id": "clear-only-vrhi",
+      "pattern": "uniform",
+      "color": [9, 14, 22],
+      "expect": "clear_only",
+      "description": "VRHI clear color with no renderer-owned draws."
+    },
+    {
+      "id": "clear-only-black-no-expectation",
+      "pattern": "uniform",
+      "color": [0, 0, 0],
+      "expected_clear_color": null,
+      "expect": "clear_only",
+      "description": "Uniform frame of any color is clear_only when no clear expectation is configured."
+    },
+    {
+      "id": "flat-world-fill",
+      "pattern": "uniform",
+      "color": [61, 107, 56],
+      "expect": "uniform_other",
+      "description": "Full-frame flat world-shader fill (0.24, 0.42, 0.22): uniform but not the clear, so it is never mistaken for clear_only."
+    },
+    {
+      "id": "ui-rect",
+      "pattern": "rect",
+      "background": [9, 14, 22],
+      "color": [255, 0, 0],
+      "rect": [0.25, 0.25, 0.5, 0.5],
+      "expect": "content",
+      "description": "Solid-color UI rectangle over the clear, as drawn by VRHI_DrawStretchPic."
+    },
+    {
+      "id": "ui-thin-bar",
+      "pattern": "rect",
+      "background": [9, 14, 22],
+      "color": [255, 255, 255],
+      "rect": [0.0, 0.9, 1.0, 0.02],
+      "expect": "content",
+      "description": "Thin one-to-two-pixel UI bar still crosses the content threshold."
+    },
+    {
+      "id": "world-partial-fill",
+      "pattern": "rect",
+      "background": [9, 14, 22],
+      "color": [61, 107, 56],
+      "rect": [0.0, 0.5, 1.0, 0.5],
+      "expect": "content",
+      "description": "Flat world fill over half the frame: two regions, so content."
+    },
+    {
+      "id": "speck-tiny",
+      "pattern": "speck",
+      "background": [9, 14, 22],
+      "color": [255, 255, 255],
+      "count": 1,
+      "expect": "clear_only",
+      "description": "A single deviating pixel is below the noise-envelope fraction and stays clear_only."
+    },
+    {
+      "id": "speck-many",
+      "pattern": "speck",
+      "background": [9, 14, 22],
+      "color": [255, 255, 255],
+      "count": 400,
+      "expect": "content",
+      "description": "A large speck population crosses the content threshold."
+    },
+    {
+      "id": "noise-small",
+      "pattern": "noise",
+      "background": [9, 14, 22],
+      "amplitude": 1,
+      "expect": "clear_only",
+      "description": "Capture noise inside the per-channel envelope stays clear_only."
+    },
+    {
+      "id": "noise-large",
+      "pattern": "noise",
+      "background": [9, 14, 22],
+      "amplitude": 32,
+      "expect": "content",
+      "description": "Strong channel noise is treated as drawn content."
+    },
+    {
+      "id": "gradient",
+      "pattern": "gradient",
+      "from": [9, 14, 22],
+      "to": [255, 255, 255],
+      "expect": "content",
+      "description": "A color ramp is unambiguous renderer output."
+    },
+    {
+      "id": "checker",
+      "pattern": "checker",
+      "a": [9, 14, 22],
+      "b": [255, 0, 0],
+      "cell": 8,
+      "expect": "content",
+      "description": "Structured two-color pattern is content."
+    },
+    {
+      "id": "threshold-strict-speck",
+      "pattern": "speck",
+      "background": [9, 14, 22],
+      "color": [255, 255, 255],
+      "count": 10,
+      "max_non_modal_fraction": 0.0001,
+      "expect": "content",
+      "description": "A strict noise-envelope knob promotes a few specks to content."
+    },
+    {
+      "id": "threshold-loose-speck",
+      "pattern": "speck",
+      "background": [9, 14, 22],
+      "color": [255, 255, 255],
+      "count": 10,
+      "max_non_modal_fraction": 0.01,
+      "expect": "clear_only",
+      "description": "A loose noise-envelope knob keeps the same specks clear_only."
+    }
+  ]
+}
