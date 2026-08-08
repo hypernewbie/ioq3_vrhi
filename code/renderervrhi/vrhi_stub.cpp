@@ -51,6 +51,7 @@
 #include "renderervrhi/vrhi_dlight.h"
 #include "renderervrhi/vrhi_font.h"
 #include "renderervrhi/vrhi_skin.h"
+#include "renderervrhi/vrhi_video_capture.h"
 #include "renderervrhi/vrhi_shader_script.h"
 
 // vrhi.h is the public header for the copied prebuilt VRHI library.  The
@@ -335,6 +336,22 @@ static int g_frameViewportHeight = 0;
 static bool g_screenshotCommandRegistered = false;
 static bool g_captureRequest = false;
 static std::string g_captureName;
+// Only caller-owned pointers are retained for one engine frame. The request
+// is consumed before present, including on failure, so stale pointers cannot
+// survive a failed readback or shutdown.
+static const int VRHI_MAX_VIDEO_DIMENSION = 8192;
+static const size_t VRHI_MAX_VIDEO_FRAME_BYTES = 64u * 1024u * 1024u;
+// AVI_LINE_PADDING from qcommon is part of the refimport ABI contract; keep
+// this renderer independent of the client-only qcommon header.
+static const size_t VRHI_AVI_LINE_PADDING = 4;
+struct VRHI_VideoCaptureRequest {
+	bool pending = false;
+	int width = 0;
+	int height = 0;
+	byte *captureBuffer = nullptr;
+	byte *encodeBuffer = nullptr;
+};
+static VRHI_VideoCaptureRequest g_videoCapture;
 static bool g_frameBackbufferReady = false;
 static int g_windowWidth = 1280;
 static int g_windowHeight = 720;
@@ -747,6 +764,81 @@ static bool VRHI_WriteScreenshot(const std::string &name,
 	return true;
 }
 
+struct VRHI_BackbufferReadback {
+	vhMem data;
+	int width = 0;
+	int height = 0;
+	size_t pitch = 0;
+	bool inputBGRA = false;
+};
+
+static bool VRHI_ReadBackBackbuffer(vhTexture backbuffer, const char *kind,
+	VRHI_BackbufferReadback *out) {
+	if (out == nullptr) return false;
+	*out = VRHI_BackbufferReadback();
+	if (backbuffer == VRHI_INVALID_HANDLE) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: %s: invalid backbuffer handle 0x%08x\n", kind, backbuffer);
+		return false;
+	}
+	std::vector<vhTextureMipInfo> mipInfo;
+	const vhTexInfo info = vhGetTextureInfo(backbuffer, &mipInfo);
+	if (info.dimensions.x <= 0 || info.dimensions.y <= 0 ||
+		info.dimensions.z != 1 || info.arrayLayers != 1 ||
+		info.target != nvrhi::TextureDimension::Texture2D || mipInfo.empty() ||
+		info.dimensions.x > VRHI_MAX_VIDEO_DIMENSION ||
+		info.dimensions.y > VRHI_MAX_VIDEO_DIMENSION) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: %s: invalid/oversized backbuffer metadata for handle "
+			"0x%08x (target=%d dimensions=%dx%dx%d layers=%d mips=%zu)\n", kind,
+			backbuffer, static_cast<int>(info.target), info.dimensions.x,
+			info.dimensions.y, info.dimensions.z, info.arrayLayers, mipInfo.size());
+		return false;
+	}
+	bool inputBGRA = false;
+	if (!VRHI_IsScreenshotFormat(info.format, &inputBGRA)) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: %s: unsupported backbuffer format %s (%d) for handle "
+			"0x%08x; expected an uncompressed 4-byte RGBA/BGRA format\n", kind,
+			VRHI_TextureFormatName(info.format), static_cast<int>(info.format), backbuffer);
+		return false;
+	}
+	const vhFormatInfo formatInfo = vhGetFormat(info.format);
+	if (formatInfo.elementSize != 4 || formatInfo.compressionBlockWidth > 1 ||
+		formatInfo.compressionBlockHeight > 1) return false;
+	const vhTextureMipInfo &baseMip = mipInfo[0];
+	const size_t width = static_cast<size_t>(info.dimensions.x);
+	const size_t height = static_cast<size_t>(info.dimensions.y);
+	const size_t rowBytes = width * 4;
+	if (height > (std::numeric_limits<size_t>::max)() / rowBytes ||
+		rowBytes * height > VRHI_MAX_VIDEO_FRAME_BYTES || baseMip.pitch <= 0 ||
+		static_cast<size_t>(baseMip.pitch) < rowBytes || baseMip.slice_size <= 0 ||
+		static_cast<uint64_t>(baseMip.slice_size) > VRHI_MAX_VIDEO_FRAME_BYTES ||
+		static_cast<uint64_t>(baseMip.slice_size) <
+			static_cast<uint64_t>(baseMip.pitch) * height) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: %s: invalid readback layout for handle 0x%08x\n",
+			kind, backbuffer);
+		return false;
+	}
+	const size_t expectedBytes = static_cast<size_t>(baseMip.slice_size);
+	const int32_t errorsBefore = g_vhErrorCounter.load(std::memory_order_relaxed);
+	vhReadTextureSlow(backbuffer, 0, 0, &out->data);
+	vhFinish();
+	const int32_t errorsAfter = g_vhErrorCounter.load(std::memory_order_relaxed);
+	if (errorsAfter != errorsBefore || out->data.size() != expectedBytes) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: %s: readback failed for handle 0x%08x; got %zu, expected %zu\n",
+			kind, backbuffer, out->data.size(), expectedBytes);
+		return false;
+	}
+	out->width = info.dimensions.x;
+	out->height = info.dimensions.y;
+	out->pitch = static_cast<size_t>(baseMip.pitch);
+	out->inputBGRA = inputBGRA;
+	return true;
+}
+
 static bool VRHI_CaptureBackbuffer(void) {
 	const std::string name = g_captureName;
 	const vhTexture backbuffer = g_frameBackbuffer;
@@ -865,6 +957,52 @@ static bool VRHI_CaptureBackbuffer(void) {
 
 	return VRHI_WriteScreenshot(name, tga, static_cast<int>(width),
 		static_cast<int>(height));
+}
+
+static void VRHI_CaptureVideoFrame(void) {
+	const VRHI_VideoCaptureRequest request = g_videoCapture;
+	g_videoCapture = VRHI_VideoCaptureRequest();
+	if (!request.pending || !g_frameBackbufferReady || request.encodeBuffer == nullptr) {
+		if (request.pending) VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: AVI video capture dropped: no usable backbuffer or encode buffer\n");
+		return;
+	}
+	VRHI_BackbufferReadback readback;
+	if (!VRHI_ReadBackBackbuffer(g_frameBackbuffer, "AVI video capture", &readback) ||
+		readback.width != request.width || readback.height != request.height) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: AVI video capture dropped: backbuffer dimensions do not match %dx%d\n",
+			request.width, request.height);
+		return;
+	}
+	const size_t width = static_cast<size_t>(request.width);
+	const size_t height = static_cast<size_t>(request.height);
+	const size_t aviLineBytes = width * 3;
+	const size_t aviPitch = (aviLineBytes + (VRHI_AVI_LINE_PADDING - 1)) /
+		VRHI_AVI_LINE_PADDING * VRHI_AVI_LINE_PADDING;
+	if (height > (std::numeric_limits<size_t>::max)() / aviPitch ||
+		aviPitch * height > VRHI_MAX_VIDEO_FRAME_BYTES ||
+		aviPitch * height > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+		!vrhi_video::ConvertTopFirstRGBA8ToBottomUpBGR24(
+			readback.data.data(), readback.pitch, request.width, request.height,
+			readback.inputBGRA, request.encodeBuffer, aviPitch, aviPitch * height)) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: AVI video capture dropped: bounded pixel conversion failed\n");
+		return;
+	}
+	if (request.captureBuffer != nullptr) {
+		const size_t capturePitch = width * 4;
+		for (size_t y = 0; y < height; ++y) {
+			std::memcpy(request.captureBuffer + y * capturePitch,
+				readback.data.data() + y * readback.pitch, capturePitch);
+		}
+	}
+	if (g_ri.CL_WriteAVIVideoFrame != nullptr) {
+		g_ri.CL_WriteAVIVideoFrame(request.encodeBuffer, static_cast<int>(aviPitch * height));
+	} else {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: AVI video capture dropped: writer is unavailable\n");
+	}
 }
 
 static void VRHI_FillConfig(glconfig_t *config) {
@@ -1662,6 +1800,7 @@ static void VRHI_Shutdown(qboolean destroyWindow) {
 		// unconditional CPU cleanup also clears script caches if registration
 		// failed before a device was created.
 		VRHI_DestroyWorldResources(true);
+		g_videoCapture = VRHI_VideoCaptureRequest();
 		if (g_deviceInitialized) {
 			VRHI_DestroyUITextures(false);
 			VRHI_DestroyCinematicTextures();
@@ -1685,6 +1824,7 @@ static void VRHI_Shutdown(qboolean destroyWindow) {
 		g_captureRequest = false;
 		g_captureName.clear();
 	}
+	g_videoCapture = VRHI_VideoCaptureRequest();
 	VRHI_RemoveScreenshotCommand();
 
 	if (g_deviceInitialized) {
@@ -1790,9 +1930,8 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 	}
 
 	// The client may call BeginFrame twice for stereo, but EndFrame is called
-	// once for the engine frame. Present exactly once here. Screenshot capture
-	// is deliberately synchronous and happens before this present, outside any
-	// renderer timing path.
+	// once for the engine frame. Present exactly once here. Screenshot and AVI
+	// capture happen synchronously before this present.
 	if (g_captureRequest) {
 		if (g_frameBackbufferReady) {
 			if (VRHI_CaptureBackbuffer()) {
@@ -1807,6 +1946,9 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 				"is available this frame (handle=0x%08x)\n",
 				g_captureName.c_str(), g_frameBackbuffer);
 		}
+	}
+	if (g_videoCapture.pending) {
+		VRHI_CaptureVideoFrame();
 	}
 
 	if (!vhFrame()) {
@@ -4704,17 +4846,40 @@ static qboolean VRHI_InPVS(const vec3_t p1, const vec3_t p2) {
 	return (row[cluster2 >> 3] & static_cast<byte>(1 << (cluster2 & 7))) != 0
 		? qtrue : qfalse;
 }
-static void VRHI_TakeVideoFrame(int h, int w, byte *captureBuffer,
+static void VRHI_TakeVideoFrame(int width, int height, byte *captureBuffer,
 	byte *encodeBuffer, qboolean motionJpeg) {
-	// Deliberate, documented no-op: the renderer owns no framebuffer readback
-	// video-capture path. The engine's CL_TakeVideoFrame (cl_avi.c) passes
-	// caller-owned buffers; leaving them untouched is the safe fallback and
-	// matches the previous slice behavior exactly (no AVI capture support).
-	(void)h;
-	(void)w;
-	(void)captureBuffer;
-	(void)encodeBuffer;
-	(void)motionJpeg;
+	if (motionJpeg) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: MJPEG AVI capture is unsupported; no frame queued\n");
+		return;
+	}
+	if (!g_deviceInitialized || width <= 0 || height <= 0 ||
+		width > VRHI_MAX_VIDEO_DIMENSION || height > VRHI_MAX_VIDEO_DIMENSION ||
+		encodeBuffer == nullptr) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: AVI video capture rejected: invalid %dx%d, NULL encode "
+			"buffer, or renderer unavailable (cap=%d)\n", width, height,
+			VRHI_MAX_VIDEO_DIMENSION);
+		return;
+	}
+	const size_t w = static_cast<size_t>(width);
+	const size_t h = static_cast<size_t>(height);
+	const size_t captureBytes = w * 4 * h;
+	const size_t aviPitch = ((w * 3) + (VRHI_AVI_LINE_PADDING - 1)) /
+		VRHI_AVI_LINE_PADDING * VRHI_AVI_LINE_PADDING;
+	if (captureBytes > VRHI_MAX_VIDEO_FRAME_BYTES ||
+		h > (std::numeric_limits<size_t>::max)() / aviPitch ||
+		aviPitch * h > VRHI_MAX_VIDEO_FRAME_BYTES ||
+		aviPitch * h > static_cast<size_t>(std::numeric_limits<int>::max())) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: AVI video capture rejected: frame exceeds bounded caps\n");
+		return;
+	}
+	g_videoCapture.pending = true;
+	g_videoCapture.width = width;
+	g_videoCapture.height = height;
+	g_videoCapture.captureBuffer = captureBuffer;
+	g_videoCapture.encodeBuffer = encodeBuffer;
 }
 #ifdef __USEA3D
 static void VRHI_A3DRenderGeometry(void *pVoidA3D, void *pVoidGeom,

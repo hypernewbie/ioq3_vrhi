@@ -146,9 +146,13 @@ self-sufficient like the GL1 path: it (re)uploads when the slot is empty or the
 frame dimensions changed, then draws a full-cell textured UI rectangle through
 the same UI state/program and UV/color semantics as `DrawStretchPic`. Slots are
 destroyed on `Shutdown(qfalse)` restart, `Shutdown(qtrue)` final teardown, and
-reset on no-device failures. `TakeVideoFrame` remains an explicit, documented
-no-op (no AVI capture). Every refexport callback is populated so the client, cgame,
-and UI cannot dereference a null renderer callback. Model, skin, shader, and
+reset on no-device failures. Raw AVI BI_RGB capture is supported: a bounded
+one-frame-late request reads the final pre-present RGBA/BGRA backbuffer, fills
+the optional caller capture buffer, and writes bottom-up padded BGR rows.
+MJPEG capture remains explicitly unsupported and queues no frame; unsupported
+framebuffer formats/readback failures fall back with a warning. Every refexport
+callback is populated so the client, cgame, and UI cannot dereference a null
+renderer callback. Model, skin, shader, and
 unsupported material registrations retain stable name-to-handle mappings; eligible UI image
 pixels are retained under bounded caps for video restart while their VRHI
 textures are destroyed and re-uploaded at the next registration, and final
