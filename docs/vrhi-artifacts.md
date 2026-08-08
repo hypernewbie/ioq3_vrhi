@@ -28,16 +28,18 @@ root); `<config>` is `debug` or `release`:
 | Artifact | Source | Destination (under the destination worktree) |
 | --- | --- | --- |
 | Dependency libraries (6 files) | `lib/win_llvm_md_<config>/` | `code/thirdparty/vrhi/lib/win_llvm_md_<config>/` |
-| VRHI static library | `build/windows-llvm-md-release/vrhi_md.lib` or `build/windows-llvm-md-debug/vrhi_md.lib` | same relative path under `code/thirdparty/vrhi/` |
+| VRHI static library | `build/windows-llvm-md-release/vrhi_md.lib` or `build/windows-llvm-md-debug/vrhi_mdd.lib` | same relative path under `code/thirdparty/vrhi/` |
 | Dependency build state | `.vdeps-state.json` | `code/thirdparty/vrhi/.vdeps-state.json` |
 | Hash manifest (written) | — | `code/thirdparty/vrhi/vrhi-manifest.json` |
 
 The destination layout mirrors the ioq3_vrhi repository layout, where the
 VRHI submodule lives at `code/thirdparty/vrhi`.
 
-The VRHI static library is taken from the single build tree that exists.
-If both release and debug variants exist the source is ambiguous and the
-tool refuses; if none exists the tool reports it as missing.
+The selected configuration must contain exactly one `vrhi_*.lib`. The
+standalone VRHI CMake target names the release archive `vrhi_md.lib` and the
+Debug archive `vrhi_mdd.lib`; an extra stale archive in the selected build
+directory is refused as ambiguous. Release and debug directories may both
+exist because `--config` selects one explicitly.
 
 ## Usage
 

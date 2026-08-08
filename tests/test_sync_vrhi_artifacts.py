@@ -41,19 +41,23 @@ def make_artifact_root(parent: Path, configs=("debug", "release")) -> Path:
     """
     source = parent / "vrhi"
     (source / "lib").mkdir(parents=True)
-    (source / "build" / "windows-llvm-md-release").mkdir(parents=True)
     for config in configs:
+        (source / "build" / f"windows-llvm-md-{config}").mkdir(parents=True)
         config_dir = source / "lib" / f"win_llvm_md_{config}"
         config_dir.mkdir(parents=True)
         for name in tool.DEPENDENCY_LIBRARIES:
             (config_dir / name).write_bytes(fake_lib_content(config, name))
-    (source / "build" / "windows-llvm-md-release" / "vrhi_md.lib").write_bytes(
-        STATIC_RELEASE
-    )
+    for config in configs:
+        static_name = tool.STATIC_LIBRARY_NAMES[config]
+        static_content = STATIC_RELEASE if config == "release" else STATIC_DEBUG
+        (source / "build" / f"windows-llvm-md-{config}" / static_name).write_bytes(
+            static_content
+        )
     (source / ".vdeps-state.json").write_text(
         json.dumps({"schema": 1, "records": {}}), encoding="utf-8"
     )
     # Build-tree internals and sources that must never be copied.
+    (source / "build" / "windows-llvm-md-release").mkdir(parents=True, exist_ok=True)
     (source / "build" / "windows-llvm-md-release" / "CMakeCache.txt").write_text(
         "cache", encoding="utf-8"
     )
@@ -165,11 +169,6 @@ class SyncVrhiArtifactsTests(unittest.TestCase):
     def test_uses_debug_static_library_when_only_debug_built(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = make_artifact_root(Path(tmp), configs=("debug",))
-            (source / "build" / "windows-llvm-md-debug").mkdir(parents=True)
-            (source / "build" / "windows-llvm-md-release" / "vrhi_md.lib").unlink()
-            (source / "build" / "windows-llvm-md-debug" / "vrhi_md.lib").write_bytes(
-                STATIC_DEBUG
-            )
             destination = Path(tmp) / "ioq3"
             destination.mkdir()
 
@@ -181,7 +180,7 @@ class SyncVrhiArtifactsTests(unittest.TestCase):
             self.assertEqual(code, 0, err)
             copied = (
                 self.artifact_dir(destination)
-                / "build" / "windows-llvm-md-debug" / "vrhi_md.lib"
+                / "build" / "windows-llvm-md-debug" / "vrhi_mdd.lib"
             )
             self.assertEqual(copied.read_bytes(), STATIC_DEBUG)
 
@@ -223,8 +222,7 @@ class SyncVrhiArtifactsTests(unittest.TestCase):
     def test_ambiguous_static_library_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = make_artifact_root(Path(tmp))
-            (source / "build" / "windows-llvm-md-debug").mkdir(parents=True)
-            (source / "build" / "windows-llvm-md-debug" / "vrhi_md.lib").write_bytes(
+            (source / "build" / "windows-llvm-md-release" / "vrhi_mdd.lib").write_bytes(
                 STATIC_DEBUG
             )
             destination = Path(tmp) / "ioq3"

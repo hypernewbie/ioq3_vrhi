@@ -29,8 +29,13 @@ endif()
 set(VRHI_DEPENDENCY_DIR
     "${VRHI_ROOT}/lib/win_llvm_md_${VRHI_CONFIG_LOWER}" CACHE PATH
     "Directory containing copied VRHI dependency libraries")
+if(VRHI_CONFIG_LOWER STREQUAL "debug")
+    set(_VRHI_STATIC_LIBRARY_NAME "vrhi_mdd.lib")
+else()
+    set(_VRHI_STATIC_LIBRARY_NAME "vrhi_md.lib")
+endif()
 set(VRHI_STATIC_LIBRARY
-    "${VRHI_ROOT}/build/windows-llvm-md-${VRHI_CONFIG_LOWER}/vrhi_md.lib"
+    "${VRHI_ROOT}/build/windows-llvm-md-${VRHI_CONFIG_LOWER}/${_VRHI_STATIC_LIBRARY_NAME}"
     CACHE FILEPATH "Copied VRHI static library")
 set(VRHI_INCLUDE_DIR "${VRHI_ROOT}/include" CACHE PATH
     "Optional copied VRHI include directory")

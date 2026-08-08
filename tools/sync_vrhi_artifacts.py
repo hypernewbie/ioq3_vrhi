@@ -21,12 +21,14 @@ Artifacts (paths relative to the VRHI artifact root):
     lib/win_llvm_md_<config>/nvrhi_vk.lib          dependency lib
     lib/win_llvm_md_<config>/rtxmu.lib             dependency lib
     lib/win_llvm_md_<config>/vk-bootstrap.lib      dependency lib
-    build/windows-llvm-md-<config>/vrhi_md.lib     VRHI static library
+    build/windows-llvm-md-release/vrhi_md.lib     VRHI static library
+    build/windows-llvm-md-debug/vrhi_mdd.lib       VRHI static library
     .vdeps-state.json                              dependency build state
 
-<config> is selected with --config (debug or release). The VRHI static
-library is taken from the single build tree that exists; if both release
-and debug variants exist the source is ambiguous and the tool refuses.
+<config> is selected with --config (debug or release). The selected
+configuration supplies the VRHI static library; release and debug build
+trees may both exist. An extra `vrhi_*.lib` in the selected tree is
+ambiguous and is refused.
 
 Destination layout mirrors the ioq3_vrhi repository: artifacts land below
 <destination-root>/code/thirdparty/vrhi/, and the hash manifest is
@@ -70,13 +72,13 @@ DEPENDENCY_LIBRARIES = (
     "vk-bootstrap.lib",
 )
 
-# VRHI static library candidates. The dependency build emits one static
-# library per build tree; at most one variant may exist and exactly one is
-# required. Two variants at once is ambiguous and refused.
-STATIC_LIBRARY_CANDIDATES = (
-    "build/windows-llvm-md-release/vrhi_md.lib",
-    "build/windows-llvm-md-debug/vrhi_md.lib",
-)
+# VRHI's standalone CMake target uses `vrhi_md.lib` for RelWithDebInfo and
+# `vrhi_mdd.lib` for Debug. Only the selected configuration is considered;
+# an extra vrhi_*.lib in that same build directory is treated as ambiguous.
+STATIC_LIBRARY_NAMES = {
+    "debug": "vrhi_mdd.lib",
+    "release": "vrhi_md.lib",
+}
 
 # Dependency build state file written next to the artifacts.
 STATE_FILE = ".vdeps-state.json"
@@ -99,8 +101,8 @@ def build_plan(source_root: Path, config: str) -> list[tuple[Path, Path]]:
     """Validate sources and return [(dest-relative path, source path)] pairs.
 
     Raises RuntimeError when the source root is not a VRHI artifact root,
-    when any expected artifact is missing, or when the VRHI static library
-    is ambiguous (more than one variant exists).
+    when any expected artifact is missing, or when the selected VRHI static
+    library is ambiguous (more than one variant exists in that build tree).
     """
     if not source_root.is_dir():
         raise RuntimeError(f"--source-root is not a directory: {source_root}")
@@ -121,21 +123,25 @@ def build_plan(source_root: Path, config: str) -> list[tuple[Path, Path]]:
         else:
             missing.append(rel)
 
-    static = [
-        Path(candidate)
-        for candidate in STATIC_LIBRARY_CANDIDATES
-        if (source_root / candidate).is_file()
-    ]
+    static_dir = source_root / "build" / f"windows-llvm-md-{config}"
+    static_name = STATIC_LIBRARY_NAMES[config]
+    static = sorted(static_dir.glob("vrhi_*.lib")) if static_dir.is_dir() else []
+    expected_static = Path("build") / f"windows-llvm-md-{config}" / static_name
     if len(static) > 1:
         raise RuntimeError(
-            "ambiguous VRHI static library, multiple variants exist:\n  "
-            + "\n  ".join(str(source_root / candidate) for candidate in static)
+            "ambiguous VRHI static library in selected configuration:\n  "
+            + "\n  ".join(str(path) for path in static)
             + "\nremove the stale variant and re-run"
         )
+    if static and static[0].name != static_name:
+        raise RuntimeError(
+            f"unexpected VRHI static library name in {static_dir}: "
+            f"{static[0].name} (expected {static_name})"
+        )
     if static:
-        plan.append((static[0], source_root / static[0]))
+        plan.append((expected_static, static[0]))
     else:
-        missing.extend(Path(candidate) for candidate in STATIC_LIBRARY_CANDIDATES)
+        missing.append(expected_static)
 
     plan.append((Path(STATE_FILE), source_root / STATE_FILE))
 
