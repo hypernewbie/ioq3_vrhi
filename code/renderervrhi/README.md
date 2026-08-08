@@ -83,9 +83,18 @@ by `tests/vrhi_dlight_test.cpp`.
 `Shutdown(qtrue)` finishes and destroys VRHI, input, the window, and SDL video in
 that order.
 
-RT_SPRITE and RT_BEAM entities plus AddPolyToScene triangle-fan batches are
+RT_SPRITE entities plus AddPolyToScene triangle-fan batches are
 retained in bounded CPU scene storage and rendered as camera-facing 3D geometry
-after the static world. Registered direct image handles are reused when
+after the static world. RT_BEAM, RT_LIGHTNING, RT_RAIL_CORE, and RT_RAIL_RINGS
+are emitted through the same bounded camera-facing beam-quad fallback: one flat
+view-facing quad spanning entity origin..oldorigin with a fixed bounded
+per-type width (beam honors a bounded `frame` scale; lightning 8, rail core 6,
+rail rings 16), textured with the entity customShader (solid fallback) and
+modulated by entity color plus the bounded dynamic-light add. This is a
+beam-quad approximation, NOT full rail ring geometry or lightning shader-stage
+parity: no rings, no rotated rail-core passes, no shader stages, and no segment
+animation; the GL renderers' r_railWidth/r_railCoreWidth cvars are not honored.
+Registered direct image handles are reused when
 available, with a solid fallback. Scene CPU submissions and renderer-owned
 transient vertex/index buffers reset on ClearScene and are destroyed on restart
 and shutdown. RT_MODEL supports bounded MD3 data and safe inline BSP names
@@ -97,7 +106,7 @@ handles registered before a load cannot retain stale model indices; ModelBounds
 works for both MD3 and inline BSP models, while LerpTag remains false for inline.
 Inline geometry has strict per-model and aggregate caps and malformed surfaces
 are skipped safely. MD3 normal decoding/lighting and full material/shader
-parity remain unsupported, as do rail, lightning, portal, and video-capture
+parity remain unsupported, as do portal and video-capture
 resources (safe no-ops); bounded surface-name `.skin` overrides are supported
 (next paragraph).
 
@@ -164,6 +173,8 @@ are exposed by the focused `vrhi_image_decode.h` API and use puff/libjpeg
 target-locally. The TGA decoder is exercised standalone by
 `tests/vrhi_tga_decode_test.cpp` (any C++17 compiler; no engine or third-party
 dependencies), the fixed-cell font UV/scale helpers are exercised
-standalone by `tests/vrhi_font_test.cpp`, and the bounded `.skin` text parser
-is exercised standalone by `tests/vrhi_skin_test.cpp`. Resize/minimize failures are reported as warnings and are not
+standalone by `tests/vrhi_font_test.cpp`, the bounded `.skin` text parser
+is exercised standalone by `tests/vrhi_skin_test.cpp`, and the bounded
+beam-quad fallback type/width helpers are exercised standalone by
+`tests/vrhi_beam_test.cpp`. Resize/minimize failures are reported as warnings and are not
 treated as fatal initialization errors.

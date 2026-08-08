@@ -50,13 +50,19 @@ website for updated status.
 ## VRHI renderer scene slice
 
 The optional `renderer_vrhi` backend retains bounded submissions between
-`ClearScene` and `RenderScene`. `RT_SPRITE` and `RT_BEAM` are emitted as
-camera-facing 3D quads, and `AddPolyToScene` emits validated triangle-fan
+`ClearScene` and `RenderScene`. `RT_SPRITE` is emitted as a camera-facing 3D
+quad, and `RT_BEAM`, `RT_LIGHTNING`, `RT_RAIL_CORE`, and `RT_RAIL_RINGS` all
+share the same bounded camera-facing beam-quad fallback (a single flat quad
+spanning `origin`..`oldorigin` with fixed bounded per-type widths, the entity
+customShader texture, and entity color/dynamic-light modulation; this is a
+beam-quad approximation, not full rail-ring/lightning geometry or shader
+stages). `AddPolyToScene` emits validated triangle-fan
 batches after the static BSP world. Registered direct image handles are used
 when available, with a solid fallback otherwise. CPU and GPU scene storage is
 capped and reset on restart/shutdown. `RT_MODEL` (including MD3 and inline BSP
-submodels) and complex material/effect types remain documented safe no-ops in
-this initial slice; the static BSP world remains supported.
+submodels) is supported; `RT_PORTALSURFACE` and other complex material/effect
+types remain documented safe no-ops in this slice; the static BSP world remains
+supported.
 
 ## Just want to play ioquake3?
 Check out our Player's Guide here:

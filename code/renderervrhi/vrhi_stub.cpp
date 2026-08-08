@@ -51,6 +51,7 @@
 #include "renderervrhi/vrhi_dlight.h"
 #include "renderervrhi/vrhi_font.h"
 #include "renderervrhi/vrhi_skin.h"
+#include "renderervrhi/vrhi_beam.h"
 #include "renderervrhi/vrhi_video_capture.h"
 #include "renderervrhi/vrhi_shader_script.h"
 
@@ -1980,7 +1981,8 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 	g_frameBackbuffer = VRHI_INVALID_HANDLE;
 }
 
-// RT_SPRITE/RT_BEAM and AddPolyToScene are retained in bounded CPU scene
+// RT_SPRITE and the RT_BEAM/RT_LIGHTNING/RT_RAIL_CORE/RT_RAIL_RINGS
+// beam-quad fallback plus AddPolyToScene are retained in bounded CPU scene
 // storage and uploaded after the static BSP world. DrawStretchPic supports
 // bounded direct image UI textures and retains a solid-color fallback for
 // missing/unsupported handles, while the first BSP model and its bounded image
@@ -3588,7 +3590,10 @@ static void VRHI_AddRefEntityToScene(const refEntity_t *entity) {
 	if (entity->reType < 0 || entity->reType >= RT_MAX_REF_ENTITY_TYPE) return;
 	// RT_MODEL is handled during BuildSceneGeometry for MD3 and mapped inline
 	// BSP '*N' handles; BSP model 0 remains on the static world path.
-	if (entity->reType != RT_MODEL && entity->reType != RT_SPRITE && entity->reType != RT_BEAM) {
+	// RT_LIGHTNING/RT_RAIL_CORE/RT_RAIL_RINGS ride the bounded camera-facing
+	// beam-quad path used by RT_BEAM (see VRHI_BeamFallbackSupported).
+	if (entity->reType != RT_MODEL && entity->reType != RT_SPRITE &&
+		!VRHI_BeamFallbackSupported(static_cast<int>(entity->reType))) {
 		// Report each unsupported type once per renderer lifetime instead of
 		// once per entity per frame; model entities dominate real scenes and
 		// would otherwise flood developer-mode console output.
@@ -4055,7 +4060,13 @@ static bool VRHI_BuildSceneGeometry(const refdef_t *fd) {
 			const glm::vec3 corners[4] = { center - left - up, center + left - up,
 				center + left + up, center - left + up };
 			VRHI_AppendSceneQuad(corners, color, shader);
-		} else if (entity.reType == RT_BEAM) {
+		} else if (VRHI_BeamFallbackSupported(static_cast<int>(entity.reType))) {
+			// Bounded camera-facing beam-quad fallback shared by RT_BEAM,
+			// RT_LIGHTNING, RT_RAIL_CORE, and RT_RAIL_RINGS. This is an
+			// approximation: one flat view-facing quad along origin..oldorigin
+			// with a fixed bounded per-type width, customShader texture, and
+			// entity color/dynamic-light modulation. It is NOT full rail ring
+			// geometry or lightning shader-stage parity.
 			const glm::vec3 start(entity.origin[0], entity.origin[1], entity.origin[2]);
 			const glm::vec3 end(entity.oldorigin[0], entity.oldorigin[1], entity.oldorigin[2]);
 			const glm::vec3 direction = end - start;
@@ -4068,7 +4079,10 @@ static bool VRHI_BuildSceneGeometry(const refdef_t *fd) {
 				sideLength = glm::dot(side, side);
 			}
 			if (sideLength <= 1.0e-8f || !std::isfinite(sideLength)) continue;
-			const float width = entity.frame > 0 ? glm::clamp(entity.frame * 0.5f, 0.25f, 4096.0f) : 4.0f;
+			// entity.frame is an int (finite by construction) and every width
+			// is bounded by VRHI_BeamFallbackWidth.
+			const float width = VRHI_BeamFallbackWidth(
+				static_cast<int>(entity.reType), entity.frame);
 			side *= width / std::sqrt(sideLength);
 			const glm::vec3 corners[4] = { start - side, end - side, end + side, start + side };
 			VRHI_AppendSceneQuad(corners, color, shader);
