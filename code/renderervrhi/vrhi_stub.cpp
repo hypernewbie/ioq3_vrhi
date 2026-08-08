@@ -567,7 +567,7 @@ static void VRHI_FillConfig(glconfig_t *config) {
 // This shader is deliberately a solid-color UI fallback. It draws no texture
 // or world content; the shader handle and texture coordinates remain ignored.
 static const char *VRHI_UIVertexSource = R"(
-cbuffer UIParams : register(b0, VRHI_STAGE_SPACE)
+cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
 {
     float4 ui_rect;
 };
@@ -592,7 +592,7 @@ VSOutput main(uint vertexID : SV_VertexID)
 )";
 
 static const char *VRHI_UIPixelSource = R"(
-cbuffer UIColor : register(b1, VRHI_STAGE_SPACE)
+cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
 {
     float4 ui_color;
 };
@@ -653,8 +653,14 @@ static bool VRHI_InitializeUI(void) {
 		g_uiPixelShader == VRHI_INVALID_HANDLE) {
 		VRHI_Printf(PRINT_WARNING,
 			"renderer_vrhi: solid-color UI shader allocation failed\n");
-		// Allocation alone does not enqueue a backend resource, so there is
-		// nothing to destroy on this failure path.
+		// Release whichever IDs were allocated. No create command has been
+		// submitted yet, so this cannot destroy a backend shader resource.
+		if (g_uiVertexShader != VRHI_INVALID_HANDLE) {
+			vhDestroyShader(g_uiVertexShader);
+		}
+		if (g_uiPixelShader != VRHI_INVALID_HANDLE) {
+			vhDestroyShader(g_uiPixelShader);
+		}
 		g_uiVertexShader = VRHI_INVALID_HANDLE;
 		g_uiPixelShader = VRHI_INVALID_HANDLE;
 		return false;
