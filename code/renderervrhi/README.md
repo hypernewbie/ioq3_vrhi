@@ -10,11 +10,16 @@ device and primary swapchain, clears the acquired backbuffer, draws bounded TGA,
 engine frame. Missing, malformed, unsupported, or oversized material names use
 a solid-color fallback.
 
-The static BSP world path is deliberately scoped to planar and triangle-soup
-surfaces. It preserves BSP lightmap UVs and indices, uploads raw 128x128 RGB
-lightmap blocks as a VRHI texture array, and samples them with a fixed world
-shader. A bounded diffuse subset decodes direct, uncompressed (type 2) and
-run-length encoded (type 10) 24/32-bit true-color TGA files plus JPG/JPEG and
+The static BSP world path supports planar, triangle-soup, and bounded quadratic
+patch surfaces. Patch control grids must have odd dimensions of at least 3,
+pass finite/range checks, and stay within explicit control, block, and aggregate
+geometry caps; each overlapping 3x3 block is tessellated at four subdivisions
+with nondegenerate triangles and retains interpolated diffuse/lightmap UVs.
+Each patch is one batch mapped to its original BSP surface, so leafsurface PVS
+culling remains intact. It preserves BSP lightmap UVs and indices, uploads raw
+128x128 RGB lightmap blocks as a VRHI texture array, and samples them with a
+fixed world shader. A bounded diffuse subset decodes direct, uncompressed (type 2)
+and run-length encoded (type 10) 24/32-bit true-color TGA files plus JPG/JPEG and
 8-bit RGB/RGBA/grayscale/gray-alpha/indexed PNG files named by BSP shaders (bare
 names probe bounded supported extensions; explicit extensions are preserved),
 retains per-surface UVs, and issues texture batches. Missing, corrupt,
@@ -35,9 +40,9 @@ A bounded first-stage shader-script diffuse lookup is supported for BSP maps:
 `scripts/*.shader` is scanned once per map, matching BSP shader names and taking
 the first non-special `map`/`clampmap` image stage into a copied cache. This
 is not full Quake shader/material parity; deform, fog, blend, additional
-stage/material semantics, PK3 material stages, patches, area/door masking,
-entities, and corresponding renderer parity remain unsupported and fall back to
-the existing lightmap/solid path. Script file count, per-file/aggregate text,
+stage/material semantics, PK3 material stages, area/door masking, entities, and
+corresponding renderer parity remain unsupported and fall back to the existing
+lightmap/solid path. Script file count, per-file/aggregate text,
 token, candidate image, and decoded image memory are bounded, so malformed or
 oversized input is rejected safely.
 
@@ -46,9 +51,9 @@ oversized input is rejected safely.
 that order.
 
 Model, skin, general shader-script/JPG/PNG/PK3 material stages, scene entities,
-patches, fonts, cinematics, and video-capture resources are intentionally not
-implemented. Shader registration admits bounded TGA/JPG/JPEG/PNG names (bare names probe
-`.tga`, `.jpg`, `.jpeg`, and `.png`; explicit supported extensions are not
+fonts, cinematics, and video-capture resources are intentionally not
+implemented. Shader registration admits bounded TGA/JPG/JPEG/PNG names (bare
+names probe `.tga`, `.jpg`, `.jpeg`, and `.png`; explicit supported extensions are not
 rewritten); the BSP-only first-stage script lookup uses the same image resolver,
 and all other material semantics remain unsupported and use the solid UI
 fallback. Every refexport callback is populated so the client, cgame,

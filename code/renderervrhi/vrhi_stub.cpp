@@ -210,6 +210,21 @@ static const int VRHI_MAX_WORLD_LEAFS = 65536;
 static const int VRHI_MAX_WORLD_LEAFSURFACES = 262144;
 static const int VRHI_MAX_WORLD_CLUSTERS = 65536;
 static const size_t VRHI_MAX_WORLD_VIS_BYTES = 16u * 1024u * 1024u;
+// Geometry is assembled into one static upload. Keep both aggregate and
+// per-surface limits explicit so malformed BSP counts cannot grow vectors or
+// temporary patch meshes without bound.
+static const size_t VRHI_MAX_WORLD_VERTICES = 1024u * 1024u;
+static const size_t VRHI_MAX_WORLD_INDEXES = 3u * 1024u * 1024u;
+static const size_t VRHI_MAX_WORLD_BATCHES = 65536u;
+static const int VRHI_MAX_WORLD_SURFACES = 65536;
+static const int VRHI_MAX_WORLD_SURFACE_VERTICES = 262144;
+static const int VRHI_MAX_WORLD_SURFACE_INDEXES = 786432;
+// Quake quadratic patches use overlapping 3x3 control-point blocks. Four
+// subdivisions per block is deliberately fixed and bounded for this renderer.
+static const int VRHI_PATCH_SUBDIVISIONS = 4;
+static const int VRHI_MAX_PATCH_DIMENSION = 129;
+static const int VRHI_MAX_PATCH_CONTROL_VERTICES = 16384;
+static const int VRHI_MAX_PATCH_BLOCKS = 4096;
 // UI registrations retain decoded image pixels so a video restart can destroy
 // and safely re-upload GPU textures without rereading untrusted data.
 static const int VRHI_MAX_UI_TEXTURES = 1024;
@@ -1539,7 +1554,7 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 	g_frameBackbuffer = VRHI_INVALID_HANDLE;
 }
 
-// Entity, patch, and non-direct material resources remain outside this slice.
+// Entity and non-direct material resources remain outside this slice.
 // DrawStretchPic supports bounded direct image UI textures and retains a
 // solid-color fallback for missing/unsupported handles, while the first BSP
 // model and its bounded image diffuse batches are rendered by the static
@@ -2230,6 +2245,127 @@ static bool VRHI_RegisterDirectUITexture(qhandle_t handle, const char *name) {
 	return true;
 }
 
+struct VRHI_PatchMesh {
+	std::vector<VRHI_WorldVertex> vertices;
+	std::vector<uint32_t> indexes;
+};
+
+static bool VRHI_FinitePatchControl(const drawVert_t &vertex) {
+	return std::isfinite(vertex.xyz[0]) && std::isfinite(vertex.xyz[1]) &&
+		std::isfinite(vertex.xyz[2]) && std::isfinite(vertex.st[0]) &&
+		std::isfinite(vertex.st[1]) && std::isfinite(vertex.lightmap[0]) &&
+		std::isfinite(vertex.lightmap[1]);
+}
+
+// Decode and tessellate all overlapping quadratic 3x3 blocks in a patch.
+// This helper owns only temporary vectors; the caller commits them to the
+// world aggregate after every validation and cap check has succeeded.
+static bool VRHI_TessellatePatch(const byte *vertsData, int vertCount,
+	const dsurface_t &surface, VRHI_PatchMesh *mesh) {
+	if (vertsData == nullptr || mesh == nullptr || surface.patchWidth < 3 ||
+		surface.patchHeight < 3 || (surface.patchWidth & 1) == 0 ||
+		(surface.patchHeight & 1) == 0 ||
+		surface.patchWidth > VRHI_MAX_PATCH_DIMENSION ||
+		surface.patchHeight > VRHI_MAX_PATCH_DIMENSION || surface.firstVert < 0 ||
+		surface.numVerts < 0 || surface.firstVert > vertCount ||
+		surface.numVerts > vertCount - surface.firstVert) return false;
+	const size_t controlCount = static_cast<size_t>(surface.patchWidth) *
+		static_cast<size_t>(surface.patchHeight);
+	const int blocksX = (surface.patchWidth - 1) / 2;
+	const int blocksY = (surface.patchHeight - 1) / 2;
+	if (controlCount > static_cast<size_t>(VRHI_MAX_PATCH_CONTROL_VERTICES) ||
+		controlCount != static_cast<size_t>(surface.numVerts) ||
+		blocksX <= 0 || blocksY <= 0 ||
+		static_cast<size_t>(blocksX) * static_cast<size_t>(blocksY) >
+			static_cast<size_t>(VRHI_MAX_PATCH_BLOCKS)) return false;
+
+	std::vector<drawVert_t> controls;
+	try {
+		controls.reserve(controlCount);
+		for (size_t i = 0; i < controlCount; ++i) {
+			const drawVert_t control = VRHI_ReadDrawVert(vertsData,
+				surface.firstVert + static_cast<int>(i));
+			if (!VRHI_FinitePatchControl(control)) return false;
+			controls.push_back(control);
+		}
+		const size_t blockCount = static_cast<size_t>(blocksX) *
+			static_cast<size_t>(blocksY);
+		const size_t gridWidth = static_cast<size_t>(VRHI_PATCH_SUBDIVISIONS + 1);
+		const size_t verticesPerPatch = blockCount * gridWidth * gridWidth;
+		const size_t indexesPerPatch = blockCount *
+			static_cast<size_t>(VRHI_PATCH_SUBDIVISIONS) *
+			static_cast<size_t>(VRHI_PATCH_SUBDIVISIONS) * 6u;
+		if (verticesPerPatch > VRHI_MAX_WORLD_VERTICES ||
+			indexesPerPatch > VRHI_MAX_WORLD_INDEXES) return false;
+		mesh->vertices.reserve(verticesPerPatch);
+		mesh->indexes.reserve(indexesPerPatch);
+		for (int blockY = 0; blockY < blocksY; ++blockY) {
+			for (int blockX = 0; blockX < blocksX; ++blockX) {
+				const int controlX = blockX * 2;
+				const int controlY = blockY * 2;
+				for (int y = 0; y <= VRHI_PATCH_SUBDIVISIONS; ++y) {
+					const float v = static_cast<float>(y) /
+						static_cast<float>(VRHI_PATCH_SUBDIVISIONS);
+					const float by[3] = { (1.0f - v) * (1.0f - v),
+						2.0f * v * (1.0f - v), v * v };
+					for (int x = 0; x <= VRHI_PATCH_SUBDIVISIONS; ++x) {
+						const float u = static_cast<float>(x) /
+							static_cast<float>(VRHI_PATCH_SUBDIVISIONS);
+						const float bx[3] = { (1.0f - u) * (1.0f - u),
+							2.0f * u * (1.0f - u), u * u };
+						VRHI_WorldVertex vertex;
+						vertex.position = glm::vec3(0.0f);
+						vertex.diffuse = glm::vec2(0.0f);
+						vertex.lightmap = glm::vec2(0.0f);
+						vertex.lightmapLayer = -1.0f;
+						for (int row = 0; row < 3; ++row) {
+							for (int column = 0; column < 3; ++column) {
+								const drawVert_t &control = controls[static_cast<size_t>(controlY + row) *
+									static_cast<size_t>(surface.patchWidth) + controlX + column];
+								const float weight = bx[column] * by[row];
+								vertex.position += weight * glm::vec3(control.xyz[0], control.xyz[1], control.xyz[2]);
+								vertex.diffuse += weight * glm::vec2(control.st[0], control.st[1]);
+								vertex.lightmap += weight * glm::vec2(control.lightmap[0], control.lightmap[1]);
+							}
+						}
+						if (!std::isfinite(vertex.position.x) || !std::isfinite(vertex.position.y) ||
+							!std::isfinite(vertex.position.z) || !std::isfinite(vertex.diffuse.x) ||
+							!std::isfinite(vertex.diffuse.y) || !std::isfinite(vertex.lightmap.x) ||
+							!std::isfinite(vertex.lightmap.y)) return false;
+						mesh->vertices.push_back(vertex);
+					}
+				}
+				const uint32_t first = static_cast<uint32_t>(mesh->vertices.size() - gridWidth * gridWidth);
+				for (int y = 0; y < VRHI_PATCH_SUBDIVISIONS; ++y) {
+					for (int x = 0; x < VRHI_PATCH_SUBDIVISIONS; ++x) {
+						const uint32_t a = first + static_cast<uint32_t>(y * (VRHI_PATCH_SUBDIVISIONS + 1) + x);
+						const uint32_t b = a + 1;
+						const uint32_t d = a + static_cast<uint32_t>(VRHI_PATCH_SUBDIVISIONS + 1);
+						const uint32_t c = d + 1;
+						const uint32_t triangles[2][3] = {{ a, b, c }, { a, c, d }};
+						for (const auto &triangle : triangles) {
+							const glm::vec3 edge1 = mesh->vertices[triangle[1]].position - mesh->vertices[triangle[0]].position;
+							const glm::vec3 edge2 = mesh->vertices[triangle[2]].position - mesh->vertices[triangle[0]].position;
+							const glm::vec3 cross = glm::cross(edge1, edge2);
+							const float area = glm::dot(cross, cross);
+							if (!std::isfinite(cross.x) || !std::isfinite(cross.y) ||
+								!std::isfinite(cross.z) || !std::isfinite(area) || area <= 1.0e-10f) continue;
+							mesh->indexes.push_back(triangle[0]);
+							mesh->indexes.push_back(triangle[1]);
+							mesh->indexes.push_back(triangle[2]);
+						}
+					}
+				}
+			}
+		}
+	} catch (...) {
+		mesh->vertices.clear();
+		mesh->indexes.clear();
+		return false;
+	}
+	return !mesh->vertices.empty() && !mesh->indexes.empty();
+}
+
 static void VRHI_LoadWorld(const char *name) {
 	VRHI_DestroyWorldResources(true);
 	if (name == nullptr || name[0] == '\0' || g_ri.FS_ReadFile == nullptr) {
@@ -2386,6 +2522,12 @@ static void VRHI_LoadWorld(const char *name) {
 	const int vertCount = vertsLump.filelen / static_cast<int>(sizeof(drawVert_t));
 	const int indexCount = indexesLump.filelen / static_cast<int>(sizeof(int));
 	const int shaderCount = shadersLump.filelen / static_cast<int>(sizeof(dshader_t));
+	if (surfaceCount > VRHI_MAX_WORLD_SURFACES) {
+		VRHI_Printf(PRINT_WARNING,
+			"renderer_vrhi: BSP world '%s' has too many surfaces; geometry rejected\n", name);
+		g_ri.FS_FreeFile(fileData);
+		return;
+	}
 	std::vector<std::string> bspShaderNames;
 	try {
 		bspShaderNames.reserve(static_cast<size_t>(shaderCount));
@@ -2449,18 +2591,15 @@ static void VRHI_LoadWorld(const char *name) {
 		const dsurface_t surface = VRHI_ReadSurface(surfacesData, surfaceIndex);
 		const dshader_t shader = surface.shaderNum >= 0 && surface.shaderNum < shaderCount
 			? VRHI_ReadShader(shadersData, surface.shaderNum) : dshader_t();
-		if ((surface.surfaceType != MST_PLANAR && surface.surfaceType != MST_TRIANGLE_SOUP) ||
-			surface.shaderNum < 0 || surface.shaderNum >= shaderCount ||
-			(shader.surfaceFlags & (SURF_SKY | SURF_NODRAW)) ||
-			surface.firstVert < 0 || surface.numVerts < 3 ||
-			surface.firstVert > vertCount || surface.numVerts > vertCount - surface.firstVert ||
-			surface.firstIndex < 0 || surface.numIndexes < 3 ||
-			surface.firstIndex > indexCount || surface.numIndexes > indexCount - surface.firstIndex ||
-			surface.numIndexes % 3 != 0) {
+		if ((surface.surfaceType != MST_PLANAR && surface.surfaceType != MST_PATCH &&
+			surface.surfaceType != MST_TRIANGLE_SOUP) || surface.shaderNum < 0 ||
+			surface.shaderNum >= shaderCount || (shader.surfaceFlags & (SURF_SKY | SURF_NODRAW)) ||
+			surface.firstVert < 0 || surface.numVerts < 3 || surface.firstVert > vertCount ||
+			surface.numVerts > vertCount - surface.firstVert ||
+			surface.numVerts > VRHI_MAX_WORLD_SURFACE_VERTICES) {
 			skipped++;
 			continue;
 		}
-		std::unordered_map<int, uint32_t> localVertices;
 		const int surfaceLightmapLayer = lightmapLumpValid &&
 			(shader.surfaceFlags & SURF_NOLIGHTMAP) == 0 &&
 			surface.lightmapNum >= 0 && surface.lightmapNum < g_worldLightmapLayers
@@ -2470,6 +2609,57 @@ static void VRHI_LoadWorld(const char *name) {
 		// only a first-stage script map/clampmap image candidate; all other shader
 		// semantics retain the lightmap/solid fallback.
 		VRHI_LoadDiffuseTGA(shader.shader, &diffuseImage);
+		if (surface.surfaceType == MST_PATCH) {
+			VRHI_PatchMesh patch;
+			if (!VRHI_TessellatePatch(vertsData, vertCount, surface, &patch) ||
+				g_worldBatches.size() >= VRHI_MAX_WORLD_BATCHES ||
+				g_worldVertices.size() > VRHI_MAX_WORLD_VERTICES - patch.vertices.size() ||
+				g_worldIndexes.size() > VRHI_MAX_WORLD_INDEXES - patch.indexes.size()) {
+				VRHI_Printf(PRINT_WARNING,
+					"renderer_vrhi: BSP patch surface %d rejected by validation/caps\n", surfaceIndex);
+				skipped++;
+				continue;
+			}
+			const uint32_t baseVertex = static_cast<uint32_t>(g_worldVertices.size());
+			for (VRHI_WorldVertex vertex : patch.vertices) {
+				const bool validLightmapUV = surfaceLightmapLayer >= 0 &&
+					vertex.lightmap.x >= 0.0f && vertex.lightmap.x <= 1.0f &&
+					vertex.lightmap.y >= 0.0f && vertex.lightmap.y <= 1.0f;
+				vertex.diffuse = diffuseImage >= 0 ? vertex.diffuse : glm::vec2(0.0f);
+				vertex.lightmapLayer = validLightmapUV ? static_cast<float>(surfaceLightmapLayer) : -1.0f;
+				g_worldVertices.push_back(vertex);
+				g_worldPositions.push_back(vertex.position);
+			}
+			const uint32_t firstIndex = static_cast<uint32_t>(g_worldIndexes.size());
+			for (uint32_t index : patch.indexes) g_worldIndexes.push_back(baseVertex + index);
+			VRHI_WorldBatch batch;
+			batch.firstIndex = firstIndex;
+			batch.indexCount = static_cast<uint32_t>(patch.indexes.size());
+			batch.diffuseImage = diffuseImage;
+			g_worldBatches.push_back(batch);
+			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
+			accepted++;
+			continue;
+		}
+		if (surface.firstIndex < 0 || surface.numIndexes < 3 ||
+			surface.numIndexes > VRHI_MAX_WORLD_SURFACE_INDEXES ||
+			surface.firstIndex > indexCount || surface.numIndexes > indexCount - surface.firstIndex ||
+			surface.numIndexes % 3 != 0) {
+			skipped++;
+			continue;
+		}
+		if (g_worldBatches.size() >= VRHI_MAX_WORLD_BATCHES ||
+			g_worldVertices.size() > VRHI_MAX_WORLD_VERTICES -
+				static_cast<size_t>(surface.numVerts) ||
+			g_worldIndexes.size() > VRHI_MAX_WORLD_INDEXES -
+				static_cast<size_t>(surface.numIndexes)) {
+			VRHI_Printf(PRINT_WARNING,
+				"renderer_vrhi: BSP surface %d rejected; aggregate geometry cap reached\n",
+				surfaceIndex);
+			skipped++;
+			continue;
+		}
+		std::unordered_map<int, uint32_t> localVertices;
 		const uint32_t surfaceFirstIndex = static_cast<uint32_t>(g_worldIndexes.size());
 		int surfaceTriangles = 0;
 		for (int i = 0; i + 2 < surface.numIndexes; i += 3) {
