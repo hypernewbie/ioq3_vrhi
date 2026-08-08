@@ -108,7 +108,7 @@ static const float VRHI_WORLD_NEAR = 4.0f;
 static const float VRHI_WORLD_FAR = 131072.0f;
 // Keep malformed or hostile BSP lumps from forcing an unbounded CPU/GPU
 // allocation. Normal Quake 3 maps use far fewer layers.
-static const int VRHI_MAX_WORLD_LIGHTMAP_LAYERS = 4096;
+static const int VRHI_MAX_WORLD_LIGHTMAP_LAYERS = 1024;
 
 // Keep the generated qpath within MAX_QPATH while allowing the command to
 // accept only a basename.  The prefix and suffix are fixed and never come
