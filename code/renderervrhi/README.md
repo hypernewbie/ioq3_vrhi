@@ -79,9 +79,17 @@ retained in bounded CPU scene storage and rendered as camera-facing 3D geometry
 after the static world. Registered direct image handles are reused when
 available, with a solid fallback. Scene CPU submissions and renderer-owned
 transient vertex/index buffers reset on ClearScene and are destroyed on restart
-and shutdown. RT_MODEL (including MD3 parsing and inline BSP submodels), rail,
-lightning, portal, and video-capture resources remain explicit safe no-ops; no
-fake model parity is attempted.
+and shutdown. RT_MODEL supports bounded MD3 data and safe inline BSP names
+(`*1`, `*2`, ...): inline planar/triangle-soup/patch surfaces retain local
+positions, diffuse/lightmap UVs, lightmap layers, and shared BSP diffuse image
+indices, then transform by refEntity origin/axis with entity color and dynamic
+light modulation. Inline registration is refreshed after each world load so
+handles registered before a load cannot retain stale model indices; ModelBounds
+works for both MD3 and inline BSP models, while LerpTag remains false for inline.
+Inline geometry has strict per-model and aggregate caps and malformed surfaces
+are skipped safely. MD3 normal decoding/lighting and full skin/material/shader
+parity remain unsupported, as do rail, lightning, portal, and video-capture
+resources (safe no-ops).
 
 `RegisterFont` is a documented fixed-cell fallback, NOT proportional/FreeType
 parity: it registers the classic `gfx/2d/bigchars` atlas (256x256, 16x16 grid

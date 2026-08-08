@@ -105,6 +105,11 @@ struct VRHI_SceneDraw {
 	uint32_t firstIndex = 0;
 	uint32_t indexCount = 0;
 	qhandle_t shader = 0;
+	// Inline BSP batches already resolved their map shader to a shared diffuse
+	// image.  Keep that image index on the draw instead of manufacturing a
+	// second scene-local texture table.
+	int diffuseImage = -1;
+	bool lightmapped = false;
 };
 static std::vector<VRHI_SceneEntity> g_sceneEntities;
 static std::vector<VRHI_ScenePoly> g_scenePolys;
@@ -137,6 +142,14 @@ struct VRHI_WorldBatch {
 	uint32_t firstIndex = 0;
 	uint32_t indexCount = 0;
 	int diffuseImage = -1;
+};
+struct VRHI_InlineBSPModel {
+	bool valid = false;
+	glm::vec3 mins = glm::vec3(0.0f);
+	glm::vec3 maxs = glm::vec3(0.0f);
+	std::vector<VRHI_WorldVertex> vertices;
+	std::vector<uint32_t> indexes;
+	std::vector<VRHI_WorldBatch> batches;
 };
 struct VRHI_UITexture {
 	std::string path;
@@ -171,6 +184,11 @@ static std::vector<VRHI_WorldVertex> g_worldLightedVertices;
 static std::vector<uint32_t> g_worldIndexes;
 static std::vector<VRHI_WorldBatch> g_worldBatches;
 static std::vector<VRHI_WorldDiffuseImage> g_worldDiffuseImages;
+// Indexed by BSP model number (model 0 is the static world and is not stored
+// here). Invalid entries are retained so handle refresh can never retain a
+// stale index after a map reload.
+static std::vector<VRHI_InlineBSPModel> g_inlineBSPModels;
+static std::unordered_map<qhandle_t, size_t> g_inlineBSPModelByHandle;
 // Script results are map-scoped. Values are copied qpaths, never pointers into
 // FS_ListFiles/FS_ReadFile storage; an empty value is a cached miss.
 static std::unordered_map<std::string, std::string> g_worldShaderScriptPaths;
@@ -331,6 +349,14 @@ static const size_t VRHI_MAX_WORLD_BATCHES = 65536u;
 static const int VRHI_MAX_WORLD_SURFACES = 65536;
 static const int VRHI_MAX_WORLD_SURFACE_VERTICES = 262144;
 static const int VRHI_MAX_WORLD_SURFACE_INDEXES = 786432;
+// Inline BSP submodels use the same decoded surface format as the static
+// world, but retain bounded local CPU geometry for per-entity transforms.
+static const int VRHI_MAX_INLINE_MODELS = 1024;
+static const size_t VRHI_MAX_INLINE_VERTICES = 262144u;
+static const size_t VRHI_MAX_INLINE_INDEXES = 786432u;
+static const size_t VRHI_MAX_INLINE_BATCHES = 16384u;
+static const size_t VRHI_MAX_INLINE_SURFACE_VERTICES = 262144u;
+static const size_t VRHI_MAX_INLINE_SURFACE_INDEXES = 786432u;
 // Quake quadratic patches use overlapping 3x3 control-point blocks. Four
 // subdivisions per block is deliberately fixed and bounded for this renderer.
 static const int VRHI_PATCH_SUBDIVISIONS = 4;
@@ -1089,6 +1115,8 @@ static void VRHI_DestroyWorldResources(bool clearGeometry) {
 		g_worldIndexes.clear();
 		g_worldBatches.clear();
 		g_worldDiffuseImages.clear();
+		g_inlineBSPModels.clear();
+		g_inlineBSPModelByHandle.clear();
 		g_worldShaderScriptPaths.clear();
 		g_worldShaderScriptsScanned = false;
 		g_worldLoaded = false;
@@ -1773,9 +1801,9 @@ static void VRHI_EndFrame(int *frontEndMsec, int *backEndMsec) {
 // storage and uploaded after the static BSP world. DrawStretchPic supports
 // bounded direct image UI textures and retains a solid-color fallback for
 // missing/unsupported handles, while the first BSP model and its bounded image
-// diffuse batches are rendered by the static world path above. RT_MODEL (MD3
-// and inline BSP submodels) and complex effect/material stages remain explicit
-// safe no-ops. Every callback is
+// diffuse batches are rendered by the static world path above. RT_MODEL covers
+// bounded MD3 and inline BSP submodels; complex effect/material stages remain
+// explicit safe no-ops. Every callback is
 // nevertheless populated so the client, cgame, and UI can safely exercise the
 // renderer without NULL dereferences.
 //
@@ -1865,6 +1893,34 @@ static bool VRHI_MD3Extension(const char *name) {
 		ext[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(dot[1 + i])));
 	return std::strcmp(ext, "md3") == 0;
 }
+static bool VRHI_InlineModelName(const char *name, int *modelIndex) {
+	if (modelIndex != nullptr) *modelIndex = -1;
+	if (name == nullptr || name[0] != '*' || name[1] == '0' ||
+		name[1] < '1' || name[1] > '9') return false;
+	int value = 0;
+	for (size_t i = 1; name[i] != '\0'; ++i) {
+		if (i >= 5 || name[i] < '0' || name[i] > '9' ||
+		value > (VRHI_MAX_INLINE_MODELS - (name[i] - '0')) / 10) return false;
+		value = value * 10 + (name[i] - '0');
+	}
+	if (value < 1 || value > VRHI_MAX_INLINE_MODELS) return false;
+	if (modelIndex != nullptr) *modelIndex = value;
+	return true;
+}
+
+static void VRHI_RefreshInlineModelHandles(void) {
+	g_inlineBSPModelByHandle.clear();
+	for (const auto &entry : g_modelHandles) {
+		int modelIndex = -1;
+		if (!VRHI_InlineModelName(entry.first.c_str(), &modelIndex) ||
+			static_cast<size_t>(modelIndex) >= g_inlineBSPModels.size() ||
+			!g_inlineBSPModels[static_cast<size_t>(modelIndex)].valid) continue;
+		g_inlineBSPModelByHandle.emplace(entry.second, static_cast<size_t>(modelIndex));
+		VRHI_Printf(PRINT_ALL, "renderer_vrhi: registered inline BSP '%s' handle=%d model=%d\n",
+			entry.first.c_str(), static_cast<int>(entry.second), modelIndex);
+	}
+}
+
 static qhandle_t VRHI_RegisterModelShader(const std::string &shaderName) {
 	if (shaderName.empty()) return 0;
 	const qhandle_t handle = VRHI_RegisterName(g_shaderHandles, shaderName.c_str(),
@@ -2014,6 +2070,22 @@ static bool VRHI_ParseMD3(const byte *file, size_t fileSize, const char *name,
 
 static qhandle_t VRHI_RegisterModel(const char *name) {
 	size_t length = 0;
+	int inlineModelIndex = -1;
+	// Inline names are resolved against the currently loaded BSP after the
+	// handle is allocated. This permits the engine's normal register-before-
+	// LoadWorld sequence while RefreshInlineModelHandles removes stale maps.
+	if (VRHI_InlineModelName(name, &inlineModelIndex)) {
+		const qhandle_t handle = VRHI_RegisterName(g_modelHandles, name, "RegisterModel");
+		VRHI_RefreshInlineModelHandles();
+		return handle;
+	}
+	// A leading '*' which is not a canonical bounded inline name is never an
+	// MD3/model handle.
+	if (name != nullptr && name[0] == '*') {
+		VRHI_Printf(PRINT_DEVELOPER, "renderer_vrhi: RegisterModel('%s') rejected; qhandle 0\n",
+			name);
+		return 0;
+	}
 	// Preserve qhandle 0 semantics for invalid names exactly like the GL
 	// renderers: NULL/empty/overlong and traversal-style names report "not
 	// registered" instead of consuming a fake non-zero handle that mods
@@ -2810,6 +2882,104 @@ static bool VRHI_TessellatePatch(const byte *vertsData, int vertCount,
 	return !mesh->vertices.empty() && !mesh->indexes.empty();
 }
 
+static bool VRHI_BuildInlineSurface(const byte *vertsData, int vertCount,
+	const byte *indexesData, int indexCount, const dsurface_t &surface,
+	int surfaceLightmapLayer, int diffuseImage, VRHI_InlineBSPModel *model) {
+	if (model == nullptr || vertsData == nullptr || indexesData == nullptr ||
+		surface.numVerts < 3 || surface.numVerts > static_cast<int>(VRHI_MAX_INLINE_SURFACE_VERTICES) ||
+		surface.firstVert < 0 || surface.firstVert > vertCount ||
+		surface.numVerts > vertCount - surface.firstVert) return false;
+	try {
+		VRHI_PatchMesh patch;
+		if (surface.surfaceType == MST_PATCH) {
+			if (model->batches.size() >= VRHI_MAX_INLINE_BATCHES ||
+				!VRHI_TessellatePatch(vertsData, vertCount, surface, &patch) ||
+			patch.vertices.size() > VRHI_MAX_INLINE_SURFACE_VERTICES ||
+			patch.indexes.size() > VRHI_MAX_INLINE_SURFACE_INDEXES) return false;
+			VRHI_WorldBatch batch;
+			batch.firstIndex = static_cast<uint32_t>(model->indexes.size());
+			batch.indexCount = static_cast<uint32_t>(patch.indexes.size());
+			batch.diffuseImage = diffuseImage;
+			for (VRHI_WorldVertex vertex : patch.vertices) {
+				const bool lightmapped = surfaceLightmapLayer >= 0 &&
+					vertex.lightmap.x >= 0.0f && vertex.lightmap.x <= 1.0f &&
+					vertex.lightmap.y >= 0.0f && vertex.lightmap.y <= 1.0f;
+				vertex.diffuse = diffuseImage >= 0 ? vertex.diffuse : glm::vec2(0.0f);
+				vertex.lightmapLayer = lightmapped ? static_cast<float>(surfaceLightmapLayer) : -1.0f;
+				vertex.color = glm::vec4(1.0f);
+				model->vertices.push_back(vertex);
+			}
+			for (uint32_t index : patch.indexes) model->indexes.push_back(index +
+				static_cast<uint32_t>(model->vertices.size() - patch.vertices.size()));
+			model->batches.push_back(batch);
+			return true;
+		}
+		if ((surface.surfaceType != MST_PLANAR && surface.surfaceType != MST_TRIANGLE_SOUP) ||
+			surface.firstIndex < 0 || surface.numIndexes < 3 ||
+			surface.numIndexes > static_cast<int>(VRHI_MAX_INLINE_SURFACE_INDEXES) ||
+			surface.firstIndex > indexCount || surface.numIndexes > indexCount - surface.firstIndex ||
+			surface.numIndexes % 3 != 0) return false;
+		std::unordered_map<int, uint32_t> localVertices;
+		localVertices.reserve(static_cast<size_t>(surface.numVerts));
+		std::vector<VRHI_WorldVertex> vertices;
+		std::vector<uint32_t> indexes;
+		vertices.reserve(static_cast<size_t>(surface.numVerts));
+		indexes.reserve(static_cast<size_t>(surface.numIndexes));
+		for (int i = 0; i < surface.numIndexes; i += 3) {
+			int source[3];
+			for (int corner = 0; corner < 3; ++corner)
+				source[corner] = VRHI_ReadIndex(indexesData, surface.firstIndex + i + corner);
+			if (source[0] < 0 || source[1] < 0 || source[2] < 0 ||
+				source[0] >= surface.numVerts || source[1] >= surface.numVerts || source[2] >= surface.numVerts ||
+				source[0] == source[1] || source[0] == source[2] || source[1] == source[2]) continue;
+			drawVert_t sourceVertices[3];
+			glm::vec3 positions[3];
+			bool valid = true;
+			for (int corner = 0; corner < 3; ++corner) {
+				sourceVertices[corner] = VRHI_ReadDrawVert(vertsData, surface.firstVert + source[corner]);
+				positions[corner] = glm::vec3(sourceVertices[corner].xyz[0], sourceVertices[corner].xyz[1], sourceVertices[corner].xyz[2]);
+				if (!VRHI_FinitePatchControl(sourceVertices[corner])) { valid = false; break; }
+			}
+			if (!valid) continue;
+			const glm::vec3 cross = glm::cross(positions[1] - positions[0], positions[2] - positions[0]);
+			if (!std::isfinite(cross.x) || !std::isfinite(cross.y) || !std::isfinite(cross.z) ||
+				glm::dot(cross, cross) <= 1.0e-10f) continue;
+			for (int corner = 0; corner < 3; ++corner) {
+				auto found = localVertices.find(source[corner]);
+				uint32_t local = 0;
+				if (found == localVertices.end()) {
+					if (vertices.size() >= VRHI_MAX_INLINE_SURFACE_VERTICES) return false;
+					local = static_cast<uint32_t>(vertices.size());
+					localVertices.emplace(source[corner], local);
+					const bool lightmapped = surfaceLightmapLayer >= 0 &&
+						sourceVertices[corner].lightmap[0] >= 0.0f && sourceVertices[corner].lightmap[0] <= 1.0f &&
+						sourceVertices[corner].lightmap[1] >= 0.0f && sourceVertices[corner].lightmap[1] <= 1.0f;
+					VRHI_WorldVertex vertex;
+					vertex.position = positions[corner];
+					vertex.diffuse = diffuseImage >= 0 ? glm::vec2(sourceVertices[corner].st[0], sourceVertices[corner].st[1]) : glm::vec2(0.0f);
+					vertex.lightmap = lightmapped ? glm::vec2(sourceVertices[corner].lightmap[0], sourceVertices[corner].lightmap[1]) : glm::vec2(0.0f);
+					vertex.lightmapLayer = lightmapped ? static_cast<float>(surfaceLightmapLayer) : -1.0f;
+					vertex.color = glm::vec4(1.0f);
+					vertices.push_back(vertex);
+				} else local = found->second;
+				indexes.push_back(local);
+			}
+		}
+		if (indexes.empty() || model->batches.size() >= VRHI_MAX_INLINE_BATCHES) return false;
+		VRHI_WorldBatch batch;
+		batch.firstIndex = static_cast<uint32_t>(model->indexes.size());
+		batch.indexCount = static_cast<uint32_t>(indexes.size());
+		batch.diffuseImage = diffuseImage;
+		const uint32_t baseVertex = static_cast<uint32_t>(model->vertices.size());
+		model->vertices.insert(model->vertices.end(), vertices.begin(), vertices.end());
+		for (uint32_t index : indexes) model->indexes.push_back(baseVertex + index);
+		model->batches.push_back(batch);
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
 static void VRHI_LoadWorld(const char *name) {
 	VRHI_DestroyWorldResources(true);
 	if (name == nullptr || name[0] == '\0' || g_ri.FS_ReadFile == nullptr) {
@@ -2856,6 +3026,7 @@ static void VRHI_LoadWorld(const char *name) {
 	const lump_t &shadersLump = lumps[LUMP_SHADERS];
 	const lump_t &lightmapsLump = lumps[LUMP_LIGHTMAPS];
 	if (static_cast<size_t>(modelsLump.filelen) < sizeof(dmodel_t) ||
+		static_cast<size_t>(modelsLump.filelen) % sizeof(dmodel_t) != 0 ||
 		static_cast<size_t>(shadersLump.filelen) % sizeof(dshader_t) != 0 ||
 		static_cast<size_t>(surfacesLump.filelen) % sizeof(dsurface_t) != 0 ||
 		static_cast<size_t>(vertsLump.filelen) % sizeof(drawVert_t) != 0 ||
@@ -2962,6 +3133,12 @@ static void VRHI_LoadWorld(const char *name) {
 	const byte *shadersData = fileBytes + static_cast<size_t>(shadersLump.fileofs);
 	const byte *vertsData = fileBytes + static_cast<size_t>(vertsLump.fileofs);
 	const byte *indexesData = fileBytes + static_cast<size_t>(indexesLump.fileofs);
+	const int modelCount = modelsLump.filelen / static_cast<int>(sizeof(dmodel_t));
+	const int inlineModelCount = std::min(modelCount, VRHI_MAX_INLINE_MODELS + 1);
+	if (modelCount > inlineModelCount) {
+		VRHI_Printf(PRINT_WARNING, "renderer_vrhi: BSP world '%s' has %d models; inline model cap keeps first %d\n",
+			name, modelCount, inlineModelCount);
+	}
 	const int surfaceCount = surfacesLump.filelen / static_cast<int>(sizeof(dsurface_t));
 	const int vertCount = vertsLump.filelen / static_cast<int>(sizeof(drawVert_t));
 	const int indexCount = indexesLump.filelen / static_cast<int>(sizeof(int));
@@ -3171,19 +3348,105 @@ static void VRHI_LoadWorld(const char *name) {
 			accepted++;
 		} else skipped++;
 	}
+
+	// Inline BSP models share the already decoded map images/lightmaps, but
+	// retain their own local geometry so entities can apply origin/axis without
+	// touching the static world upload. Build each surface atomically and keep
+	// both per-model and aggregate caps independent of the world budget.
+	g_inlineBSPModels.clear();
+	g_inlineBSPModels.resize(static_cast<size_t>(inlineModelCount));
+	size_t inlineVertices = 0;
+	size_t inlineIndexes = 0;
+	size_t inlineBatches = 0;
+	int inlineAccepted = 0;
+	int inlineSkipped = 0;
+	for (int modelIndex = 1; modelIndex < inlineModelCount; ++modelIndex) {
+		const dmodel_t inlineDisk = VRHI_ReadModel(modelsData, modelIndex);
+		VRHI_InlineBSPModel &inlineModel = g_inlineBSPModels[static_cast<size_t>(modelIndex)];
+		inlineModel.mins = glm::vec3(inlineDisk.mins[0], inlineDisk.mins[1], inlineDisk.mins[2]);
+		inlineModel.maxs = glm::vec3(inlineDisk.maxs[0], inlineDisk.maxs[1], inlineDisk.maxs[2]);
+		const bool validBounds = std::isfinite(inlineModel.mins.x) && std::isfinite(inlineModel.mins.y) &&
+			std::isfinite(inlineModel.mins.z) && std::isfinite(inlineModel.maxs.x) &&
+			std::isfinite(inlineModel.maxs.y) && std::isfinite(inlineModel.maxs.z) &&
+			inlineModel.mins.x <= inlineModel.maxs.x && inlineModel.mins.y <= inlineModel.maxs.y &&
+			inlineModel.mins.z <= inlineModel.maxs.z;
+		if (!validBounds || inlineDisk.firstSurface < 0 || inlineDisk.numSurfaces <= 0 ||
+			inlineDisk.firstSurface > surfaceCount || inlineDisk.numSurfaces > surfaceCount - inlineDisk.firstSurface) {
+			++inlineSkipped;
+			continue;
+		}
+		for (int surfaceIndex = inlineDisk.firstSurface;
+			surfaceIndex < inlineDisk.firstSurface + inlineDisk.numSurfaces; ++surfaceIndex) {
+			const dsurface_t surface = VRHI_ReadSurface(surfacesData, surfaceIndex);
+			const dshader_t shader = surface.shaderNum >= 0 && surface.shaderNum < shaderCount
+				? VRHI_ReadShader(shadersData, surface.shaderNum) : dshader_t();
+			if ((surface.surfaceType != MST_PLANAR && surface.surfaceType != MST_PATCH &&
+				surface.surfaceType != MST_TRIANGLE_SOUP) || surface.shaderNum < 0 ||
+				surface.shaderNum >= shaderCount || (shader.surfaceFlags & (SURF_SKY | SURF_NODRAW)) ||
+				surface.firstVert < 0 || surface.numVerts < 3 || surface.firstVert > vertCount ||
+				surface.numVerts > vertCount - surface.firstVert ||
+				surface.numVerts > VRHI_MAX_WORLD_SURFACE_VERTICES) {
+				continue;
+			}
+			const int surfaceLightmapLayer = lightmapLumpValid &&
+				(shader.surfaceFlags & SURF_NOLIGHTMAP) == 0 && surface.lightmapNum >= 0 &&
+				surface.lightmapNum < g_worldLightmapLayers ? surface.lightmapNum : -1;
+			int diffuseImage = -1;
+			VRHI_LoadDiffuseTGA(shader.shader, &diffuseImage);
+			VRHI_InlineBSPModel surfaceModel;
+			if (!VRHI_BuildInlineSurface(vertsData, vertCount, indexesData, indexCount,
+				surface, surfaceLightmapLayer, diffuseImage, &surfaceModel) ||
+				surfaceModel.vertices.empty() || surfaceModel.indexes.empty() ||
+				surfaceModel.batches.empty()) continue;
+			if (inlineModel.vertices.size() > VRHI_MAX_INLINE_VERTICES - surfaceModel.vertices.size() ||
+				inlineModel.indexes.size() > VRHI_MAX_INLINE_INDEXES - surfaceModel.indexes.size() ||
+				inlineModel.batches.size() > VRHI_MAX_INLINE_BATCHES - surfaceModel.batches.size() ||
+				inlineVertices > VRHI_MAX_INLINE_VERTICES - surfaceModel.vertices.size() ||
+				inlineIndexes > VRHI_MAX_INLINE_INDEXES - surfaceModel.indexes.size() ||
+				inlineBatches > VRHI_MAX_INLINE_BATCHES - surfaceModel.batches.size()) {
+				++inlineSkipped;
+				continue;
+			}
+			const uint32_t vertexBase = static_cast<uint32_t>(inlineModel.vertices.size());
+			const uint32_t indexBase = static_cast<uint32_t>(inlineModel.indexes.size());
+			inlineModel.vertices.insert(inlineModel.vertices.end(), surfaceModel.vertices.begin(), surfaceModel.vertices.end());
+			for (uint32_t index : surfaceModel.indexes) inlineModel.indexes.push_back(vertexBase + index);
+			for (VRHI_WorldBatch batch : surfaceModel.batches) {
+				batch.firstIndex += indexBase;
+				inlineModel.batches.push_back(batch);
+			}
+			inlineVertices += surfaceModel.vertices.size();
+			inlineIndexes += surfaceModel.indexes.size();
+			inlineBatches += surfaceModel.batches.size();
+		}
+		if (!inlineModel.vertices.empty() && !inlineModel.indexes.empty() && !inlineModel.batches.empty()) {
+			inlineModel.valid = true;
+			++inlineAccepted;
+		} else {
+			++inlineSkipped;
+		}
+	}
+	VRHI_RefreshInlineModelHandles();
 	g_worldLoaded = !g_worldVertices.empty() && !g_worldIndexes.empty();
 	// Per-batch visibility stamps are rebuilt whenever the batch list changes.
 	g_worldBatchMarked.assign(g_worldBatches.size(), 0);
 	g_worldVisEpoch = 0;
 	VRHI_Printf(PRINT_ALL,
-		"renderer_vrhi: BSP world '%s': models=1 surfaces=%d accepted=%d skipped=%d vertices=%zu indexes=%zu lightmaps=%d diffuse=%zu batches=%zu cull=%s planes=%d nodes=%d leafs=%d leafsurfaces=%d clusters=%d vis=%s\n",
-		name, model.numSurfaces, accepted, skipped, g_worldVertices.size(), g_worldIndexes.size(),
+		"renderer_vrhi: BSP world '%s': models=%d inlineAccepted=%d inlineSkipped=%d surfaces=%d accepted=%d skipped=%d vertices=%zu indexes=%zu lightmaps=%d diffuse=%zu batches=%zu cull=%s planes=%d nodes=%d leafs=%d leafsurfaces=%d clusters=%d vis=%s\n",
+		name, modelCount, inlineAccepted, inlineSkipped, model.numSurfaces, accepted, skipped, g_worldVertices.size(), g_worldIndexes.size(),
 		g_worldLightmapLayers, g_worldDiffuseImages.size(), g_worldBatches.size(),
 		cullLumpsValid ? (g_worldVisAvailable ? "pvs" : "fallback-novis") : "fallback-lumps",
 		planeCount, nodeCount, leafCount, leafSurfaceCount, g_worldNumClusters,
 		g_worldVisAvailable ? "yes" : "no");
 	g_ri.FS_FreeFile(fileData);
-	if (g_worldLoaded && g_deviceInitialized) VRHI_UploadWorldGeometry();
+	if (g_worldLoaded && g_deviceInitialized) {
+		VRHI_UploadWorldGeometry();
+	} else if (inlineAccepted > 0 && g_deviceInitialized && VRHI_InitializeWorldShader()) {
+		// A malformed/empty world model must not prevent an otherwise valid
+		// inline entity from using the map's shared image/lightmap resources.
+		VRHI_UploadWorldLightmaps();
+		VRHI_UploadWorldDiffuse();
+	}
 }
 static void VRHI_SetWorldVisData(const byte *vis) {
 	// The engine in this tree never calls this callback; the GL renderers use
@@ -3211,9 +3474,8 @@ static void VRHI_AddRefEntityToScene(const refEntity_t *entity) {
 		return;
 	}
 	if (entity->reType < 0 || entity->reType >= RT_MAX_REF_ENTITY_TYPE) return;
-	// MD3 RT_MODEL is handled during BuildSceneGeometry. Inline BSP '*N'
-	// handles, unsupported model extensions, and complex effect types remain
-	// explicit safe no-ops; BSP model 0 remains on the static world path.
+	// RT_MODEL is handled during BuildSceneGeometry for MD3 and mapped inline
+	// BSP '*N' handles; BSP model 0 remains on the static world path.
 	if (entity->reType != RT_MODEL && entity->reType != RT_SPRITE && entity->reType != RT_BEAM) {
 		// Report each unsupported type once per renderer lifetime instead of
 		// once per entity per frame; model entities dominate real scenes and
@@ -3443,20 +3705,24 @@ static VRHI_WorldVertex VRHI_SceneVertex(const glm::vec3 &position,
 }
 
 static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
-	size_t indexCount) {
+	size_t indexCount, int diffuseImage = -1, bool lightmapped = false) {
 	if (indexCount == 0 || firstIndex > UINT32_MAX || indexCount > UINT32_MAX ||
 		g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) return false;
 	VRHI_SceneDraw draw;
 	draw.firstIndex = static_cast<uint32_t>(firstIndex);
 	draw.indexCount = static_cast<uint32_t>(indexCount);
 	draw.shader = shader;
+	draw.diffuseImage = diffuseImage;
+	draw.lightmapped = lightmapped;
 	g_sceneDraws.push_back(draw);
 	return true;
 }
 
-static vhTexture VRHI_SceneTexture(qhandle_t shader) {
+static vhTexture VRHI_SceneTexture(const VRHI_SceneDraw &draw) {
+	if (draw.diffuseImage >= 0 && static_cast<size_t>(draw.diffuseImage) < g_worldDiffuseImages.size())
+		return g_worldDiffuseImages[static_cast<size_t>(draw.diffuseImage)].texture;
 	const std::unordered_map<qhandle_t, size_t>::const_iterator found =
-		g_uiTextureByHandle.find(shader);
+		g_uiTextureByHandle.find(draw.shader);
 	if (found == g_uiTextureByHandle.end() || found->second >= g_uiTextures.size())
 		return VRHI_INVALID_HANDLE;
 	return g_uiTextures[found->second].texture;
@@ -3561,6 +3827,79 @@ static bool VRHI_AppendMD3Model(const refEntity_t &entity, const glm::vec4 &colo
 	return true;
 }
 
+static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4 &color) {
+	const auto found = g_inlineBSPModelByHandle.find(entity.hModel);
+	if (found == g_inlineBSPModelByHandle.end() || found->second >= g_inlineBSPModels.size()) return false;
+	const VRHI_InlineBSPModel &model = g_inlineBSPModels[found->second];
+	if (!model.valid || model.vertices.empty() || model.indexes.empty()) return false;
+	const glm::vec3 origin(entity.origin[0], entity.origin[1], entity.origin[2]);
+	for (const VRHI_WorldBatch &batch : model.batches) {
+		if (batch.indexCount == 0 || batch.firstIndex > model.indexes.size() ||
+			batch.indexCount > model.indexes.size() - batch.firstIndex ||
+			batch.firstIndex > UINT32_MAX || g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) continue;
+		std::vector<VRHI_WorldVertex> scratchVertices;
+		std::vector<uint32_t> scratchIndexes;
+		try {
+			scratchVertices.reserve(std::min(static_cast<size_t>(batch.indexCount), model.vertices.size()));
+			scratchIndexes.reserve(batch.indexCount);
+			std::unordered_map<uint32_t, uint32_t> vertexMap;
+			vertexMap.reserve(std::min(static_cast<size_t>(batch.indexCount), model.vertices.size()));
+			bool lightmapped = false;
+			for (size_t i = batch.firstIndex; i < static_cast<size_t>(batch.firstIndex) + batch.indexCount; ++i) {
+				const uint32_t index = model.indexes[i];
+				if (index >= model.vertices.size()) { scratchIndexes.clear(); break; }
+				auto mapped = vertexMap.find(index);
+				uint32_t sceneIndex = 0;
+				if (mapped == vertexMap.end()) {
+					const VRHI_WorldVertex &localVertex = model.vertices[index];
+					const glm::vec3 &p = localVertex.position;
+					const glm::vec3 position = origin + glm::vec3(
+						entity.axis[0][0] * p.x + entity.axis[1][0] * p.y + entity.axis[2][0] * p.z,
+						entity.axis[0][1] * p.x + entity.axis[1][1] * p.y + entity.axis[2][1] * p.z,
+						entity.axis[0][2] * p.x + entity.axis[1][2] * p.y + entity.axis[2][2] * p.z);
+					if (!std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z)) {
+						scratchIndexes.clear();
+						break;
+					}
+					sceneIndex = static_cast<uint32_t>(scratchVertices.size());
+					vertexMap.emplace(index, sceneIndex);
+					lightmapped = lightmapped || localVertex.lightmapLayer >= -0.5f;
+					// Carry the model-local lightmap UVs and array layer into the
+					// scene vertex: the world lightmap atlas is shared with the
+					// static BSP surfaces, and the pixel shaders gate on
+					// lightmapLayer (< -0.5 means no lightmap for this vertex).
+					VRHI_WorldVertex sceneVertex = VRHI_SceneVertex(position,
+						localVertex.diffuse, color);
+					sceneVertex.lightmap = localVertex.lightmap;
+					sceneVertex.lightmapLayer = localVertex.lightmapLayer;
+					scratchVertices.push_back(sceneVertex);
+				} else sceneIndex = mapped->second;
+				scratchIndexes.push_back(sceneIndex);
+			}
+			if (scratchIndexes.size() != batch.indexCount ||
+				scratchVertices.size() > VRHI_MAX_SCENE_VERTICES ||
+				scratchIndexes.size() > VRHI_MAX_SCENE_INDEXES ||
+				g_sceneVertices.size() > VRHI_MAX_SCENE_VERTICES - scratchVertices.size() ||
+				g_sceneIndexes.size() > VRHI_MAX_SCENE_INDEXES - scratchIndexes.size()) continue;
+			const uint32_t baseVertex = static_cast<uint32_t>(g_sceneVertices.size());
+			const uint32_t firstIndex = static_cast<uint32_t>(g_sceneIndexes.size());
+			g_sceneVertices.insert(g_sceneVertices.end(), scratchVertices.begin(), scratchVertices.end());
+			for (uint32_t index : scratchIndexes) g_sceneIndexes.push_back(baseVertex + index);
+			if (!VRHI_AppendSceneDraw(entity.customShader, firstIndex, scratchIndexes.size(),
+				batch.diffuseImage, lightmapped)) {
+				g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
+				g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
+				continue;
+			}
+			++g_sceneModelDraws;
+		} catch (...) {
+			// A malformed or exhausted transient allocation drops only this batch.
+			continue;
+		}
+	}
+	return true;
+}
+
 static bool VRHI_BuildSceneGeometry(const refdef_t *fd) {
 	VRHI_ReserveSceneStorage();
 	g_sceneVertices.clear();
@@ -3580,7 +3919,10 @@ static bool VRHI_BuildSceneGeometry(const refdef_t *fd) {
 			entity.shaderRGBA[2] / 255.0f, entity.shaderRGBA[3] / 255.0f);
 		if (color == glm::vec4(0.0f)) color = glm::vec4(1.0f);
 		if (entity.reType == RT_MODEL) {
-			VRHI_AppendMD3Model(entity, color);
+			if (g_md3ModelByHandle.find(entity.hModel) != g_md3ModelByHandle.end())
+				VRHI_AppendMD3Model(entity, color);
+			else
+				VRHI_AppendInlineBSPModel(entity, color);
 		} else if (entity.reType == RT_SPRITE) {
 			if (!(entity.radius > 0.0f) || !std::isfinite(entity.radius)) continue;
 			const float angle = entity.rotation * 3.14159265358979323846f / 180.0f;
@@ -3952,11 +4294,14 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 			g_sceneEntities.size(), g_scenePolys.size(), g_sceneModelDraws, g_sceneDraws.size(),
 			g_sceneVertices.size(), g_sceneIndexes.size(), g_sceneLights.size());
 		for (const VRHI_SceneDraw &draw : g_sceneDraws) {
-			const vhTexture texture = VRHI_SceneTexture(draw.shader);
+			const vhTexture texture = VRHI_SceneTexture(draw);
 			const bool textured = texture != VRHI_INVALID_HANDLE &&
 				g_worldDiffusePixelShader != VRHI_INVALID_HANDLE;
+			const bool lightmapped = draw.lightmapped && g_worldLightmapTexture != VRHI_INVALID_HANDLE &&
+				g_worldLightmapPixelShader != VRHI_INVALID_HANDLE;
 			g_worldState = worldBaseState;
-			g_worldState.SetProgram(textured ? g_worldDiffuseProgram : g_worldSolidProgram)
+			g_worldState.SetProgram(textured ? g_worldDiffuseProgram :
+				(lightmapped ? g_worldLightmapProgram : g_worldSolidProgram))
 				.SetStateFlags(VRHI_STATE_WRITE_RGB | VRHI_STATE_WRITE_A | VRHI_STATE_WRITE_Z |
 					VRHI_STATE_DEPTH_TEST_ENABLE | VRHI_STATE_DEPTH_TEST_LESS |
 					VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES | VRHI_STATE_BLEND_ALPHA)
@@ -3981,6 +4326,11 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 							VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
 							VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP });
 				}
+			} else if (lightmapped) {
+				g_worldState.SetTexture(0, { "u_lightmap", 0, g_worldLightmapTexture })
+					.SetSampler(0, { "u_lightmapSampler", 0,
+						VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
+						VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP });
 			}
 			if (vhSetState(g_worldStateId, g_worldState)) {
 				if (!submitted) vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
@@ -4257,13 +4607,24 @@ static int VRHI_LerpTag(orientation_t *tag, qhandle_t model, int startFrame,
 static void VRHI_ModelBounds(qhandle_t model, vec3_t mins, vec3_t maxs) {
 	if (mins != nullptr) std::memset(mins, 0, sizeof(vec3_t));
 	if (maxs != nullptr) std::memset(maxs, 0, sizeof(vec3_t));
-	const auto found = g_md3ModelByHandle.find(model);
-	if (found == g_md3ModelByHandle.end() || found->second >= g_md3Models.size()) return;
-	const VRHI_MD3Model &data = g_md3Models[found->second];
-	if (!data.valid || data.frameMins.empty() || mins == nullptr || maxs == nullptr) return;
+	const auto md3 = g_md3ModelByHandle.find(model);
+	if (md3 != g_md3ModelByHandle.end() && md3->second < g_md3Models.size()) {
+		const VRHI_MD3Model &data = g_md3Models[md3->second];
+		if (!data.valid || data.frameMins.empty() || mins == nullptr || maxs == nullptr) return;
+		for (int i = 0; i < 3; ++i) {
+			mins[i] = data.frameMins[0][i];
+			maxs[i] = data.frameMaxs[0][i];
+		}
+		return;
+	}
+	const auto inlineModel = g_inlineBSPModelByHandle.find(model);
+	if (inlineModel == g_inlineBSPModelByHandle.end() ||
+		inlineModel->second >= g_inlineBSPModels.size() || mins == nullptr || maxs == nullptr) return;
+	const VRHI_InlineBSPModel &data = g_inlineBSPModels[inlineModel->second];
+	if (!data.valid) return;
 	for (int i = 0; i < 3; ++i) {
-		mins[i] = data.frameMins[0][i];
-		maxs[i] = data.frameMaxs[0][i];
+		mins[i] = data.mins[i];
+		maxs[i] = data.maxs[i];
 	}
 }
 static void VRHI_RegisterFont(const char *fontName, int pointSize,
