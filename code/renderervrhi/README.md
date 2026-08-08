@@ -10,10 +10,12 @@ UI rectangles through `DrawStretchPic`, and presents once per engine frame. This
 UI path is a fallback only, not texture rendering parity.
 
 The static BSP world path is deliberately scoped to planar and triangle-soup
-surfaces. It is triangle-soup geometry only: patches, materials, lightmaps,
-visibility, entities, and the corresponding renderer parity are not implemented,
-so visual coverage and lighting remain limited and maps may differ substantially
-from the GL renderers.
+surfaces. It preserves BSP lightmap UVs and indices, uploads the raw 128x128 RGB
+lightmap blocks as a VRHI texture array, and samples them with a fixed world
+shader; surfaces without valid lightmaps fall back to the solid world color.
+Patches, diffuse PK3 images, materials, visibility, entities, and corresponding
+renderer parity are not implemented, so visual coverage remains limited and maps
+may differ substantially from the GL renderers.
 `Shutdown(qfalse)` flushes while retaining the device/window for a video restart;
 `Shutdown(qtrue)` finishes and destroys VRHI, input, the window, and SDL video in
 that order.
