@@ -267,10 +267,16 @@ def build_command(engine: Path, home: Path, renderer: str, scene: Scene) -> list
         actions.append(f"setviewpos {scene.viewpos}")
     actions.extend("wait" for _ in range(scene.waits))
     waits = "; ".join(actions)
-    active_action = ACTIVE_ACTION_TEMPLATE.format(
-        waits=waits,
-        screenshot=scene.screenshot,
-    )
+    if renderer == "vrhi":
+        # renderer_vrhi services its capture ticket in EndFrame.  Keep the
+        # OpenGL action string byte-for-byte unchanged; VRHI alone needs one
+        # frame boundary between screenshot and quit.
+        active_action = f"{waits}; screenshot {scene.screenshot}; wait; quit"
+    else:
+        active_action = ACTIVE_ACTION_TEMPLATE.format(
+            waits=waits,
+            screenshot=scene.screenshot,
+        )
     command.extend(("+set", "activeAction", active_action))
     map_command = "devmap" if scene.source == "map" and scene.viewpos else scene.source
     command.extend((f"+{map_command}", scene.target))

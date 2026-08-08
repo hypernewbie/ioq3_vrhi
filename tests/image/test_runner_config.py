@@ -44,6 +44,18 @@ class RunnerConfigTests(unittest.TestCase):
         self.assertIn("+demo", command)
         self.assertEqual(command[command.index("+demo") + 1], "unit_demo")
 
+    def test_vrhi_action_waits_after_renderer_capture(self) -> None:
+        scene = Scene(
+            name="unit-vrhi",
+            source="demo",
+            target="unit_demo",
+            screenshot="unit-vrhi",
+        )
+        command = build_command(Path("ioquake3.exe"), Path("home"), "vrhi", scene)
+        action = command[command.index("activeAction") + 1]
+        self.assertIn("screenshot unit-vrhi; wait; quit", action)
+        self.assertNotIn("screenshot unit-vrhi; quit", action)
+
     def test_map_scene_uses_devmap_for_pinned_viewpos(self) -> None:
         scene = Scene(
             name="unit-map",
