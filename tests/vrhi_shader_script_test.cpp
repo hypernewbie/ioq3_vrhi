@@ -368,18 +368,41 @@ void testSimpleMultiStageExtraction() {
 		"{ map textures/glow.tga blendFunc GL_SRC_ALPHA GL_ONE }\n"
 		"{ map $lightmap rgbGen identity }\n"
 		"{ map textures/overlay.tga }\n"
-		"{ map textures/unsupported-detail.tga blendFunc GL_DST_COLOR GL_SRC_COLOR }");
+		"{ map textures/detail.tga blendFunc GL_DST_COLOR GL_SRC_COLOR }");
 	rejected.clear();
 	CHECK(VRHI_ParseShaderScriptStages(asBytes(compatibilityStages), compatibilityStages.size(), wanted, &rejected));
 	CHECK_EQ_INT(rejected.size(), 1u);
 	if (rejected.size() == 1) {
 		const std::vector<VRHI_ShaderStage> &compatStages = rejected["textures/foo/bar"];
-		CHECK_EQ_INT(compatStages.size(), 2u);
-		if (compatStages.size() == 2) {
-			CHECK_EQ_INT(compatStages[0].blendMode, VRHI_SHADER_BLEND_ADDITIVE);
+		CHECK_EQ_INT(compatStages.size(), 3u);
+		if (compatStages.size() == 3) {
+			CHECK_EQ_INT(compatStages[0].blendMode, VRHI_SHADER_BLEND_ALPHA_ADDITIVE);
 			CHECK_EQ_INT(compatStages[1].blendMode, VRHI_SHADER_BLEND_ALPHA);
+			CHECK_EQ_INT(compatStages[2].blendMode, VRHI_SHADER_BLEND_MULTIPLY);
 		}
 	}
+	// Each new Q3 blend pair maps to its own mode in isolation.
+	const std::string alphaAdditive = script(
+		"{ map textures/glow.tga blendFunc GL_SRC_ALPHA GL_ONE }");
+	rejected.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(alphaAdditive), alphaAdditive.size(), wanted, &rejected));
+	CHECK_EQ_INT(rejected.size(), 1u);
+	if (rejected.size() == 1)
+		CHECK_EQ_INT(rejected["textures/foo/bar"][0].blendMode, VRHI_SHADER_BLEND_ALPHA_ADDITIVE);
+	const std::string multiply = script(
+		"{ map textures/detail.tga blendFunc GL_DST_COLOR GL_SRC_COLOR }");
+	rejected.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(multiply), multiply.size(), wanted, &rejected));
+	CHECK_EQ_INT(rejected.size(), 1u);
+	if (rejected.size() == 1)
+		CHECK_EQ_INT(rejected["textures/foo/bar"][0].blendMode, VRHI_SHADER_BLEND_MULTIPLY);
+	const std::string premultiplied = script(
+		"{ map textures/premultiplied.tga blendFunc GL_ONE GL_ONE_MINUS_SRC_ALPHA }");
+	rejected.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(premultiplied), premultiplied.size(), wanted, &rejected));
+	CHECK_EQ_INT(rejected.size(), 1u);
+	if (rejected.size() == 1)
+		CHECK_EQ_INT(rejected["textures/foo/bar"][0].blendMode, VRHI_SHADER_BLEND_PREMULTIPLIED);
 	const std::string explicitOpaqueOverlay = script(
 		"{ map textures/base.tga } { map textures/opaque.tga blendFunc GL_ONE GL_ZERO }");
 	rejected.clear();

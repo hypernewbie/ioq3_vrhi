@@ -4554,6 +4554,23 @@ static void VRHI_UpdateWorldVertexLighting(void) {
 	vhUpdateVertexBuffer(g_worldVertexBuffer, vertices, 0, g_worldLightedVertices.size());
 }
 
+static uint64_t VRHI_BlendStateForMode(uint8_t blendMode) {
+	switch (blendMode) {
+	case VRHI_SHADER_BLEND_ADDITIVE:
+		return VRHI_STATE_BLEND_ADD;
+	case VRHI_SHADER_BLEND_ALPHA_ADDITIVE:
+		return VRHI_STATE_BLEND_FUNC(VRHI_STATE_BLEND_SRC_ALPHA, VRHI_STATE_BLEND_ONE);
+	case VRHI_SHADER_BLEND_FILTER:
+		return VRHI_STATE_BLEND_FUNC(VRHI_STATE_BLEND_DST_COLOUR, VRHI_STATE_BLEND_ZERO);
+	case VRHI_SHADER_BLEND_MULTIPLY:
+		return VRHI_STATE_BLEND_FUNC(VRHI_STATE_BLEND_DST_COLOUR, VRHI_STATE_BLEND_SRC_COLOUR);
+	case VRHI_SHADER_BLEND_PREMULTIPLIED:
+		return VRHI_STATE_BLEND_FUNC(VRHI_STATE_BLEND_ONE, VRHI_STATE_BLEND_INV_SRC_ALPHA);
+	default:
+		return VRHI_STATE_BLEND_ALPHA;
+	}
+}
+
 static void VRHI_RenderScene(const refdef_t *fd) {
 	if (fd == nullptr || (fd->rdflags & RDF_HYPERSPACE) != 0 ||
 		!g_deviceInitialized || !g_frameBackbufferReady ||
@@ -4703,11 +4720,7 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 			if (overlay && g_worldOverlayPixelShader == VRHI_INVALID_HANDLE) continue;
 			g_worldState = worldBaseState;
 			if (overlay || blended) {
-				const uint64_t blend = batch.stageBlend[stage] == VRHI_SHADER_BLEND_ADDITIVE
-					? VRHI_STATE_BLEND_ADD
-					: batch.stageBlend[stage] == VRHI_SHADER_BLEND_FILTER
-						? VRHI_STATE_BLEND_FUNC(VRHI_STATE_BLEND_DST_COLOUR, VRHI_STATE_BLEND_ZERO)
-						: VRHI_STATE_BLEND_ALPHA;
+				const uint64_t blend = VRHI_BlendStateForMode(batch.stageBlend[stage]);
 				// Translucent base stages are rendered after opaque geometry in
 				// back-to-front order. They test depth but never write it. Overlay
 				// stages redraw the same surface, so LEQUAL keeps them visible.
@@ -4788,11 +4801,7 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 			const bool lightmapped = draw.lightmapped && g_worldLightmapTexture != VRHI_INVALID_HANDLE &&
 				g_worldLightmapPixelShader != VRHI_INVALID_HANDLE;
 			g_worldState = worldBaseState;
-			const uint64_t sceneBlend = draw.blendMode == VRHI_SHADER_BLEND_ADDITIVE
-				? VRHI_STATE_BLEND_ADD
-				: draw.blendMode == VRHI_SHADER_BLEND_FILTER
-					? VRHI_STATE_BLEND_FUNC(VRHI_STATE_BLEND_DST_COLOUR, VRHI_STATE_BLEND_ZERO)
-					: VRHI_STATE_BLEND_ALPHA;
+			const uint64_t sceneBlend = VRHI_BlendStateForMode(draw.blendMode);
 			const uint64_t sceneFlags = VRHI_STATE_WRITE_RGB | VRHI_STATE_WRITE_A |
 				VRHI_STATE_DEPTH_TEST_ENABLE | VRHI_STATE_DEPTH_TEST_LESS |
 				VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES |

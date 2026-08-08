@@ -64,7 +64,16 @@ enum VRHI_ShaderBlendMode {
 	// Quake3 `blendFunc filter`: destination-colour modulation. This is
 	// intentionally separate from source-alpha so water/filter materials do
 	// not silently become additive.
-	VRHI_SHADER_BLEND_FILTER = 3
+	VRHI_SHADER_BLEND_FILTER = 3,
+	// Quake3 `blendFunc GL_DST_COLOR GL_SRC_COLOR`: colour multiply,
+	// deliberately distinct from filter (GL_DST_COLOR GL_ZERO).
+	VRHI_SHADER_BLEND_MULTIPLY = 4,
+	// Quake3 `blendFunc GL_ONE GL_ONE_MINUS_SRC_ALPHA`: premultiplied-alpha
+	// compositing (src*1 + dst*(1-srcA)).
+	VRHI_SHADER_BLEND_PREMULTIPLIED = 5,
+	// Quake3 `blendFunc GL_SRC_ALPHA GL_ONE`: additive glow scaled by source
+	// alpha, distinct from plain additive (GL_ONE GL_ONE).
+	VRHI_SHADER_BLEND_ALPHA_ADDITIVE = 6
 };
 struct VRHI_ShaderStage {
 	std::string path;
@@ -361,9 +370,10 @@ inline bool VRHI_ParseShaderScript(const unsigned char *data, std::size_t size,
 // parser ignores bounded stage/top-level directives whose geometry/UV/time
 // semantics are not implemented, preserving a visible static-material fallback
 // instead of returning the green solid placeholder. Stage zero may be opaque,
-// source-alpha, additive, or filter; later stages without an explicit blendFunc
-// become static source-alpha overlays. This remains separate from the
-// conservative first-stage helper above.
+// source-alpha, additive, alpha-additive, multiply, or premultiplied alpha;
+// later stages without an explicit blendFunc become static source-alpha
+// overlays. This remains separate from the conservative first-stage helper
+// above.
 inline bool VRHI_ParseSimpleShaderBlock(
 	const std::vector<VRHI_ShaderScriptToken> &tokens, std::size_t begin,
 	std::size_t end, std::vector<VRHI_ShaderStage> *stages) {
@@ -458,8 +468,12 @@ inline bool VRHI_ParseSimpleShaderBlock(
 						stage.blendMode = VRHI_SHADER_BLEND_ADDITIVE;
 					else if (arg == "gl_dst_color" && dst == "gl_zero")
 						stage.blendMode = VRHI_SHADER_BLEND_FILTER;
+					else if (arg == "gl_dst_color" && dst == "gl_src_color")
+						stage.blendMode = VRHI_SHADER_BLEND_MULTIPLY;
+					else if (arg == "gl_one" && dst == "gl_one_minus_src_alpha")
+						stage.blendMode = VRHI_SHADER_BLEND_PREMULTIPLIED;
 					else if (arg == "gl_src_alpha" && dst == "gl_one")
-						stage.blendMode = VRHI_SHADER_BLEND_ADDITIVE;
+						stage.blendMode = VRHI_SHADER_BLEND_ALPHA_ADDITIVE;
 					else if (arg == "gl_one" && dst == "gl_zero")
 						stage.blendMode = VRHI_SHADER_BLEND_OPAQUE;
 					else
