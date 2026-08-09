@@ -132,6 +132,37 @@ input buffer, so no FS storage can be referenced after FS_FreeFile.
 // and samples with no scroll exactly as before this slice, and the statement
 // never borrows tokens past the stage end. The conservative first-stage
 // helper still treats `tcMod` as unsupported and rejects such shaders.
+//
+// The bounded stage-local `tcMod rotate` slice extends the same simple
+// multi-stage parser with exactly the Quake3 time-based `tcMod rotate
+// degsPerSecond` statement: the single rate must be finite and |value| <=
+// the defined safe magnitude bound (VRHI_SCRIPT_TCMOD_ROTATE_MAX below,
+// degrees per second); zero is accepted because a zero rate is the identity
+// no-rotate case and the default. The parsed rate is carried through the
+// world, inline-BSP, and scene shader-cache/draw paths, and the textured
+// material pixel shaders receive the current refdef/render time in seconds
+// so they rotate the diffuse (material) UVs around the texture center
+// (0.5, 0.5) by -rate * frameTimeSeconds degrees, matching the GL1
+// renderer's RB_CalcRotateTexCoords sign and units exactly (degs =
+// -degsPerSecond * shaderTime, then rotate about (0.5, 0.5); the angle is
+// wrapped into [0,360) degrees first like the GL1 sine-table mask so long
+// sessions cannot erode sin/cos precision). The fixed documented order when
+// a stage carries several supported tcMods is: static tcMod scale first
+// (about the UV origin), then tcMod rotate about the texture center, then
+// the time-based tcMod scroll offset (wrapped into [0,1) like the GL1
+// RB_CalcScrollTexCoords); script order is intentionally NOT tracked, so
+// every combination renders with exactly this one deterministic
+// composition. World and scene draws share one per-frame time value and the
+// rotate uniform is bound only to the textured diffuse/overlay material
+// programs, never to the solid/lightmap fallbacks. It is applied ONLY to
+// the diffuse/material sample; lightmap UVs, UI textures, vertex colour,
+// blend classification, const generators, depth, and alpha testing are
+// never modified. Every other tcMod variant (turb, stretch, ...) and every
+// malformed, truncated, non-finite, or out-of-range rate keeps the existing
+// fallback: the stage stays accepted and samples with no rotation exactly
+// as before this slice, and the statement never borrows tokens past the
+// stage end. The conservative first-stage helper still treats `tcMod` as
+// unsupported and rejects such shaders.
 ===========================================================================
 */
 #ifndef __VRHI_SHADER_SCRIPT_H
@@ -240,6 +271,23 @@ struct VRHI_ShaderStage {
 	bool tcModScroll = false;
 	float tcModScrollS = 0.0f;
 	float tcModScrollT = 0.0f;
+	// Bounded stage-local time-based `tcMod rotate degsPerSecond`: true only
+	// when the stage's tcMod statement used the Quake3 `rotate` variant with
+	// one finite, safely bounded rate (|value| <= VRHI_SCRIPT_TCMOD_ROTATE_MAX
+	// degrees per second; zero is accepted as the identity no-rotate rate and
+	// is the default). The rate is carried into the world/scene draw state
+	// and the textured material pixel shaders rotate the diffuse (material)
+	// UVs around the texture center (0.5, 0.5) by -rate * frameTimeSeconds
+	// degrees exactly like the GL1 renderer's RB_CalcRotateTexCoords;
+	// lightmap UVs, UI textures, vertex colour, blend modes, const
+	// generators, depth, and alpha testing are never modified. Stages without
+	// the keyword (or with any other tcMod variant such as turb or stretch)
+	// keep the no-rotate fallback exactly as before. A stage may carry
+	// tcModScale, tcModRotate, and tcModScroll together; the fixed
+	// documented order is static scale, then rotate about the texture
+	// center, then time scroll.
+	bool tcModRotate = false;
+	float tcModRotateDegreesPerSecond = 0.0f;
 };
 
 // Strict bounds, independent of the legacy qfiles.h limits so malformed or
@@ -277,6 +325,16 @@ static const float VRHI_SCRIPT_TCMOD_SCALE_MAX = 64.0f;
 // pixel-shader multiply and its [0,1) wrap, so extreme magnitudes can never
 // smear or explode the material sampling.
 static const float VRHI_SCRIPT_TCMOD_SCROLL_MAX = 16.0f;
+
+// Bounded `tcMod rotate` rate range (degrees per second). The rate must be
+// finite and |value| <= VRHI_SCRIPT_TCMOD_ROTATE_MAX; zero is accepted (a
+// zero rate is the identity no-rotate case and the default). The bound
+// comfortably covers every practical Quake3 rotate rate (commonly 15..540
+// degrees per second for spinning fans/teleporters/sky swirls) while keeping
+// rate * frameTimeSeconds numerically safe for the pixel-shader angle wrap
+// (the angle is wrapped into [0,360) degrees like the GL1 sine-table mask,
+// so extreme magnitudes can never erode the sin/cos precision).
+static const float VRHI_SCRIPT_TCMOD_ROTATE_MAX = 3600.0f;
 
 struct VRHI_ShaderScriptToken {
 	std::string text;
@@ -351,6 +409,25 @@ inline bool VRHI_ShaderParseTcModScroll(const std::string &text, float *value) {
 	if (end == text.c_str() || *end != '\0' || errno == ERANGE ||
 		!std::isfinite(parsed)) return false;
 	if (std::fabs(parsed) > VRHI_SCRIPT_TCMOD_SCROLL_MAX) return false;
+	*value = parsed;
+	return true;
+}
+
+// Parses one token as a bounded `tcMod rotate` rate in degrees per second:
+// finite and |value| <= VRHI_SCRIPT_TCMOD_ROTATE_MAX (zero is accepted: a
+// zero rate is the identity no-rotate case). Returns false for empty,
+// non-numeric, partially consumed (trailing junk), non-finite, or
+// out-of-range tokens, so the tcMod rotate slice accepts only exact in-range
+// rates and every other value keeps the existing no-rotate fallback. Locale
+// behaviour mirrors the original renderer's atof-based ParseVector path.
+inline bool VRHI_ShaderParseTcModRotate(const std::string &text, float *value) {
+	if (value == nullptr || text.empty()) return false;
+	char *end = nullptr;
+	errno = 0;
+	const float parsed = std::strtof(text.c_str(), &end);
+	if (end == text.c_str() || *end != '\0' || errno == ERANGE ||
+		!std::isfinite(parsed)) return false;
+	if (std::fabs(parsed) > VRHI_SCRIPT_TCMOD_ROTATE_MAX) return false;
 	*value = parsed;
 	return true;
 }
@@ -820,19 +897,23 @@ inline bool VRHI_ParseSimpleShaderBlock(
 				continue;
 			}
 			if (keyword == "tcmod") {
-				// Bounded static `tcMod scale s t` and time-based `tcMod scroll
-				// s t`: preserved only when the next token is the `scale` or
-				// `scroll` variant and both components are finite and inside the
+				// Bounded static `tcMod scale s t`, time-based `tcMod scroll
+				// s t`, and time-based `tcMod rotate degsPerSecond`: preserved
+				// only when the next token is the `scale`, `scroll`, or
+				// `rotate` variant and every argument is finite and inside the
 				// defined safe range (scale: nonzero, |value| in
 				// [VRHI_SCRIPT_TCMOD_SCALE_MIN, VRHI_SCRIPT_TCMOD_SCALE_MAX];
 				// scroll: |value| <= VRHI_SCRIPT_TCMOD_SCROLL_MAX, zero
-				// accepted as the identity no-scroll rate). Every other tcMod
-				// variant (rotate, turb, stretch, ...) keeps the existing
-				// unsupported fallback: the keyword is consumed and its
+				// accepted as the identity no-scroll rate; rotate: |value| <=
+				// VRHI_SCRIPT_TCMOD_ROTATE_MAX degrees per second, zero
+				// accepted as the identity no-rotate rate). Every other tcMod
+				// variant (turb, stretch, entityTranslate, ...) keeps the
+				// existing unsupported fallback: the keyword is consumed and its
 				// argument tokens remain bounded and ignored below, exactly as
-				// before this slice. A stage may carry both a scale and a
-				// scroll; the pixel shader applies the scale first, then the
-				// time scroll.
+				// before this slice. A stage may carry a scale, a rotate, and a
+				// scroll; the pixel shader applies the fixed documented order
+				// scale, then rotate about the texture center, then time
+				// scroll (script order is intentionally not tracked).
 				if (j + 1 < stageEnd && VRHI_ShaderTokenIs(tokens[j + 1], "scale")) {
 					// A syntactically complete `tcMod scale s t` statement
 					// consumes exactly four tokens (keyword + "scale" + s + t)
@@ -859,6 +940,33 @@ inline bool VRHI_ParseSimpleShaderBlock(
 					// keyword and the `scale` marker (and any partial argument
 					// below via the generic fallthrough), keep identity UVs, and
 					// never borrow tokens past the stage end.
+					j += 2;
+					continue;
+				}
+				if (j + 1 < stageEnd && VRHI_ShaderTokenIs(tokens[j + 1], "rotate")) {
+					// A syntactically complete `tcMod rotate degsPerSecond`
+					// statement consumes exactly three tokens (keyword +
+					// "rotate" + one rate), so a following directive (map,
+					// blendFunc, ...) still parses normally. A complete but
+					// invalid/out-of-range rate (for example `tcMod rotate 1e30`
+					// or `tcMod rotate abc`) also consumes its whole declared
+					// argument count, so keyword-looking argument tokens cannot
+					// be re-parsed as stage directives; the stage stays accepted
+					// with the no-rotate fallback (the existing behavior).
+					if (j + 2 < stageEnd) {
+						float rate = 0.0f;
+						if (VRHI_ShaderParseTcModRotate(tokens[j + 2].text, &rate)) {
+							stage.tcModRotate = true;
+							stage.tcModRotateDegreesPerSecond = rate;
+						}
+						j += 3;
+						continue;
+					}
+					// Truncated `tcMod rotate` at the end of a stage: consume
+					// the keyword and the `rotate` marker (and any partial
+					// argument below via the generic fallthrough), keep the
+					// no-rotate fallback, and never borrow tokens past the
+					// stage end.
 					j += 2;
 					continue;
 				}
@@ -892,9 +1000,10 @@ inline bool VRHI_ParseSimpleShaderBlock(
 					j += 2;
 					continue;
 				}
-				// Non-scale/scroll tcMod (rotate/turb/stretch/...): keep the
-				// existing fallback by consuming just the keyword; the remaining
-				// argument tokens are bounded by stageEnd and ignored below.
+				// Non-scale/scroll/rotate tcMod (turb/stretch/entityTranslate/...):
+				// keep the existing fallback by consuming just the keyword; the
+				// remaining argument tokens are bounded by stageEnd and ignored
+				// below.
 				j += 1;
 				continue;
 			}

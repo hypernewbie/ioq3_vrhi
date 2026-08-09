@@ -27,9 +27,20 @@
 // per-stage rates to the textured material UV sampling, where the pixel
 // shader combines them with the current refdef/render time in seconds after
 // the static scale (scale then time scroll); every other tcMod variant
-// (rotate/turb/stretch) and every malformed, truncated, non-finite, or
+// (turb/stretch) and every malformed, truncated, non-finite, or
 // out-of-range rate keeps the zero-scroll fallback with the stage still
-// accepted.
+// accepted. The bounded stage-local `tcMod rotate degsPerSecond` slice
+// accepts only one finite, safely bounded (|value| <= 3600) rate in degrees
+// per second (zero accepted as the identity no-rotate rate) and carries the
+// per-stage rate to the textured material UV sampling, where the pixel
+// shader rotates the diffuse UVs around the texture center (0.5, 0.5) by
+// -rate * frameTimeSeconds degrees, matching the GL1 renderer's
+// RB_CalcRotateTexCoords sign and units exactly; the fixed documented order
+// when a stage carries several supported tcMods is scale, then rotate, then
+// time scroll (script order is intentionally not tracked). Every other tcMod
+// variant (turb/stretch/entityTranslate) and every malformed, truncated,
+// non-finite, or out-of-range rate keeps the no-rotate fallback with the
+// stage still accepted.
 //
 // Build and run (any C++11-or-later compiler):
 //   clang++ -std=c++17 -O1 -Wall -Wextra -Werror tests/vrhi_shader_script_test.cpp -o vrhi_shader_script_test && ./vrhi_shader_script_test
@@ -1177,7 +1188,7 @@ void testStageTcModScale() {
 	// accepted with identity UVs, exactly as before this slice.
 	const std::string unsupported = script(
 		"{ map textures/base.tga tcMod scroll 0.1 0.1 }\n"
-		"{ map textures/a.png blendFunc blend tcMod rotate 90 }\n"
+		"{ map textures/a.png blendFunc blend tcMod entityTranslate }\n"
 		"{ map textures/b.png blendFunc blend tcMod turb 0 1 1 0.5 0.5 }\n"
 		"{ map textures/c.png blendFunc blend tcMod stretch sin 0 1 0.5 0.5 }");
 	results.clear();
@@ -1421,7 +1432,7 @@ void testStageTcModScroll() {
 	// Unsupported tcMod variants keep the existing fallback: the stage stays
 	// accepted with no scroll, exactly as before this slice.
 	const std::string unsupported = script(
-		"{ map textures/base.tga tcMod rotate 90 }\n"
+		"{ map textures/base.tga tcMod entityTranslate }\n"
 		"{ map textures/a.png blendFunc blend tcMod turb 0 1 1 0.5 0.5 }\n"
 		"{ map textures/b.png blendFunc blend tcMod stretch sin 0 1 0.5 0.5 }");
 	results.clear();
@@ -1438,9 +1449,9 @@ void testStageTcModScroll() {
 			}
 		}
 	}
-	// A dynamic tcMod followed by a static scroll keeps the scroll slice
-	// intact (rotate falls back, the scroll is preserved), and a scroll
-	// plus a scale compose (scale then time scroll).
+	// A rotate plus a scroll compose on one stage (fixed order: scale, then
+	// rotate, then scroll), and a scroll plus a scale compose (scale then
+	// time scroll).
 	const std::string mixed = script(
 		"{ map textures/base.tga tcMod rotate 90 tcMod scroll 0.1 0.2 }\n"
 		"{ map textures/a.png blendFunc blend tcMod scroll 0.5 0.5 tcMod scale 2 2 }");
@@ -1453,6 +1464,8 @@ void testStageTcModScroll() {
 		if (stages.size() == 2) {
 			CHECK(stages[0].tcModScroll);
 			CHECK(stages[0].tcModScrollS > 0.09f && stages[0].tcModScrollS < 0.11f);
+			CHECK(stages[0].tcModRotate);
+			CHECK(stages[0].tcModRotateDegreesPerSecond == 90.0f);
 			CHECK(!stages[0].tcModScale);
 			CHECK(stages[1].tcModScroll);
 			CHECK(stages[1].tcModScrollT > 0.49f && stages[1].tcModScrollT < 0.51f);
@@ -1465,6 +1478,275 @@ void testStageTcModScroll() {
 	// shader keeps its existing fallback there.
 	CHECK_EQ_STR(candidateBody(
 		"{ map textures/foo/bar.tga tcMod scroll 0.1 0.1 }", nullptr), "");
+}
+
+void testStageTcModRotate() {
+	// Direct parser-helper bounds/token safety: VRHI_ShaderParseTcModRotate
+	// accepts finite in-range rates in degrees per second (zero included),
+	// rejects empty, non-numeric, trailing-junk, non-finite, and
+	// out-of-range tokens, and never writes through a null output pointer.
+	// The GL1 renderer's ParseTcMod reads exactly one atof token and stores
+	// it as rotateSpeed; RB_CalcRotateTexCoords (tr_shade_calc.c) then
+	// computes degs = -degsPerSecond * shaderTime and rotates the UVs about
+	// (0.5, 0.5), so the sign is negative and the unit is degrees per
+	// second.
+	float value = 123.0f;
+	CHECK(VRHI_ShaderParseTcModRotate("0", &value));
+	CHECK(value == 0.0f);
+	CHECK(VRHI_ShaderParseTcModRotate("90", &value));
+	CHECK(value == 90.0f);
+	CHECK(VRHI_ShaderParseTcModRotate("-45.5", &value));
+	CHECK(value == -45.5f);
+	CHECK(VRHI_ShaderParseTcModRotate("3600", &value));
+	CHECK(value == 3600.0f);
+	CHECK(!VRHI_ShaderParseTcModRotate("", &value));
+	CHECK(!VRHI_ShaderParseTcModRotate("abc", &value));
+	CHECK(!VRHI_ShaderParseTcModRotate("90x", &value));
+	CHECK(!VRHI_ShaderParseTcModRotate("nan", &value));
+	CHECK(!VRHI_ShaderParseTcModRotate("inf", &value));
+	CHECK(!VRHI_ShaderParseTcModRotate("1e30", &value));
+	CHECK(!VRHI_ShaderParseTcModRotate("3600.001", &value));
+	CHECK(!VRHI_ShaderParseTcModRotate("-3600.5", &value));
+	CHECK(!VRHI_ShaderParseTcModRotate("90", nullptr));
+
+	// Bounded time-based `tcMod rotate degsPerSecond`: the single rate must
+	// be finite and |value| <= VRHI_SCRIPT_TCMOD_ROTATE_MAX degrees per
+	// second (zero accepted as the identity no-rotate rate); the parsed rate
+	// is carried per stage for the textured material UV rotation around the
+	// texture center (0.5, 0.5) by -rate * frameTimeSeconds degrees,
+	// composed between the static tcMod scale and the time-based scroll
+	// (fixed order: scale, then rotate, then scroll). Every other tcMod
+	// variant (turb, stretch, entityTranslate, ...) and every
+	// malformed/truncated/non-finite/out-of-range rate keeps the existing
+	// fallback: the stage stays accepted and samples with no rotation
+	// exactly as before.
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	// Basic acceptance: fractional, mirrored (negative), boundary, and zero
+	// rates all parse; the magnitude bound is inclusive. Split across two
+	// scripts (the parser caps every shader at four stages).
+	const std::string accepted = script(
+		"{ map textures/base.tga tcMod rotate 90 }\n"
+		"{ map textures/a.png blendFunc blend tcMod rotate -45.5 }\n"
+		"{ map textures/b.png blendFunc blend tcMod rotate 3600 }\n"
+		"{ map textures/c.png blendFunc blend tcMod rotate 0 }");
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(accepted), accepted.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 4u);
+		if (stages.size() == 4) {
+			CHECK(stages[0].tcModRotate);
+			CHECK(stages[0].tcModRotateDegreesPerSecond == 90.0f);
+			CHECK(stages[1].tcModRotate);
+			CHECK(stages[1].tcModRotateDegreesPerSecond == -45.5f);
+			CHECK(stages[2].tcModRotate);
+			CHECK(stages[2].tcModRotateDegreesPerSecond == 3600.0f);
+			// A zero rate is accepted as the identity no-rotate case.
+			CHECK(stages[3].tcModRotate);
+			CHECK(stages[3].tcModRotateDegreesPerSecond == 0.0f);
+		}
+	}
+	// Stage locality: each stage keeps its own rate, and stages without the
+	// keyword keep no rotate (flag false, rate 0).
+	const std::string locality = script(
+		"{ map textures/base.tga tcMod rotate 90 }\n"
+		"{ map textures/a.png blendFunc blend }\n"
+		"{ map textures/b.png blendFunc blend tcMod rotate -30 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(locality), locality.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			CHECK(stages[0].tcModRotate);
+			CHECK(stages[0].tcModRotateDegreesPerSecond == 90.0f);
+			CHECK(!stages[1].tcModRotate);
+			CHECK(stages[1].tcModRotateDegreesPerSecond == 0.0f);
+			CHECK(stages[2].tcModRotate);
+			CHECK(stages[2].tcModRotateDegreesPerSecond == -30.0f);
+		}
+	}
+	// The rotate statement consumes exactly three tokens, so a following
+	// directive still parses, and the rotate composes with the static scale
+	// and the time scroll (fixed order: scale, then rotate, then scroll)
+	// plus every other bounded stage slice without changing any of them.
+	const std::string composed = script(
+		"{ clampmap textures/clamped.tga tcMod scale 2 3 tcMod rotate 90 tcMod scroll 0.5 0.25 blendFunc blend depthWrite alphaFunc GE128 rgbGen const 0.5 0.5 0.5 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(composed), composed.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(stages[0].tcModRotate);
+			CHECK(stages[0].tcModRotateDegreesPerSecond == 90.0f);
+			CHECK(stages[0].tcModScale);
+			CHECK(stages[0].tcModScaleS > 1.99f && stages[0].tcModScaleS < 2.01f);
+			CHECK(stages[0].tcModScroll);
+			CHECK(stages[0].tcModScrollS > 0.49f && stages[0].tcModScrollS < 0.51f);
+			CHECK(stages[0].clampMap);
+			CHECK_EQ_INT(stages[0].blendMode, VRHI_SHADER_BLEND_ALPHA);
+			CHECK(stages[0].depthWrite);
+			CHECK_EQ_INT(stages[0].alphaFunc, VRHI_SHADER_ALPHAFUNC_GE128);
+			CHECK(stages[0].rgbGenConst);
+		}
+	}
+	// Keyword matching is case-insensitive, like every other directive.
+	const std::string upper = script(
+		"{ map textures/base.tga TCMOD ROTATE 90 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(upper), upper.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) CHECK(stages[0].tcModRotate);
+	}
+	// Statement order is independent: a rotate declared before the map still
+	// parses and consumes exactly its own tokens.
+	const std::string rotateFirst = script(
+		"{ tcMod rotate 90 map textures/base.tga }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(rotateFirst), rotateFirst.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(stages[0].tcModRotate);
+			CHECK(stages[0].tcModRotateDegreesPerSecond == 90.0f);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+		}
+	}
+	// Fallbacks: out-of-range, non-numeric, trailing-junk, and truncated
+	// rates keep the stage accepted with no rotate (flag false, rate 0)
+	// instead of rejecting the material.
+	const std::string fallbacks = script(
+		"{ map textures/base.tga tcMod rotate 1e30 }\n"
+		"{ map textures/a.png blendFunc blend tcMod rotate abc }\n"
+		"{ map textures/b.png blendFunc blend tcMod rotate 90x }\n"
+		"{ map textures/c.png blendFunc blend tcMod rotate -3600.5 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(fallbacks), fallbacks.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 4u);
+		if (stages.size() == 4) {
+			for (std::size_t i = 0; i < stages.size(); ++i) {
+				CHECK(!stages[i].tcModRotate);
+				CHECK(stages[i].tcModRotateDegreesPerSecond == 0.0f);
+			}
+		}
+	}
+	// Truncated `tcMod rotate` statements at the end of a stage keep the
+	// fallback (no rotate) and never borrow tokens past the stage end.
+	const std::string truncated = script("{ map textures/base.tga tcMod rotate }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncated), truncated.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(!stages[0].tcModRotate);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+		}
+	}
+	const std::string truncatedBare = script("{ map textures/base.tga tcMod }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncatedBare), truncatedBare.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) CHECK(!stages[0].tcModRotate);
+	}
+	// A syntactically complete but invalid rotate statement consumes its
+	// whole declared argument count (three tokens: keyword + "rotate" + one
+	// rate), so leftover numeric argument tokens (for example
+	// `tcMod rotate 1e30 2`) cannot be re-parsed as stage directives: the
+	// stage stays accepted with no rotate. A valid rate followed by extra
+	// tokens keeps the rotate and the extras are bounded and ignored, exactly
+	// like the GL1 single-atof ParseTcMod.
+	const std::string invalidConsumed = script(
+		"{ map textures/base.tga tcMod rotate 1e30 2 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(invalidConsumed), invalidConsumed.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(!stages[0].tcModRotate);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+		}
+	}
+	const std::string extraArg = script(
+		"{ map textures/base.tga tcMod rotate 90 2 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(extraArg), extraArg.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(stages[0].tcModRotate);
+			CHECK(stages[0].tcModRotateDegreesPerSecond == 90.0f);
+		}
+	}
+	// Unsupported tcMod variants keep the existing fallback: the stage stays
+	// accepted with no rotate, exactly as before this slice.
+	const std::string unsupported = script(
+		"{ map textures/base.tga tcMod turb 0 1 1 0.5 0.5 }\n"
+		"{ map textures/a.png blendFunc blend tcMod stretch sin 0 1 0.5 0.5 }\n"
+		"{ map textures/b.png blendFunc blend tcMod entityTranslate }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(unsupported), unsupported.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			for (std::size_t i = 0; i < stages.size(); ++i) {
+				CHECK(!stages[i].tcModRotate);
+				CHECK(stages[i].tcModRotateDegreesPerSecond == 0.0f);
+			}
+		}
+	}
+	// A rotate composes with the supported scale and scroll slices: each
+	// statement keeps its own parsed values regardless of script order.
+	const std::string mixed = script(
+		"{ map textures/base.tga tcMod rotate 90 tcMod scroll 0.1 0.2 }\n"
+		"{ map textures/a.png blendFunc blend tcMod scale 2 2 tcMod rotate -45 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(mixed), mixed.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 2u);
+		if (stages.size() == 2) {
+			CHECK(stages[0].tcModRotate);
+			CHECK(stages[0].tcModRotateDegreesPerSecond == 90.0f);
+			CHECK(stages[0].tcModScroll);
+			CHECK(stages[0].tcModScrollS > 0.09f && stages[0].tcModScrollS < 0.11f);
+			CHECK(!stages[0].tcModScale);
+			CHECK(stages[1].tcModRotate);
+			CHECK(stages[1].tcModRotateDegreesPerSecond == -45.0f);
+			CHECK(stages[1].tcModScale);
+			CHECK(stages[1].tcModScaleS > 1.99f && stages[1].tcModScaleS < 2.01f);
+			CHECK(!stages[1].tcModScroll);
+		}
+	}
+	// The conservative first-stage opaque helper still rejects tcMod: only
+	// identity matches the fixed opaque diffuse pass, so a tcMod rotate
+	// shader keeps its existing fallback there.
+	CHECK_EQ_STR(candidateBody(
+		"{ map textures/foo/bar.tga tcMod rotate 90 }", nullptr), "");
 }
 
 void testConsoleScriptResolution() {
@@ -1540,6 +1822,7 @@ int main() {
 	testStageClampMap();
 	testStageTcModScale();
 	testStageTcModScroll();
+	testStageTcModRotate();
 	testConsoleScriptResolution();
 	testPathSafetyHelpers();
 

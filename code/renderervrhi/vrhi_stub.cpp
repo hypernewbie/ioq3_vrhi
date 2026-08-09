@@ -166,6 +166,19 @@ struct VRHI_SceneDraw {
 	// sample exactly as before.
 	bool tcModScroll = false;
 	float tcModScrollValue[2] = { 0.0f, 0.0f };
+	// Bounded per-draw time-based `tcMod rotate` (degrees per second)
+	// carried from the base stage's `tcMod rotate degsPerSecond` script
+	// statement. The textured material pixel shaders rotate the diffuse
+	// (material) UVs around the texture center (0.5, 0.5) by
+	// -rate * frameTimeSeconds degrees, exactly like the GL1 renderer's
+	// RB_CalcRotateTexCoords, composed between the static tcMod scale and
+	// the time-based scroll (fixed order: scale, then rotate, then scroll);
+	// lightmap UVs, UI textures, vertex colour, blend modes, constants,
+	// depth, and alpha testing are unchanged. False with rate 0 when the
+	// stage has no rotate statement, so draws without the keyword sample
+	// exactly as before.
+	bool tcModRotate = false;
+	float tcModRotateDegreesPerSecond = 0.0f;
 };
 static std::vector<VRHI_SceneEntity> g_sceneEntities;
 static std::vector<VRHI_ScenePoly> g_scenePolys;
@@ -249,6 +262,17 @@ struct VRHI_WorldBatch {
 	uint8_t stageTcModScroll[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 	float stageTcModScrollValue[VRHI_SHADER_MAX_STAGES][2] = {
 		{ 0.0f, 0.0f }, { 0.0f, 0.0f }, { 0.0f, 0.0f }, { 0.0f, 0.0f } };
+	// Per-stage bounded time-based `tcMod rotate` (degrees per second)
+	// carried from the parsed stage data to the pixel-shader UV rotation.
+	// Flag 0 means no rotation (no `tcMod rotate` in the stage), preserving
+	// the existing sampling; only the diffuse material sample is rotated
+	// around the texture center (0.5, 0.5) by -rate * frameTimeSeconds
+	// degrees between the static scale and the time scroll (fixed order:
+	// scale, then rotate, then scroll), never lightmaps, vertex colour, or
+	// UI.
+	uint8_t stageTcModRotate[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+	float stageTcModRotateDegreesPerSecond[VRHI_SHADER_MAX_STAGES] = {
+		0.0f, 0.0f, 0.0f, 0.0f };
 	// A non-opaque stage zero is a translucent world batch. It is rendered
 	// after opaque batches in back-to-front order with depth writes disabled
 	// unless a stage explicitly declares depthWrite.
@@ -301,6 +325,15 @@ struct VRHI_SceneShaderMaterial {
 	// (0,0) when the base stage has no scroll statement.
 	uint8_t tcModScroll = 0;
 	float tcModScrollValue[2] = { 0.0f, 0.0f };
+	// Base-stage bounded time-based `tcMod rotate` (degrees per second).
+	// The textured scene program rotates the diffuse (material) UVs around
+	// the texture center (0.5, 0.5) by -rate * frameTimeSeconds degrees,
+	// exactly like the GL1 renderer's RB_CalcRotateTexCoords, composed
+	// between the static tcMod scale and the time-based scroll (fixed
+	// order: scale, then rotate, then scroll); 0 when the base stage has no
+	// rotate statement.
+	uint8_t tcModRotate = 0;
+	float tcModRotateDegreesPerSecond = 0.0f;
 };
 // Minimal, decoded copies of the BSP PVS traversal state. Values are
 // byte-swapped out of the on-disk little-endian form at load time and copied
@@ -1276,20 +1309,37 @@ cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
     float4 u_alphaTest;     // stage alphaFunc mode: 0 off, 1 GE128, 2 GT0, 3 LT128; 0 when absent
     float4 u_tcModScale;    // static tcMod scale (s, t); 1,1,0,0 when absent (identity UVs)
     float4 u_tcModScroll;   // tcMod scroll rates (s, t) and frame time in seconds (z); 0,0,time,0 when absent
+    float4 u_tcModRotate;   // tcMod rotate rate in degrees/sec (x) and frame time in seconds (z); 0,0,time,0 when absent
 };
 struct PSInput { float4 position : SV_Position; float2 diffuse : TEXCOORD0; float2 lightmap : TEXCOORD1; float lightmapLayer : TEXCOORD2; float4 color : TEXCOORD3; };
 [shader("pixel")]
 float4 main(PSInput input) : SV_Target
 {
-    // Bounded static tcMod scale then time scroll: only the diffuse
-    // (material) UVs are affected. The UVs are scaled by (s, t), then
-    // scrolled by rate * frameTimeSeconds wrapped into [0,1) exactly like
-    // the GL1 renderer's RB_CalcScrollTexCoords, so the coordinates never
-    // grow without bound. Identity scale / zero scroll when the stage has
-    // no statements; lightmap UVs, vertex colour, and blend state are never
+    // Bounded fixed-order tcMod composition (static scale, then rotate
+    // about the texture center, then time scroll): only the diffuse
+    // (material) UVs are affected. The UVs are scaled by (s, t), rotated
+    // around (0.5, 0.5) by -rate * frameTimeSeconds degrees exactly like
+    // the GL1 renderer's RB_CalcRotateTexCoords, then scrolled by
+    // rate * frameTimeSeconds wrapped into [0,1) exactly like the GL1
+    // RB_CalcScrollTexCoords, so the coordinates never grow without bound.
+    // Identity scale / zero rotation / zero scroll when the stage has no
+    // statements; lightmap UVs, vertex colour, and blend state are never
     // modified.
-    float2 uv = input.diffuse * u_tcModScale.xy
-        + frac(u_tcModScroll.xy * u_tcModScroll.z);
+    float2 uv = input.diffuse * u_tcModScale.xy;
+    // Rotate about (0.5, 0.5) by -rate * frameTimeSeconds degrees. The
+    // angle is wrapped into [0,360) degrees first (like the GL1 sine-table
+    // mask), so huge times cannot erode the sin/cos precision; a stage
+    // without a rotate statement keeps rate 0, which is the identity
+    // rotation.
+    const float rotateDeg = frac((-u_tcModRotate.x * u_tcModRotate.z) / 360.0) * 360.0;
+    const float rotateRad = radians(rotateDeg);
+    const float rotateSin = sin(rotateRad);
+    const float rotateCos = cos(rotateRad);
+    uv = float2(uv.x * rotateCos - uv.y * rotateSin,
+                uv.x * rotateSin + uv.y * rotateCos)
+        + float2(0.5 - 0.5 * rotateCos + 0.5 * rotateSin,
+                 0.5 - 0.5 * rotateSin - 0.5 * rotateCos);
+    uv += frac(u_tcModScroll.xy * u_tcModScroll.z);
     float4 sample = u_diffuse.Sample(u_diffuseSampler, uv);
     // Bounded static const generators tint only the material sample; vertex
     // colour and blend state are never modified here.
@@ -1318,6 +1368,7 @@ cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
     float4 u_alphaTest;     // stage alphaFunc mode: 0 off, 1 GE128, 2 GT0, 3 LT128; 0 when absent
     float4 u_tcModScale;    // static tcMod scale (s, t); 1,1,0,0 when absent (identity UVs)
     float4 u_tcModScroll;   // tcMod scroll rates (s, t) and frame time in seconds (z); 0,0,time,0 when absent
+    float4 u_tcModRotate;   // tcMod rotate rate in degrees/sec (x) and frame time in seconds (z); 0,0,time,0 when absent
 };
 struct PSInput {
     float4 position : SV_Position;
@@ -1329,16 +1380,32 @@ struct PSInput {
 [shader("pixel")]
 float4 main(PSInput input) : SV_Target
 {
-    // Bounded static tcMod scale then time scroll: only the diffuse
-    // (material) UVs are affected. The UVs are scaled by (s, t), then
-    // scrolled by rate * frameTimeSeconds wrapped into [0,1) exactly like
-    // the GL1 renderer's RB_CalcScrollTexCoords, so the coordinates never
-    // grow without bound. Identity scale / zero scroll when the stage has
-    // no statements, so draws without the keyword sample exactly as before;
+    // Bounded fixed-order tcMod composition (static scale, then rotate
+    // about the texture center, then time scroll): only the diffuse
+    // (material) UVs are affected. The UVs are scaled by (s, t), rotated
+    // around (0.5, 0.5) by -rate * frameTimeSeconds degrees exactly like
+    // the GL1 renderer's RB_CalcRotateTexCoords, then scrolled by
+    // rate * frameTimeSeconds wrapped into [0,1) exactly like the GL1
+    // RB_CalcScrollTexCoords, so the coordinates never grow without bound.
+    // Identity scale / zero rotation / zero scroll when the stage has no
+    // statements, so draws without the keyword sample exactly as before;
     // lightmap UVs, vertex colour, lightmaps, and blend state are never
     // modified.
-    float2 uv = input.diffuse * u_tcModScale.xy
-        + frac(u_tcModScroll.xy * u_tcModScroll.z);
+    float2 uv = input.diffuse * u_tcModScale.xy;
+    // Rotate about (0.5, 0.5) by -rate * frameTimeSeconds degrees. The
+    // angle is wrapped into [0,360) degrees first (like the GL1 sine-table
+    // mask), so huge times cannot erode the sin/cos precision; a stage
+    // without a rotate statement keeps rate 0, which is the identity
+    // rotation.
+    const float rotateDeg = frac((-u_tcModRotate.x * u_tcModRotate.z) / 360.0) * 360.0;
+    const float rotateRad = radians(rotateDeg);
+    const float rotateSin = sin(rotateRad);
+    const float rotateCos = cos(rotateRad);
+    uv = float2(uv.x * rotateCos - uv.y * rotateSin,
+                uv.x * rotateSin + uv.y * rotateCos)
+        + float2(0.5 - 0.5 * rotateCos + 0.5 * rotateSin,
+                 0.5 - 0.5 * rotateSin - 0.5 * rotateCos);
+    uv += frac(u_tcModScroll.xy * u_tcModScroll.z);
     float4 sample = u_diffuse.Sample(u_diffuseSampler, uv);
     // Bounded static const generators tint only the material sample; vertex
     // colour, lightmaps, and blend state are never modified here.
@@ -3104,7 +3171,9 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 	uint8_t *alphaFuncFlags = nullptr, uint8_t *clampMapFlags = nullptr,
 	uint8_t *tcModScaleFlags = nullptr, float (*tcModScaleValues)[2] = nullptr,
 	uint8_t *tcModScrollFlags = nullptr,
-	float (*tcModScrollValues)[2] = nullptr) {
+	float (*tcModScrollValues)[2] = nullptr,
+	uint8_t *tcModRotateFlags = nullptr,
+	float *tcModRotateDegreesPerSecond = nullptr) {
 	if (images == nullptr || blends == nullptr || stageCount == nullptr) return false;
 	*stageCount = 0;
 	for (size_t i = 0; i < VRHI_SHADER_MAX_STAGES; ++i) {
@@ -3131,6 +3200,8 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 			tcModScrollValues[i][0] = 0.0f;
 			tcModScrollValues[i][1] = 0.0f;
 		}
+		if (tcModRotateFlags != nullptr) tcModRotateFlags[i] = 0;
+		if (tcModRotateDegreesPerSecond != nullptr) tcModRotateDegreesPerSecond[i] = 0.0f;
 	}
 	std::vector<VRHI_ShaderStage> stages;
 	std::string directPath;
@@ -3192,6 +3263,9 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 			tcModScrollValues[i][0] = stages[i].tcModScrollS;
 			tcModScrollValues[i][1] = stages[i].tcModScrollT;
 		}
+		if (tcModRotateFlags != nullptr) tcModRotateFlags[i] = stages[i].tcModRotate ? 1 : 0;
+		if (tcModRotateDegreesPerSecond != nullptr)
+			tcModRotateDegreesPerSecond[i] = stages[i].tcModRotateDegreesPerSecond;
 	}
 	*stageCount = static_cast<int>(stages.size());
 	if (scriptResolved)
@@ -3795,11 +3869,15 @@ static void VRHI_LoadWorld(const char *name) {
 		uint8_t stageTcModScroll[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		float stageTcModScrollValue[VRHI_SHADER_MAX_STAGES][2] = {
 			{ 0.0f, 0.0f }, { 0.0f, 0.0f }, { 0.0f, 0.0f }, { 0.0f, 0.0f } };
+		uint8_t stageTcModRotate[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		float stageTcModRotateDegreesPerSecond[VRHI_SHADER_MAX_STAGES] = {
+			0.0f, 0.0f, 0.0f, 0.0f };
 		VRHI_LoadDiffuseStages(shader.shader, stageImages, stageBlend, &stageCount,
 			stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
 			stageDepthWrite, stageAlphaFunc, stageClampMap,
 			stageTcModScale, stageTcModScaleValue,
-			stageTcModScroll, stageTcModScrollValue);
+			stageTcModScroll, stageTcModScrollValue,
+			stageTcModRotate, stageTcModRotateDegreesPerSecond);
 		diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 		if (surface.surfaceType == MST_PATCH) {
 			VRHI_PatchMesh patch;
@@ -3849,6 +3927,8 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageTcModScroll[stage] = stageTcModScroll[stage];
 				batch.stageTcModScrollValue[stage][0] = stageTcModScrollValue[stage][0];
 				batch.stageTcModScrollValue[stage][1] = stageTcModScrollValue[stage][1];
+				batch.stageTcModRotate[stage] = stageTcModRotate[stage];
+				batch.stageTcModRotateDegreesPerSecond[stage] = stageTcModRotateDegreesPerSecond[stage];
 			}
 			g_worldBatches.push_back(batch);
 			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
@@ -3955,6 +4035,8 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageTcModScroll[stage] = stageTcModScroll[stage];
 				batch.stageTcModScrollValue[stage][0] = stageTcModScrollValue[stage][0];
 				batch.stageTcModScrollValue[stage][1] = stageTcModScrollValue[stage][1];
+				batch.stageTcModRotate[stage] = stageTcModRotate[stage];
+				batch.stageTcModRotateDegreesPerSecond[stage] = stageTcModRotateDegreesPerSecond[stage];
 			}
 			g_worldBatches.push_back(batch);
 			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
@@ -4034,11 +4116,15 @@ static void VRHI_LoadWorld(const char *name) {
 			uint8_t stageTcModScroll[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 			float stageTcModScrollValue[VRHI_SHADER_MAX_STAGES][2] = {
 				{ 0.0f, 0.0f }, { 0.0f, 0.0f }, { 0.0f, 0.0f }, { 0.0f, 0.0f } };
+			uint8_t stageTcModRotate[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+			float stageTcModRotateDegreesPerSecond[VRHI_SHADER_MAX_STAGES] = {
+				0.0f, 0.0f, 0.0f, 0.0f };
 			VRHI_LoadDiffuseStages(shader.shader, stageImages, stageBlend, &stageCount,
 				stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
 				stageDepthWrite, stageAlphaFunc, stageClampMap,
 				stageTcModScale, stageTcModScaleValue,
-				stageTcModScroll, stageTcModScrollValue);
+				stageTcModScroll, stageTcModScrollValue,
+				stageTcModRotate, stageTcModRotateDegreesPerSecond);
 			const int diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 			VRHI_InlineBSPModel surfaceModel;
 			if (!VRHI_BuildInlineSurface(vertsData, vertCount, indexesData, indexCount,
@@ -4072,6 +4158,8 @@ static void VRHI_LoadWorld(const char *name) {
 					batch.stageTcModScroll[stage] = stageTcModScroll[stage];
 					batch.stageTcModScrollValue[stage][0] = stageTcModScrollValue[stage][0];
 					batch.stageTcModScrollValue[stage][1] = stageTcModScrollValue[stage][1];
+					batch.stageTcModRotate[stage] = stageTcModRotate[stage];
+					batch.stageTcModRotateDegreesPerSecond[stage] = stageTcModRotateDegreesPerSecond[stage];
 				}
 			}
 			if (inlineModel.vertices.size() > VRHI_MAX_INLINE_VERTICES - surfaceModel.vertices.size() ||
@@ -4407,7 +4495,8 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	bool depthWrite = false, uint8_t alphaFunc = VRHI_SHADER_ALPHAFUNC_OFF,
 	bool clampMap = false, bool tcModScale = false,
 	const float *tcModScaleValue = nullptr, bool tcModScroll = false,
-	const float *tcModScrollValue = nullptr) {
+	const float *tcModScrollValue = nullptr, bool tcModRotate = false,
+	float tcModRotateDegreesPerSecond = 0.0f) {
 	if (indexCount == 0 || firstIndex > UINT32_MAX || indexCount > UINT32_MAX ||
 		g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) return false;
 	VRHI_SceneDraw draw;
@@ -4439,6 +4528,8 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 		draw.tcModScrollValue[0] = tcModScrollValue[0];
 		draw.tcModScrollValue[1] = tcModScrollValue[1];
 	}
+	draw.tcModRotate = tcModRotate;
+	draw.tcModRotateDegreesPerSecond = tcModRotateDegreesPerSecond;
 	g_sceneDraws.push_back(draw);
 	return true;
 }
@@ -4526,12 +4617,16 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 		uint8_t stageTcModScroll[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		float stageTcModScrollValue[VRHI_SHADER_MAX_STAGES][2] = {
 			{ 0.0f, 0.0f }, { 0.0f, 0.0f }, { 0.0f, 0.0f }, { 0.0f, 0.0f } };
+		uint8_t stageTcModRotate[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		float stageTcModRotateDegreesPerSecond[VRHI_SHADER_MAX_STAGES] = {
+			0.0f, 0.0f, 0.0f, 0.0f };
 		if (!shaderName.empty())
 			VRHI_LoadDiffuseStages(shaderName.c_str(), images, blends, &stageCount,
 				stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
 				stageDepthWrite, stageAlphaFunc, stageClampMap,
 				stageTcModScale, stageTcModScaleValue,
-				stageTcModScroll, stageTcModScrollValue);
+				stageTcModScroll, stageTcModScrollValue,
+				stageTcModRotate, stageTcModRotateDegreesPerSecond);
 		if (stageCount > 0) {
 			material.diffuseImage = images[0];
 			material.blendMode = blends[0];
@@ -4550,6 +4645,8 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 			material.tcModScroll = stageTcModScroll[0];
 			material.tcModScrollValue[0] = stageTcModScrollValue[0][0];
 			material.tcModScrollValue[1] = stageTcModScrollValue[0][1];
+			material.tcModRotate = stageTcModRotate[0];
+			material.tcModRotateDegreesPerSecond = stageTcModRotateDegreesPerSecond[0];
 		}
 		g_sceneShaderDiffuseByHandle.emplace(draw->shader, material);
 		if (material.diffuseImage >= 0) VRHI_UploadWorldDiffuse();
@@ -4575,6 +4672,8 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 	draw->tcModScroll = material.tcModScroll != 0;
 	draw->tcModScrollValue[0] = material.tcModScrollValue[0];
 	draw->tcModScrollValue[1] = material.tcModScrollValue[1];
+	draw->tcModRotate = material.tcModRotate != 0;
+	draw->tcModRotateDegreesPerSecond = material.tcModRotateDegreesPerSecond;
 	return image.texture;
 }
 
@@ -4758,7 +4857,8 @@ static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4
 				batch.stageDepthWrite[0] != 0, batch.stageAlphaFunc[0],
 				batch.stageClampMap[0] != 0,
 				batch.stageTcModScale[0] != 0, batch.stageTcModScaleValue[0],
-				batch.stageTcModScroll[0] != 0, batch.stageTcModScrollValue[0])) {
+				batch.stageTcModScroll[0] != 0, batch.stageTcModScrollValue[0],
+				batch.stageTcModRotate[0] != 0, batch.stageTcModRotateDegreesPerSecond[0])) {
 				g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
 				g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
 				continue;
@@ -5324,6 +5424,20 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 					batch.stageTcModScroll[stage] ? batch.stageTcModScrollValue[stage][1] : 0.0f,
 					frameTimeSeconds, 0.0f);
 				g_worldState.SetUniform(3, { "u_tcModScroll", { tcModScroll } });
+				// Bounded time-based tcMod rotate for this stage plus the shared
+				// per-frame render time in seconds (z): the textured material
+				// pixel shaders rotate the diffuse UVs around the texture center
+				// (0.5, 0.5) by -rate * time degrees, composed between the static
+				// scale and the time scroll (fixed order: scale, then rotate,
+				// then scroll), always written (rate 0 when the stage has no
+				// rotate) so the per-draw uniform never carries a stale rate
+				// from an earlier draw. Only the diffuse sample is rotated;
+				// lightmap UVs, UI textures, vertex colour, and blend state are
+				// untouched. World and scene draws share this same frame time.
+				const glm::vec4 tcModRotate(
+					batch.stageTcModRotate[stage] ? batch.stageTcModRotateDegreesPerSecond[stage] : 0.0f,
+					0.0f, frameTimeSeconds, 0.0f);
+				g_worldState.SetUniform(4, { "u_tcModRotate", { tcModRotate } });
 			}
 			if (vhSetState(g_worldStateId, g_worldState)) {
 				if (!submitted) vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
@@ -5473,6 +5587,21 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 					draw.tcModScroll ? draw.tcModScrollValue[1] : 0.0f,
 					frameTimeSeconds, 0.0f);
 				g_worldState.SetUniform(3, { "u_tcModScroll", { tcModScroll } });
+				// Bounded time-based tcMod rotate carried on the scene draw plus
+				// the shared per-frame render time in seconds (z): the textured
+				// material pixel shader rotates the diffuse UVs around the
+				// texture center (0.5, 0.5) by -rate * time degrees, composed
+				// between the static scale and the time scroll (fixed order:
+				// scale, then rotate, then scroll), always written (rate 0 when
+				// the draw has no rotate) so the per-draw uniform never carries
+				// a stale rate from an earlier draw. Only the diffuse sample is
+				// rotated; lightmap UVs, UI textures, vertex colour, and blend
+				// state are untouched. Scene and world draws share this same
+				// frame time.
+				const glm::vec4 tcModRotate(
+					draw.tcModRotate ? draw.tcModRotateDegreesPerSecond : 0.0f,
+					0.0f, frameTimeSeconds, 0.0f);
+				g_worldState.SetUniform(4, { "u_tcModRotate", { tcModRotate } });
 			}
 			if (vhSetState(g_worldStateId, g_worldState)) {
 				if (!submitted) vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
