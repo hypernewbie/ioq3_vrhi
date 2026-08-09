@@ -179,6 +179,19 @@ struct VRHI_SceneDraw {
 	// exactly as before.
 	bool tcModRotate = false;
 	float tcModRotateDegreesPerSecond = 0.0f;
+	// Bounded per-draw wave generators (`rgbGen wave` / `alphaGen wave`)
+	// carried from the base stage's script statement. The textured material
+	// pixel shaders modulate the material sample RGB/alpha by the clamped
+	// GL1 EvalWaveForm value (see vrhi_shader_script.h) using the shared
+	// per-frame render time; VRHI_SHADER_WAVE_NONE (0) keeps identity
+	// modulation, so draws without a wave statement render exactly as
+	// before. Vertex colour, lightmaps, blend state, const generators,
+	// alpha testing, and UV transforms are never modified.
+	uint8_t rgbGenWave = VRHI_SHADER_WAVE_NONE;
+	// base, amplitude, phase, frequency (script parameter order).
+	float rgbWaveValue[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	uint8_t alphaGenWave = VRHI_SHADER_WAVE_NONE;
+	float alphaWaveValue[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 };
 static std::vector<VRHI_SceneEntity> g_sceneEntities;
 static std::vector<VRHI_ScenePoly> g_scenePolys;
@@ -273,6 +286,23 @@ struct VRHI_WorldBatch {
 	uint8_t stageTcModRotate[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 	float stageTcModRotateDegreesPerSecond[VRHI_SHADER_MAX_STAGES] = {
 		0.0f, 0.0f, 0.0f, 0.0f };
+	// Per-stage bounded wave generators (`rgbGen wave`/`alphaGen wave`)
+	// carried from the parsed stage data to the pixel-shader material
+	// modulation. Func id 0 (VRHI_SHADER_WAVE_NONE) means no generator
+	// (identity modulation), preserving the existing sampling; only the
+	// diffuse material sample is modulated, never lightmaps, vertex colour,
+	// or UI. Values are stored in script parameter order: base, amplitude,
+	// phase, frequency.
+	uint8_t stageRgbGenWave[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_WAVE_NONE,
+		VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE };
+	float stageRgbWaveValue[VRHI_SHADER_MAX_STAGES][4] = {
+		{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
+		{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
+	uint8_t stageAlphaGenWave[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_WAVE_NONE,
+		VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE };
+	float stageAlphaWaveValue[VRHI_SHADER_MAX_STAGES][4] = {
+		{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
+		{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
 	// A non-opaque stage zero is a translucent world batch. It is rendered
 	// after opaque batches in back-to-front order with depth writes disabled
 	// unless a stage explicitly declares depthWrite.
@@ -334,6 +364,16 @@ struct VRHI_SceneShaderMaterial {
 	// rotate statement.
 	uint8_t tcModRotate = 0;
 	float tcModRotateDegreesPerSecond = 0.0f;
+	// Base-stage bounded wave generators (`rgbGen wave`/`alphaGen wave` in
+	// the base stage's script statement). The textured scene program
+	// modulates the material sample RGB/alpha by the clamped GL1
+	// EvalWaveForm value using the shared per-frame render time;
+	// VRHI_SHADER_WAVE_NONE (0) keeps identity modulation. Values are in
+	// script parameter order: base, amplitude, phase, frequency.
+	uint8_t rgbGenWave = VRHI_SHADER_WAVE_NONE;
+	float rgbWaveValue[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	uint8_t alphaGenWave = VRHI_SHADER_WAVE_NONE;
+	float alphaWaveValue[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 };
 // Minimal, decoded copies of the BSP PVS traversal state. Values are
 // byte-swapped out of the on-disk little-endian form at load time and copied
@@ -1310,8 +1350,46 @@ cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
     float4 u_tcModScale;    // static tcMod scale (s, t); 1,1,0,0 when absent (identity UVs)
     float4 u_tcModScroll;   // tcMod scroll rates (s, t) and frame time in seconds (z); 0,0,time,0 when absent
     float4 u_tcModRotate;   // tcMod rotate rate in degrees/sec (x) and frame time in seconds (z); 0,0,time,0 when absent
+    float4 u_rgbWave;       // rgbGen wave: func id (x), base (y), amplitude (z), frequency (w); 0,0,0,0 when absent
+    float4 u_rgbWaveTime;   // rgbGen wave: phase (x), frame time in seconds (y); 0,0,0,0 when absent
+    float4 u_alphaWave;     // alphaGen wave: func id (x), base (y), amplitude (z), frequency (w); 0,0,0,0 when absent
+    float4 u_alphaWaveTime; // alphaGen wave: phase (x), frame time in seconds (y); 0,0,0,0 when absent
 };
 struct PSInput { float4 position : SV_Position; float2 diffuse : TEXCOORD0; float2 lightmap : TEXCOORD1; float lightmapLayer : TEXCOORD2; float4 color : TEXCOORD3; };
+// Evaluates one bounded Quake3 wave generator exactly like the GL1 renderer's
+// EvalWaveForm/WAVEVALUE (tr_shade_calc.c): the table index is
+// ((int64)((phase + shaderTime * freq) * FUNCTABLE_SIZE)) & FUNCTABLE_MASK,
+// which is a truncation-toward-zero modulo (both signs wrap identically), and
+// the value is base + table[index] * amplitude, clamped to [0,1] like
+// RB_CalcWaveColor/RB_CalcWaveAlpha. The table shapes are the GL1 tr_init.c
+// tables evaluated at the same integer indices: sin via the same
+// DEG2RAD(i*360/1023) formula, square via i < FUNCTABLE_SIZE/2, sawtooth via
+// i/FUNCTABLE_SIZE, inverse sawtooth via 1 - i/FUNCTABLE_SIZE, and triangle
+// via the quarter-piecewise ramp. func 0 (VRHI_SHADER_WAVE_NONE) returns 1,
+// the identity modulation. wave = (func, base, amplitude, frequency);
+// waveTime = (phase, frameTimeSeconds, 0, 0). All inputs are finite (the
+// parser bounds every parameter and the shared frame time is refdef.time *
+// 0.001), so the result is always finite.
+float VRHI_EvalWave(float func, float4 wave, float4 waveTime)
+{
+    if (func < 0.5) return 1.0;
+    const float scaled = (waveTime.x + waveTime.y * wave.w) * 1024.0;
+    const float truncated = scaled >= 0.0 ? floor(scaled) : ceil(scaled);
+    const float wrapped = truncated - 1024.0 * floor(truncated / 1024.0);
+    const float fraction = wrapped / 1024.0;
+    float value = 0.0;
+    if (func < 1.5)
+        value = sin(6.283185307179586 * fraction * (1024.0 / 1023.0));
+    else if (func < 2.5)
+        value = fraction < 0.5 ? 1.0 : -1.0;
+    else if (func < 3.5)
+        value = 4.0 * abs(frac(fraction + 0.75) - 0.5) - 1.0;
+    else if (func < 4.5)
+        value = fraction;
+    else
+        value = 1.0 - fraction;
+    return clamp(wave.y + value * wave.z, 0.0, 1.0);
+}
 [shader("pixel")]
 float4 main(PSInput input) : SV_Target
 {
@@ -1344,6 +1422,16 @@ float4 main(PSInput input) : SV_Target
     // Bounded static const generators tint only the material sample; vertex
     // colour and blend state are never modified here.
     sample *= u_materialConst;
+    // Bounded wave generators (rgbGen wave / alphaGen wave) modulate only the
+    // material sample, exactly like the static const generators: the GL1
+    // renderer's wave color replaces the modulate color with a clamped [0,1]
+    // grayscale (RB_CalcWaveColor) and the alpha wave replaces the modulate
+    // alpha (RB_CalcWaveAlpha). Multiplying composes them (const * wave);
+    // identity values reduce to the other generator, so stages without a
+    // wave statement render exactly as before. Vertex colour, blend state,
+    // lightmaps, and the current UV transforms are never touched.
+    sample.rgb *= VRHI_EvalWave(u_rgbWave.x, u_rgbWave, u_rgbWaveTime);
+    sample.a *= VRHI_EvalWave(u_alphaWave.x, u_alphaWave, u_alphaWaveTime);
     float4 result = sample * input.color;
     // Bounded stage alpha-test (alphaFunc): GE128 discards alpha<0.5, GT0
     // discards alpha<=0, LT128 discards alpha>=0.5. Off (0) never discards,
@@ -1369,6 +1457,10 @@ cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
     float4 u_tcModScale;    // static tcMod scale (s, t); 1,1,0,0 when absent (identity UVs)
     float4 u_tcModScroll;   // tcMod scroll rates (s, t) and frame time in seconds (z); 0,0,time,0 when absent
     float4 u_tcModRotate;   // tcMod rotate rate in degrees/sec (x) and frame time in seconds (z); 0,0,time,0 when absent
+    float4 u_rgbWave;       // rgbGen wave: func id (x), base (y), amplitude (z), frequency (w); 0,0,0,0 when absent
+    float4 u_rgbWaveTime;   // rgbGen wave: phase (x), frame time in seconds (y); 0,0,0,0 when absent
+    float4 u_alphaWave;     // alphaGen wave: func id (x), base (y), amplitude (z), frequency (w); 0,0,0,0 when absent
+    float4 u_alphaWaveTime; // alphaGen wave: phase (x), frame time in seconds (y); 0,0,0,0 when absent
 };
 struct PSInput {
     float4 position : SV_Position;
@@ -1377,6 +1469,40 @@ struct PSInput {
     float lightmapLayer : TEXCOORD2;
     float4 color : TEXCOORD3;
 };
+// Evaluates one bounded Quake3 wave generator exactly like the GL1 renderer's
+// EvalWaveForm/WAVEVALUE (tr_shade_calc.c): the table index is
+// ((int64)((phase + shaderTime * freq) * FUNCTABLE_SIZE)) & FUNCTABLE_MASK,
+// which is a truncation-toward-zero modulo (both signs wrap identically), and
+// the value is base + table[index] * amplitude, clamped to [0,1] like
+// RB_CalcWaveColor/RB_CalcWaveAlpha. The table shapes are the GL1 tr_init.c
+// tables evaluated at the same integer indices: sin via the same
+// DEG2RAD(i*360/1023) formula, square via i < FUNCTABLE_SIZE/2, sawtooth via
+// i/FUNCTABLE_SIZE, inverse sawtooth via 1 - i/FUNCTABLE_SIZE, and triangle
+// via the quarter-piecewise ramp. func 0 (VRHI_SHADER_WAVE_NONE) returns 1,
+// the identity modulation. wave = (func, base, amplitude, frequency);
+// waveTime = (phase, frameTimeSeconds, 0, 0). All inputs are finite (the
+// parser bounds every parameter and the shared frame time is refdef.time *
+// 0.001), so the result is always finite.
+float VRHI_EvalWave(float func, float4 wave, float4 waveTime)
+{
+    if (func < 0.5) return 1.0;
+    const float scaled = (waveTime.x + waveTime.y * wave.w) * 1024.0;
+    const float truncated = scaled >= 0.0 ? floor(scaled) : ceil(scaled);
+    const float wrapped = truncated - 1024.0 * floor(truncated / 1024.0);
+    const float fraction = wrapped / 1024.0;
+    float value = 0.0;
+    if (func < 1.5)
+        value = sin(6.283185307179586 * fraction * (1024.0 / 1023.0));
+    else if (func < 2.5)
+        value = fraction < 0.5 ? 1.0 : -1.0;
+    else if (func < 3.5)
+        value = 4.0 * abs(frac(fraction + 0.75) - 0.5) - 1.0;
+    else if (func < 4.5)
+        value = fraction;
+    else
+        value = 1.0 - fraction;
+    return clamp(wave.y + value * wave.z, 0.0, 1.0);
+}
 [shader("pixel")]
 float4 main(PSInput input) : SV_Target
 {
@@ -1411,6 +1537,18 @@ float4 main(PSInput input) : SV_Target
     // colour, lightmaps, and blend state are never modified here.
     sample.rgb *= u_materialConst.rgb;
     sample.a *= u_materialConst.a;
+    // Bounded wave generators (rgbGen wave / alphaGen wave) modulate only the
+    // material sample, exactly like the static const generators: the GL1
+    // renderer's wave color replaces the modulate color with a clamped [0,1]
+    // grayscale (RB_CalcWaveColor) and the alpha wave replaces the modulate
+    // alpha (RB_CalcWaveAlpha). Multiplying composes them (const * wave);
+    // identity values reduce to the other generator, so draws without a wave
+    // statement render exactly as before. Vertex colour, lightmaps, blend
+    // state, and the current UV transforms are never touched. The modulated
+    // alpha feeds the alphaFunc comparison below, matching the GL1
+    // alpha-test-after-color-generator order.
+    sample.rgb *= VRHI_EvalWave(u_rgbWave.x, u_rgbWave, u_rgbWaveTime);
+    sample.a *= VRHI_EvalWave(u_alphaWave.x, u_alphaWave, u_alphaWaveTime);
     if (input.lightmapLayer >= -0.5)
         sample.rgb *= u_lightmap.Sample(u_lightmapSampler,
             float3(saturate(input.lightmap), input.lightmapLayer)).rgb;
@@ -3173,7 +3311,11 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 	uint8_t *tcModScrollFlags = nullptr,
 	float (*tcModScrollValues)[2] = nullptr,
 	uint8_t *tcModRotateFlags = nullptr,
-	float *tcModRotateDegreesPerSecond = nullptr) {
+	float *tcModRotateDegreesPerSecond = nullptr,
+	uint8_t *rgbGenWaveFuncs = nullptr,
+	float (*rgbWaveValues)[4] = nullptr,
+	uint8_t *alphaGenWaveFuncs = nullptr,
+	float (*alphaWaveValues)[4] = nullptr) {
 	if (images == nullptr || blends == nullptr || stageCount == nullptr) return false;
 	*stageCount = 0;
 	for (size_t i = 0; i < VRHI_SHADER_MAX_STAGES; ++i) {
@@ -3202,6 +3344,20 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 		}
 		if (tcModRotateFlags != nullptr) tcModRotateFlags[i] = 0;
 		if (tcModRotateDegreesPerSecond != nullptr) tcModRotateDegreesPerSecond[i] = 0.0f;
+		if (rgbGenWaveFuncs != nullptr) rgbGenWaveFuncs[i] = VRHI_SHADER_WAVE_NONE;
+		if (rgbWaveValues != nullptr) {
+			rgbWaveValues[i][0] = 0.0f;
+			rgbWaveValues[i][1] = 0.0f;
+			rgbWaveValues[i][2] = 0.0f;
+			rgbWaveValues[i][3] = 0.0f;
+		}
+		if (alphaGenWaveFuncs != nullptr) alphaGenWaveFuncs[i] = VRHI_SHADER_WAVE_NONE;
+		if (alphaWaveValues != nullptr) {
+			alphaWaveValues[i][0] = 0.0f;
+			alphaWaveValues[i][1] = 0.0f;
+			alphaWaveValues[i][2] = 0.0f;
+			alphaWaveValues[i][3] = 0.0f;
+		}
 	}
 	std::vector<VRHI_ShaderStage> stages;
 	std::string directPath;
@@ -3266,6 +3422,22 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 		if (tcModRotateFlags != nullptr) tcModRotateFlags[i] = stages[i].tcModRotate ? 1 : 0;
 		if (tcModRotateDegreesPerSecond != nullptr)
 			tcModRotateDegreesPerSecond[i] = stages[i].tcModRotateDegreesPerSecond;
+		if (rgbGenWaveFuncs != nullptr)
+			rgbGenWaveFuncs[i] = static_cast<uint8_t>(stages[i].rgbGenWaveFunc);
+		if (rgbWaveValues != nullptr) {
+			rgbWaveValues[i][0] = stages[i].rgbWaveBase;
+			rgbWaveValues[i][1] = stages[i].rgbWaveAmplitude;
+			rgbWaveValues[i][2] = stages[i].rgbWavePhase;
+			rgbWaveValues[i][3] = stages[i].rgbWaveFrequency;
+		}
+		if (alphaGenWaveFuncs != nullptr)
+			alphaGenWaveFuncs[i] = static_cast<uint8_t>(stages[i].alphaGenWaveFunc);
+		if (alphaWaveValues != nullptr) {
+			alphaWaveValues[i][0] = stages[i].alphaWaveBase;
+			alphaWaveValues[i][1] = stages[i].alphaWaveAmplitude;
+			alphaWaveValues[i][2] = stages[i].alphaWavePhase;
+			alphaWaveValues[i][3] = stages[i].alphaWaveFrequency;
+		}
 	}
 	*stageCount = static_cast<int>(stages.size());
 	if (scriptResolved)
@@ -3872,12 +4044,24 @@ static void VRHI_LoadWorld(const char *name) {
 		uint8_t stageTcModRotate[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		float stageTcModRotateDegreesPerSecond[VRHI_SHADER_MAX_STAGES] = {
 			0.0f, 0.0f, 0.0f, 0.0f };
+		uint8_t stageRgbGenWave[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_WAVE_NONE,
+			VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE };
+		float stageRgbWaveValue[VRHI_SHADER_MAX_STAGES][4] = {
+			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
+			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
+		uint8_t stageAlphaGenWave[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_WAVE_NONE,
+			VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE };
+		float stageAlphaWaveValue[VRHI_SHADER_MAX_STAGES][4] = {
+			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
+			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
 		VRHI_LoadDiffuseStages(shader.shader, stageImages, stageBlend, &stageCount,
 			stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
 			stageDepthWrite, stageAlphaFunc, stageClampMap,
 			stageTcModScale, stageTcModScaleValue,
 			stageTcModScroll, stageTcModScrollValue,
-			stageTcModRotate, stageTcModRotateDegreesPerSecond);
+			stageTcModRotate, stageTcModRotateDegreesPerSecond,
+			stageRgbGenWave, stageRgbWaveValue,
+			stageAlphaGenWave, stageAlphaWaveValue);
 		diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 		if (surface.surfaceType == MST_PATCH) {
 			VRHI_PatchMesh patch;
@@ -3929,6 +4113,16 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageTcModScrollValue[stage][1] = stageTcModScrollValue[stage][1];
 				batch.stageTcModRotate[stage] = stageTcModRotate[stage];
 				batch.stageTcModRotateDegreesPerSecond[stage] = stageTcModRotateDegreesPerSecond[stage];
+				batch.stageRgbGenWave[stage] = stageRgbGenWave[stage];
+				batch.stageRgbWaveValue[stage][0] = stageRgbWaveValue[stage][0];
+				batch.stageRgbWaveValue[stage][1] = stageRgbWaveValue[stage][1];
+				batch.stageRgbWaveValue[stage][2] = stageRgbWaveValue[stage][2];
+				batch.stageRgbWaveValue[stage][3] = stageRgbWaveValue[stage][3];
+				batch.stageAlphaGenWave[stage] = stageAlphaGenWave[stage];
+				batch.stageAlphaWaveValue[stage][0] = stageAlphaWaveValue[stage][0];
+				batch.stageAlphaWaveValue[stage][1] = stageAlphaWaveValue[stage][1];
+				batch.stageAlphaWaveValue[stage][2] = stageAlphaWaveValue[stage][2];
+				batch.stageAlphaWaveValue[stage][3] = stageAlphaWaveValue[stage][3];
 			}
 			g_worldBatches.push_back(batch);
 			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
@@ -4037,6 +4231,16 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageTcModScrollValue[stage][1] = stageTcModScrollValue[stage][1];
 				batch.stageTcModRotate[stage] = stageTcModRotate[stage];
 				batch.stageTcModRotateDegreesPerSecond[stage] = stageTcModRotateDegreesPerSecond[stage];
+				batch.stageRgbGenWave[stage] = stageRgbGenWave[stage];
+				batch.stageRgbWaveValue[stage][0] = stageRgbWaveValue[stage][0];
+				batch.stageRgbWaveValue[stage][1] = stageRgbWaveValue[stage][1];
+				batch.stageRgbWaveValue[stage][2] = stageRgbWaveValue[stage][2];
+				batch.stageRgbWaveValue[stage][3] = stageRgbWaveValue[stage][3];
+				batch.stageAlphaGenWave[stage] = stageAlphaGenWave[stage];
+				batch.stageAlphaWaveValue[stage][0] = stageAlphaWaveValue[stage][0];
+				batch.stageAlphaWaveValue[stage][1] = stageAlphaWaveValue[stage][1];
+				batch.stageAlphaWaveValue[stage][2] = stageAlphaWaveValue[stage][2];
+				batch.stageAlphaWaveValue[stage][3] = stageAlphaWaveValue[stage][3];
 			}
 			g_worldBatches.push_back(batch);
 			g_worldSurfaceBatch[surfaceIndex] = static_cast<int32_t>(g_worldBatches.size() - 1);
@@ -4119,12 +4323,24 @@ static void VRHI_LoadWorld(const char *name) {
 			uint8_t stageTcModRotate[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 			float stageTcModRotateDegreesPerSecond[VRHI_SHADER_MAX_STAGES] = {
 				0.0f, 0.0f, 0.0f, 0.0f };
+			uint8_t stageRgbGenWave[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_WAVE_NONE,
+				VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE };
+			float stageRgbWaveValue[VRHI_SHADER_MAX_STAGES][4] = {
+				{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
+				{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
+			uint8_t stageAlphaGenWave[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_WAVE_NONE,
+				VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE };
+			float stageAlphaWaveValue[VRHI_SHADER_MAX_STAGES][4] = {
+				{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
+				{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
 			VRHI_LoadDiffuseStages(shader.shader, stageImages, stageBlend, &stageCount,
 				stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
 				stageDepthWrite, stageAlphaFunc, stageClampMap,
 				stageTcModScale, stageTcModScaleValue,
 				stageTcModScroll, stageTcModScrollValue,
-				stageTcModRotate, stageTcModRotateDegreesPerSecond);
+				stageTcModRotate, stageTcModRotateDegreesPerSecond,
+				stageRgbGenWave, stageRgbWaveValue,
+				stageAlphaGenWave, stageAlphaWaveValue);
 			const int diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 			VRHI_InlineBSPModel surfaceModel;
 			if (!VRHI_BuildInlineSurface(vertsData, vertCount, indexesData, indexCount,
@@ -4160,6 +4376,16 @@ static void VRHI_LoadWorld(const char *name) {
 					batch.stageTcModScrollValue[stage][1] = stageTcModScrollValue[stage][1];
 					batch.stageTcModRotate[stage] = stageTcModRotate[stage];
 					batch.stageTcModRotateDegreesPerSecond[stage] = stageTcModRotateDegreesPerSecond[stage];
+					batch.stageRgbGenWave[stage] = stageRgbGenWave[stage];
+					batch.stageRgbWaveValue[stage][0] = stageRgbWaveValue[stage][0];
+					batch.stageRgbWaveValue[stage][1] = stageRgbWaveValue[stage][1];
+					batch.stageRgbWaveValue[stage][2] = stageRgbWaveValue[stage][2];
+					batch.stageRgbWaveValue[stage][3] = stageRgbWaveValue[stage][3];
+					batch.stageAlphaGenWave[stage] = stageAlphaGenWave[stage];
+					batch.stageAlphaWaveValue[stage][0] = stageAlphaWaveValue[stage][0];
+					batch.stageAlphaWaveValue[stage][1] = stageAlphaWaveValue[stage][1];
+					batch.stageAlphaWaveValue[stage][2] = stageAlphaWaveValue[stage][2];
+					batch.stageAlphaWaveValue[stage][3] = stageAlphaWaveValue[stage][3];
 				}
 			}
 			if (inlineModel.vertices.size() > VRHI_MAX_INLINE_VERTICES - surfaceModel.vertices.size() ||
@@ -4496,7 +4722,11 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	bool clampMap = false, bool tcModScale = false,
 	const float *tcModScaleValue = nullptr, bool tcModScroll = false,
 	const float *tcModScrollValue = nullptr, bool tcModRotate = false,
-	float tcModRotateDegreesPerSecond = 0.0f) {
+	float tcModRotateDegreesPerSecond = 0.0f,
+	uint8_t rgbGenWave = VRHI_SHADER_WAVE_NONE,
+	const float *rgbWaveValue = nullptr,
+	uint8_t alphaGenWave = VRHI_SHADER_WAVE_NONE,
+	const float *alphaWaveValue = nullptr) {
 	if (indexCount == 0 || firstIndex > UINT32_MAX || indexCount > UINT32_MAX ||
 		g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) return false;
 	VRHI_SceneDraw draw;
@@ -4530,6 +4760,20 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	}
 	draw.tcModRotate = tcModRotate;
 	draw.tcModRotateDegreesPerSecond = tcModRotateDegreesPerSecond;
+	draw.rgbGenWave = rgbGenWave;
+	if (rgbWaveValue != nullptr) {
+		draw.rgbWaveValue[0] = rgbWaveValue[0];
+		draw.rgbWaveValue[1] = rgbWaveValue[1];
+		draw.rgbWaveValue[2] = rgbWaveValue[2];
+		draw.rgbWaveValue[3] = rgbWaveValue[3];
+	}
+	draw.alphaGenWave = alphaGenWave;
+	if (alphaWaveValue != nullptr) {
+		draw.alphaWaveValue[0] = alphaWaveValue[0];
+		draw.alphaWaveValue[1] = alphaWaveValue[1];
+		draw.alphaWaveValue[2] = alphaWaveValue[2];
+		draw.alphaWaveValue[3] = alphaWaveValue[3];
+	}
 	g_sceneDraws.push_back(draw);
 	return true;
 }
@@ -4620,13 +4864,25 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 		uint8_t stageTcModRotate[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		float stageTcModRotateDegreesPerSecond[VRHI_SHADER_MAX_STAGES] = {
 			0.0f, 0.0f, 0.0f, 0.0f };
+		uint8_t stageRgbGenWave[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_WAVE_NONE,
+			VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE };
+		float stageRgbWaveValue[VRHI_SHADER_MAX_STAGES][4] = {
+			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
+			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
+		uint8_t stageAlphaGenWave[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_WAVE_NONE,
+			VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE };
+		float stageAlphaWaveValue[VRHI_SHADER_MAX_STAGES][4] = {
+			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
+			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
 		if (!shaderName.empty())
 			VRHI_LoadDiffuseStages(shaderName.c_str(), images, blends, &stageCount,
 				stageRgbConst, stageRgbConstColor, stageAlphaConst, stageAlphaConstValue,
 				stageDepthWrite, stageAlphaFunc, stageClampMap,
 				stageTcModScale, stageTcModScaleValue,
 				stageTcModScroll, stageTcModScrollValue,
-				stageTcModRotate, stageTcModRotateDegreesPerSecond);
+				stageTcModRotate, stageTcModRotateDegreesPerSecond,
+				stageRgbGenWave, stageRgbWaveValue,
+				stageAlphaGenWave, stageAlphaWaveValue);
 		if (stageCount > 0) {
 			material.diffuseImage = images[0];
 			material.blendMode = blends[0];
@@ -4647,6 +4903,16 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 			material.tcModScrollValue[1] = stageTcModScrollValue[0][1];
 			material.tcModRotate = stageTcModRotate[0];
 			material.tcModRotateDegreesPerSecond = stageTcModRotateDegreesPerSecond[0];
+			material.rgbGenWave = static_cast<uint8_t>(stageRgbGenWave[0]);
+			material.rgbWaveValue[0] = stageRgbWaveValue[0][0];
+			material.rgbWaveValue[1] = stageRgbWaveValue[0][1];
+			material.rgbWaveValue[2] = stageRgbWaveValue[0][2];
+			material.rgbWaveValue[3] = stageRgbWaveValue[0][3];
+			material.alphaGenWave = static_cast<uint8_t>(stageAlphaGenWave[0]);
+			material.alphaWaveValue[0] = stageAlphaWaveValue[0][0];
+			material.alphaWaveValue[1] = stageAlphaWaveValue[0][1];
+			material.alphaWaveValue[2] = stageAlphaWaveValue[0][2];
+			material.alphaWaveValue[3] = stageAlphaWaveValue[0][3];
 		}
 		g_sceneShaderDiffuseByHandle.emplace(draw->shader, material);
 		if (material.diffuseImage >= 0) VRHI_UploadWorldDiffuse();
@@ -4674,6 +4940,16 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 	draw->tcModScrollValue[1] = material.tcModScrollValue[1];
 	draw->tcModRotate = material.tcModRotate != 0;
 	draw->tcModRotateDegreesPerSecond = material.tcModRotateDegreesPerSecond;
+	draw->rgbGenWave = material.rgbGenWave;
+	draw->rgbWaveValue[0] = material.rgbWaveValue[0];
+	draw->rgbWaveValue[1] = material.rgbWaveValue[1];
+	draw->rgbWaveValue[2] = material.rgbWaveValue[2];
+	draw->rgbWaveValue[3] = material.rgbWaveValue[3];
+	draw->alphaGenWave = material.alphaGenWave;
+	draw->alphaWaveValue[0] = material.alphaWaveValue[0];
+	draw->alphaWaveValue[1] = material.alphaWaveValue[1];
+	draw->alphaWaveValue[2] = material.alphaWaveValue[2];
+	draw->alphaWaveValue[3] = material.alphaWaveValue[3];
 	return image.texture;
 }
 
@@ -4858,7 +5134,9 @@ static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4
 				batch.stageClampMap[0] != 0,
 				batch.stageTcModScale[0] != 0, batch.stageTcModScaleValue[0],
 				batch.stageTcModScroll[0] != 0, batch.stageTcModScrollValue[0],
-				batch.stageTcModRotate[0] != 0, batch.stageTcModRotateDegreesPerSecond[0])) {
+				batch.stageTcModRotate[0] != 0, batch.stageTcModRotateDegreesPerSecond[0],
+				batch.stageRgbGenWave[0], batch.stageRgbWaveValue[0],
+				batch.stageAlphaGenWave[0], batch.stageAlphaWaveValue[0])) {
 				g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
 				g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
 				continue;
@@ -5438,6 +5716,56 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 					batch.stageTcModRotate[stage] ? batch.stageTcModRotateDegreesPerSecond[stage] : 0.0f,
 					0.0f, frameTimeSeconds, 0.0f);
 				g_worldState.SetUniform(4, { "u_tcModRotate", { tcModRotate } });
+				// Bounded stage-local rgbGen wave generator for this stage plus
+				// the shared per-frame render time in seconds: the textured
+				// material pixel shaders modulate the material sample RGB by
+				// the clamped GL1 EvalWaveForm value (u_rgbWave carries the
+				// func id and base/amplitude/frequency; u_rgbWaveTime carries
+				// the phase and the shared frame time). Func id 0 when the
+				// stage has no wave (identity modulation), always written so
+				// the per-draw uniform never carries a stale generator from an
+				// earlier draw. Only the material sample is modulated; vertex
+				// colour, lightmaps, blend state, const generators, alpha
+				// testing, and UV transforms are untouched. World and scene
+				// draws share this same frame time.
+				// stageRgbWaveValue is [base, amplitude, phase, frequency] (script
+				// order); the shader evaluates phase + time*frequency, so
+				// u_rgbWave carries (func, base, amplitude, frequency) and
+				// u_rgbWaveTime carries (phase, frameTimeSeconds, 0, 0).
+				const glm::vec4 rgbWave(
+					static_cast<float>(batch.stageRgbGenWave[stage]),
+					batch.stageRgbWaveValue[stage][0],  // base
+					batch.stageRgbWaveValue[stage][1],  // amplitude
+					batch.stageRgbWaveValue[stage][3]); // frequency
+				g_worldState.SetUniform(5, { "u_rgbWave", { rgbWave } });
+				const glm::vec4 rgbWaveTime(
+					batch.stageRgbWaveValue[stage][2], // phase
+					frameTimeSeconds, 0.0f, 0.0f);
+				g_worldState.SetUniform(6, { "u_rgbWaveTime", { rgbWaveTime } });
+				// Bounded stage-local alphaGen wave generator for this stage
+				// plus the shared per-frame render time in seconds: the
+				// textured material pixel shaders modulate the material sample
+				// alpha by the clamped GL1 EvalWaveForm value, feeding the
+				// alphaFunc comparison below. Func id 0 when the stage has no
+				// wave (identity modulation), always written so the per-draw
+				// uniform never carries a stale generator from an earlier
+				// draw. Only the material sample is modulated; vertex colour,
+				// lightmaps, blend state, const generators, and UV transforms
+				// are untouched.
+				// stageAlphaWaveValue is [base, amplitude, phase, frequency]
+				// (script order); u_alphaWave carries (func, base, amplitude,
+				// frequency) and u_alphaWaveTime carries (phase, frameTimeSeconds,
+				// 0, 0) to match the shader's phase + time*frequency evaluation.
+				const glm::vec4 alphaWave(
+					static_cast<float>(batch.stageAlphaGenWave[stage]),
+					batch.stageAlphaWaveValue[stage][0],  // base
+					batch.stageAlphaWaveValue[stage][1],  // amplitude
+					batch.stageAlphaWaveValue[stage][3]); // frequency
+				g_worldState.SetUniform(7, { "u_alphaWave", { alphaWave } });
+				const glm::vec4 alphaWaveTime(
+					batch.stageAlphaWaveValue[stage][2], // phase
+					frameTimeSeconds, 0.0f, 0.0f);
+				g_worldState.SetUniform(8, { "u_alphaWaveTime", { alphaWaveTime } });
 			}
 			if (vhSetState(g_worldStateId, g_worldState)) {
 				if (!submitted) vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);
@@ -5602,6 +5930,56 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 					draw.tcModRotate ? draw.tcModRotateDegreesPerSecond : 0.0f,
 					0.0f, frameTimeSeconds, 0.0f);
 				g_worldState.SetUniform(4, { "u_tcModRotate", { tcModRotate } });
+				// Bounded rgbGen wave generator carried on the scene draw plus
+				// the shared per-frame render time in seconds: the textured
+				// material pixel shader modulates the material sample RGB by
+				// the clamped GL1 EvalWaveForm value (u_rgbWave carries the
+				// func id and base/amplitude/frequency; u_rgbWaveTime carries
+				// the phase and the shared frame time). Func id 0 when the
+				// draw has no wave (identity modulation), always written so
+				// the per-draw uniform never carries a stale generator from an
+				// earlier draw. Only the material sample is modulated; vertex
+				// colour, lightmaps, blend state, const generators, alpha
+				// testing, and UV transforms are untouched. Scene and world
+				// draws share this same frame time.
+				// draw.rgbWaveValue is [base, amplitude, phase, frequency] (script
+				// order); the shader evaluates phase + time*frequency, so
+				// u_rgbWave carries (func, base, amplitude, frequency) and
+				// u_rgbWaveTime carries (phase, frameTimeSeconds, 0, 0).
+				const glm::vec4 rgbWave(
+					static_cast<float>(draw.rgbGenWave),
+					draw.rgbWaveValue[0], // base
+					draw.rgbWaveValue[1], // amplitude
+					draw.rgbWaveValue[3]); // frequency
+				g_worldState.SetUniform(5, { "u_rgbWave", { rgbWave } });
+				const glm::vec4 rgbWaveTime(
+					draw.rgbWaveValue[2], // phase
+					frameTimeSeconds, 0.0f, 0.0f);
+				g_worldState.SetUniform(6, { "u_rgbWaveTime", { rgbWaveTime } });
+				// Bounded alphaGen wave generator carried on the scene draw
+				// plus the shared per-frame render time in seconds: the
+				// textured material pixel shader modulates the material sample
+				// alpha by the clamped GL1 EvalWaveForm value, feeding the
+				// alphaFunc comparison below. Func id 0 when the draw has no
+				// wave (identity modulation), always written so the per-draw
+				// uniform never carries a stale generator from an earlier
+				// draw. Only the material sample is modulated; vertex colour,
+				// lightmaps, blend state, const generators, and UV transforms
+				// are untouched.
+				// draw.alphaWaveValue is [base, amplitude, phase, frequency]
+				// (script order); u_alphaWave carries (func, base, amplitude,
+				// frequency) and u_alphaWaveTime carries (phase, frameTimeSeconds,
+				// 0, 0) to match the shader's phase + time*frequency evaluation.
+				const glm::vec4 alphaWave(
+					static_cast<float>(draw.alphaGenWave),
+					draw.alphaWaveValue[0], // base
+					draw.alphaWaveValue[1], // amplitude
+					draw.alphaWaveValue[3]); // frequency
+				g_worldState.SetUniform(7, { "u_alphaWave", { alphaWave } });
+				const glm::vec4 alphaWaveTime(
+					draw.alphaWaveValue[2], // phase
+					frameTimeSeconds, 0.0f, 0.0f);
+				g_worldState.SetUniform(8, { "u_alphaWaveTime", { alphaWaveTime } });
 			}
 			if (vhSetState(g_worldStateId, g_worldState)) {
 				if (!submitted) vhClear(g_worldStateId, VRHI_CLEAR_DEPTH);

@@ -163,6 +163,34 @@ input buffer, so no FS storage can be referenced after FS_FreeFile.
 // as before this slice, and the statement never borrows tokens past the
 // stage end. The conservative first-stage helper still treats `tcMod` as
 // unsupported and rejects such shaders.
+//
+// The bounded stage-local `rgbGen wave` / `alphaGen wave` slice extends the
+// same simple multi-stage parser with exactly the five Quake3 waveform forms
+// `sin`, `square`, `triangle`, `sawtooth`, and `inversesawtooth` (matched
+// case-insensitively like every directive) and their four parameters
+// base/amplitude/phase/frequency: every parameter must be finite and |value|
+// <= the defined safe bound (VRHI_SCRIPT_WAVE_PARAM_MAX below). The parsed
+// generator is carried through the world, inline-BSP, and scene
+// shader-cache/draw paths so the textured material pixel shaders modulate the
+// material sample RGB/alpha by clamp(base + table((phase +
+// frameTimeSeconds * frequency) wrapped to one period) * amplitude, 0, 1),
+// matching the GL1 renderer's EvalWaveForm/WAVEVALUE index wrap, table
+// shapes, phase sign, frequency units (cycles per second), and [0,1] clamp in
+// RB_CalcWaveColor/RB_CalcWaveAlpha exactly (the sin table is evaluated with
+// the GL1 tr_init.c DEG2RAD(i*360/1023) formula, and the wave index uses the
+// truncation-toward-zero modulo of ((phase + time*freq) * 1024) so negative
+// phases wrap identically to the GL1 & FUNCTABLE_MASK). The wave multiplies
+// the same material sample that the static const generators tint, so a stage
+// may carry both and the pixel shader composes them (const * wave; identity
+// values reduce to the other generator); vertex colour, lightmaps, blend
+// classification, depth, alpha testing, and the current UV transforms are
+// never modified. Every other generator (noise, lightingSpecular, vertex,
+// entity, ...) and every malformed, truncated, non-finite, or out-of-range
+// wave keeps the existing dynamic fallback: the stage stays accepted and
+// modulates with identity exactly as before this slice, and the statement
+// never borrows tokens past the stage end. The conservative first-stage
+// helper still treats `rgbGen wave`/`alphaGen wave` as unsupported and
+// rejects such shaders.
 ===========================================================================
 */
 #ifndef __VRHI_SHADER_SCRIPT_H
@@ -197,6 +225,21 @@ enum VRHI_ShaderBlendMode {
 	// Quake3 `blendFunc GL_SRC_ALPHA GL_ONE`: additive glow scaled by source
 	// alpha, distinct from plain additive (GL_ONE GL_ONE).
 	VRHI_SHADER_BLEND_ALPHA_ADDITIVE = 6
+};
+// Bounded Quake3 wave-generator functions accepted by the simple multi-stage
+// parser (`rgbGen wave <func> ...` / `alphaGen wave <func> ...`). Exactly the
+// five table-based forms are supported; every other generator (noise, ...)
+// keeps the existing dynamic fallback. The ids are deliberately 1..5 so 0 can
+// mean "no generator" and the value doubles as the pixel-shader dispatch key.
+enum VRHI_ShaderWaveFunc {
+	// No wave generator: the stage modulates with identity exactly as before
+	// this slice (also the fallback for unknown/malformed waves).
+	VRHI_SHADER_WAVE_NONE = 0,
+	VRHI_SHADER_WAVE_SIN = 1,
+	VRHI_SHADER_WAVE_SQUARE = 2,
+	VRHI_SHADER_WAVE_TRIANGLE = 3,
+	VRHI_SHADER_WAVE_SAWTOOTH = 4,
+	VRHI_SHADER_WAVE_INVERSE_SAWTOOTH = 5
 };
 // Bounded Quake3 stage alpha-test (`alphaFunc`) comparisons accepted by the
 // simple multi-stage parser. Exactly GE128, GT0, and LT128 are supported
@@ -288,6 +331,29 @@ struct VRHI_ShaderStage {
 	// center, then time scroll.
 	bool tcModRotate = false;
 	float tcModRotateDegreesPerSecond = 0.0f;
+	// Bounded stage-local wave generators (`rgbGen wave <func> <base>
+	// <amplitude> <phase> <frequency>` and `alphaGen wave <func> <base>
+	// <amplitude> <phase> <frequency>`): func is one of the five Quake3
+	// waveforms above (VRHI_ShaderWaveFunc) and every parameter is finite
+	// and inside the defined safe range (VRHI_SCRIPT_WAVE_PARAM_MAX). The
+	// textured material pixel shaders modulate the material sample RGB/alpha
+	// by the clamped GL1 EvalWaveForm value (base + table * amplitude,
+	// clamped to [0,1] like RB_CalcWaveColor/RB_CalcWaveAlpha) using the
+	// shared per-frame render time, composed with the static const
+	// generators by multiplication; vertex colour, lightmaps, blend modes,
+	// depth, alpha testing, and UV transforms are never modified. NONE with
+	// default parameters keeps the identity fallback for every other
+	// generator (noise, lightingSpecular, vertex, entity, ...).
+	int rgbGenWaveFunc = VRHI_SHADER_WAVE_NONE;
+	float rgbWaveBase = 0.0f;
+	float rgbWaveAmplitude = 0.0f;
+	float rgbWavePhase = 0.0f;
+	float rgbWaveFrequency = 0.0f;
+	int alphaGenWaveFunc = VRHI_SHADER_WAVE_NONE;
+	float alphaWaveBase = 0.0f;
+	float alphaWaveAmplitude = 0.0f;
+	float alphaWavePhase = 0.0f;
+	float alphaWaveFrequency = 0.0f;
 };
 
 // Strict bounds, independent of the legacy qfiles.h limits so malformed or
@@ -335,6 +401,17 @@ static const float VRHI_SCRIPT_TCMOD_SCROLL_MAX = 16.0f;
 // (the angle is wrapped into [0,360) degrees like the GL1 sine-table mask,
 // so extreme magnitudes can never erode the sin/cos precision).
 static const float VRHI_SCRIPT_TCMOD_ROTATE_MAX = 3600.0f;
+
+// Bounded wave-generator parameter range (`rgbGen wave` / `alphaGen wave`):
+// each of the four parameters (base, amplitude, phase, frequency) must be
+// finite and |value| <= VRHI_SCRIPT_WAVE_PARAM_MAX. The GL1 renderer's
+// EvalWaveForm evaluates base + table * amplitude and clamps the result to
+// [0,1] before use, so any finite in-range parameters stay numerically safe
+// for the pixel-shader multiply and its per-period wrap; the bound
+// comfortably covers every practical Quake3 wave (base/amplitude in [0,1],
+// phase in cycles, frequency in cycles per second, commonly 0.01..10) while
+// keeping the phase/frequency arithmetic safe for long sessions.
+static const float VRHI_SCRIPT_WAVE_PARAM_MAX = 16.0f;
 
 struct VRHI_ShaderScriptToken {
 	std::string text;
@@ -430,6 +507,41 @@ inline bool VRHI_ShaderParseTcModRotate(const std::string &text, float *value) {
 	if (std::fabs(parsed) > VRHI_SCRIPT_TCMOD_ROTATE_MAX) return false;
 	*value = parsed;
 	return true;
+}
+
+// Parses one token as a bounded wave-generator parameter (base, amplitude,
+// phase, or frequency): finite and |value| <= VRHI_SCRIPT_WAVE_PARAM_MAX
+// (zero is accepted: every parameter defaults to the identity/static wave
+// shape at 0). Returns false for empty, non-numeric, partially consumed
+// (trailing junk), non-finite, or out-of-range tokens, so the wave slice
+// accepts only exact in-range parameters and every other value keeps the
+// existing dynamic fallback. Locale behaviour mirrors the original
+// renderer's atof-based ParseVector path.
+inline bool VRHI_ShaderParseWaveConstant(const std::string &text, float *value) {
+	if (value == nullptr || text.empty()) return false;
+	char *end = nullptr;
+	errno = 0;
+	const float parsed = std::strtof(text.c_str(), &end);
+	if (end == text.c_str() || *end != '\0' || errno == ERANGE ||
+		!std::isfinite(parsed)) return false;
+	if (std::fabs(parsed) > VRHI_SCRIPT_WAVE_PARAM_MAX) return false;
+	*value = parsed;
+	return true;
+}
+
+// Maps one waveform name to its bounded function id (VRHI_ShaderWaveFunc).
+// Exactly the five Quake3 forms sin, square, triangle, sawtooth, and
+// inversesawtooth are accepted, matched case-insensitively like every
+// directive (the GL1 NameToGenFunc uses Q_stricmp). Every other name (noise
+// included) maps to NONE so the stage keeps the existing dynamic fallback.
+inline int VRHI_ShaderWaveFuncFromName(const std::string &name) {
+	const std::string lower = VRHI_ShaderLowerASCII(name);
+	if (lower == "sin") return VRHI_SHADER_WAVE_SIN;
+	if (lower == "square") return VRHI_SHADER_WAVE_SQUARE;
+	if (lower == "triangle") return VRHI_SHADER_WAVE_TRIANGLE;
+	if (lower == "sawtooth") return VRHI_SHADER_WAVE_SAWTOOTH;
+	if (lower == "inversesawtooth") return VRHI_SHADER_WAVE_INVERSE_SAWTOOTH;
+	return VRHI_SHADER_WAVE_NONE;
 }
 
 // Tokenizes bounded shader-script text into single tokens. Returns false for
@@ -775,13 +887,19 @@ inline bool VRHI_ParseSimpleShaderBlock(
 			if (keyword == "rgbgen" || keyword == "alphagen") {
 				// Bounded static const generators (`rgbGen const r g b`,
 				// `alphaGen const a`) are preserved when every constant is
-				// finite and inside the defined safe range. Every other
-				// generator (wave, entity, vertex, ...) keeps the existing
-				// dynamic fallback: the keyword and its first argument are
-				// consumed, remaining generator parameters are bounded tokens
-				// and are ignored, and the stage keeps identity colour.
-				// Malformed or truncated const statements still reject the
-				// whole shader (never borrowing tokens past the stage end).
+				// finite and inside the defined safe range. Bounded wave
+				// generators (`rgbGen wave <func> <base> <amplitude> <phase>
+				// <frequency>`, `alphaGen wave ...`) are preserved when the
+				// waveform is one of the five Quake3 forms and every
+				// parameter is finite and in range (see below). Every other
+				// generator (noise, lightingSpecular, entity, vertex, ...)
+				// keeps the existing dynamic fallback: the keyword and its
+				// first argument are consumed, remaining generator parameters
+				// are bounded tokens and are ignored, and the stage keeps
+				// identity colour. Malformed or truncated const statements
+				// still reject the whole shader (never borrowing tokens past
+				// the stage end); malformed or truncated wave statements keep
+				// the stage accepted with the identity fallback.
 				if (j + 1 >= stageEnd) return false;
 				const bool isAlphaGen = keyword == "alphagen";
 				if (VRHI_ShaderTokenIs(tokens[j + 1], "const")) {
@@ -818,6 +936,59 @@ inline bool VRHI_ParseSimpleShaderBlock(
 					// as stage directives; it simply keeps the dynamic fallback
 					// tint while the stage stays accepted.
 					j += 2 + argCount;
+					continue;
+				}
+				if (VRHI_ShaderTokenIs(tokens[j + 1], "wave")) {
+					// Bounded stage-local wave generators: exactly the five
+					// Quake3 waveform forms (sin/square/triangle/sawtooth/
+					// inversesawtooth, case-insensitive) with four finite,
+					// safely bounded parameters (base, amplitude, phase,
+					// frequency) are preserved; every other waveform (noise,
+					// ...) and every malformed/truncated/out-of-range wave
+					// keeps the existing dynamic fallback (the stage stays
+					// accepted and modulates with identity). A syntactically
+					// complete statement (keyword + "wave" + func + four
+					// parameters, seven tokens) always consumes its whole
+					// declared argument count, so keyword-looking argument
+					// tokens cannot be re-parsed as stage directives; a
+					// truncated statement consumes only the keyword and the
+					// "wave" marker and never borrows tokens past the stage
+					// end.
+					if (j + 6 < stageEnd) {
+						const int func =
+							VRHI_ShaderWaveFuncFromName(tokens[j + 2].text);
+						float base = 0.0f;
+						float amplitude = 0.0f;
+						float phase = 0.0f;
+						float frequency = 0.0f;
+						if (func != VRHI_SHADER_WAVE_NONE &&
+							VRHI_ShaderParseWaveConstant(tokens[j + 3].text, &base) &&
+							VRHI_ShaderParseWaveConstant(tokens[j + 4].text, &amplitude) &&
+							VRHI_ShaderParseWaveConstant(tokens[j + 5].text, &phase) &&
+							VRHI_ShaderParseWaveConstant(tokens[j + 6].text, &frequency)) {
+							if (isAlphaGen) {
+								stage.alphaGenWaveFunc = func;
+								stage.alphaWaveBase = base;
+								stage.alphaWaveAmplitude = amplitude;
+								stage.alphaWavePhase = phase;
+								stage.alphaWaveFrequency = frequency;
+							} else {
+								stage.rgbGenWaveFunc = func;
+								stage.rgbWaveBase = base;
+								stage.rgbWaveAmplitude = amplitude;
+								stage.rgbWavePhase = phase;
+								stage.rgbWaveFrequency = frequency;
+							}
+						}
+						j += 7;
+						continue;
+					}
+					// Truncated `rgbGen wave`/`alphaGen wave` at the end of a
+					// stage: consume the keyword and the "wave" marker (any
+					// partial argument below is skipped by the generic bounded
+					// loop), keep the identity fallback, and never borrow
+					// tokens past the stage end.
+					j += 2;
 					continue;
 				}
 				j += 2;

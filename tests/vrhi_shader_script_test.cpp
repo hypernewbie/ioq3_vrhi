@@ -40,7 +40,17 @@
 // time scroll (script order is intentionally not tracked). Every other tcMod
 // variant (turb/stretch/entityTranslate) and every malformed, truncated,
 // non-finite, or out-of-range rate keeps the no-rotate fallback with the
-// stage still accepted.
+// stage still accepted. The bounded stage-local `rgbGen wave` / `alphaGen
+// wave` slice accepts exactly the five Quake3 waveform forms sin/square/
+// triangle/sawtooth/inversesawtooth (case-insensitive) with four finite,
+// safely bounded (|value| <= 16) parameters base/amplitude/phase/frequency
+// and carries the per-stage generator to the textured material pixel
+// shaders, which modulate the material sample RGB/alpha by the clamped GL1
+// EvalWaveForm value (base + table * amplitude, [0,1]) using the shared
+// per-frame render time; every other generator (noise, lightingSpecular,
+// vertex, entity, ...) and every malformed, truncated, non-finite, or
+// out-of-range wave keeps the identity fallback with the stage still
+// accepted.
 //
 // Build and run (any C++11-or-later compiler):
 //   clang++ -std=c++17 -O1 -Wall -Wextra -Werror tests/vrhi_shader_script_test.cpp -o vrhi_shader_script_test && ./vrhi_shader_script_test
@@ -1749,6 +1759,333 @@ void testStageTcModRotate() {
 		"{ map textures/foo/bar.tga tcMod rotate 90 }", nullptr), "");
 }
 
+void testStageWaveGenerators() {
+	// Direct parser-helper bounds/token safety: VRHI_ShaderParseWaveConstant
+	// accepts finite in-range parameters (zero and the inclusive |16| bound
+	// included), rejects empty, non-numeric, trailing-junk, non-finite, and
+	// out-of-range tokens, and never writes through a null output pointer.
+	float value = 123.0f;
+	CHECK(VRHI_ShaderParseWaveConstant("0", &value));
+	CHECK(value == 0.0f);
+	CHECK(VRHI_ShaderParseWaveConstant("-16", &value));
+	CHECK(value == -16.0f);
+	CHECK(VRHI_ShaderParseWaveConstant("0.5", &value));
+	CHECK(value == 0.5f);
+	CHECK(VRHI_ShaderParseWaveConstant("16", &value));
+	CHECK(value == 16.0f);
+	CHECK(VRHI_ShaderParseWaveConstant("-2.5", &value));
+	CHECK(value == -2.5f);
+	CHECK(!VRHI_ShaderParseWaveConstant("", &value));
+	CHECK(!VRHI_ShaderParseWaveConstant("abc", &value));
+	CHECK(!VRHI_ShaderParseWaveConstant("0.5x", &value));
+	CHECK(!VRHI_ShaderParseWaveConstant("nan", &value));
+	CHECK(!VRHI_ShaderParseWaveConstant("inf", &value));
+	CHECK(!VRHI_ShaderParseWaveConstant("1e30", &value));
+	CHECK(!VRHI_ShaderParseWaveConstant("16.0001", &value));
+	CHECK(!VRHI_ShaderParseWaveConstant("-16.5", &value));
+	CHECK(!VRHI_ShaderParseWaveConstant("0.5", nullptr));
+	// The waveform-name mapper accepts exactly the five Quake3 forms,
+	// case-insensitively (the GL1 NameToGenFunc uses Q_stricmp), and maps
+	// every other name (noise included) to NONE so the stage keeps the
+	// existing dynamic fallback.
+	CHECK_EQ_INT(VRHI_ShaderWaveFuncFromName("sin"), VRHI_SHADER_WAVE_SIN);
+	CHECK_EQ_INT(VRHI_ShaderWaveFuncFromName("SQUARE"), VRHI_SHADER_WAVE_SQUARE);
+	CHECK_EQ_INT(VRHI_ShaderWaveFuncFromName("Triangle"), VRHI_SHADER_WAVE_TRIANGLE);
+	CHECK_EQ_INT(VRHI_ShaderWaveFuncFromName("sawtooth"), VRHI_SHADER_WAVE_SAWTOOTH);
+	CHECK_EQ_INT(VRHI_ShaderWaveFuncFromName("InverseSawtooth"), VRHI_SHADER_WAVE_INVERSE_SAWTOOTH);
+	CHECK_EQ_INT(VRHI_ShaderWaveFuncFromName("noise"), VRHI_SHADER_WAVE_NONE);
+	CHECK_EQ_INT(VRHI_ShaderWaveFuncFromName("bogus"), VRHI_SHADER_WAVE_NONE);
+	CHECK_EQ_INT(VRHI_ShaderWaveFuncFromName(""), VRHI_SHADER_WAVE_NONE);
+
+	// Bounded stage-local `rgbGen wave`/`alphaGen wave`: the five Quake3
+	// waveforms are accepted with four finite, in-range parameters
+	// (base/amplitude/phase/frequency in script order), carried per stage for
+	// the textured material pixel-shader modulation. Every other generator
+	// and every malformed/truncated/non-finite/out-of-range wave keeps the
+	// existing fallback: the stage stays accepted and modulates with
+	// identity (func NONE) exactly as before.
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	// All five rgb waveforms parse with their exact parameters; negative
+	// amplitude and phase are legal GL1 values (the table lookup wraps both
+	// signs and the final value is clamped to [0,1]). Split across two
+	// scripts (the parser caps every shader at four stages).
+	const std::string accepted = script(
+		"{ map textures/base.tga rgbGen wave sin 0.5 0.5 0 1 }\n"
+		"{ map textures/a.png blendFunc blend rgbGen wave square 1 -0.25 0.5 2 }\n"
+		"{ map textures/b.png blendFunc blend rgbGen wave triangle 0 1 0.25 0.5 }\n"
+		"{ map textures/c.png blendFunc blend rgbGen wave sawtooth 0 1 0 1 }");
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(accepted), accepted.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 4u);
+		if (stages.size() == 4) {
+			CHECK_EQ_INT(stages[0].rgbGenWaveFunc, VRHI_SHADER_WAVE_SIN);
+			CHECK(stages[0].rgbWaveBase == 0.5f);
+			CHECK(stages[0].rgbWaveAmplitude == 0.5f);
+			CHECK(stages[0].rgbWavePhase == 0.0f);
+			CHECK(stages[0].rgbWaveFrequency == 1.0f);
+			CHECK_EQ_INT(stages[0].alphaGenWaveFunc, VRHI_SHADER_WAVE_NONE);
+			CHECK_EQ_INT(stages[1].rgbGenWaveFunc, VRHI_SHADER_WAVE_SQUARE);
+			CHECK(stages[1].rgbWaveBase == 1.0f);
+			CHECK(stages[1].rgbWaveAmplitude == -0.25f);
+			CHECK(stages[1].rgbWavePhase == 0.5f);
+			CHECK(stages[1].rgbWaveFrequency == 2.0f);
+			CHECK_EQ_INT(stages[2].rgbGenWaveFunc, VRHI_SHADER_WAVE_TRIANGLE);
+			CHECK_EQ_INT(stages[3].rgbGenWaveFunc, VRHI_SHADER_WAVE_SAWTOOTH);
+			CHECK(stages[3].rgbWaveFrequency == 1.0f);
+		}
+	}
+	const std::string acceptedMore = script(
+		"{ map textures/base.tga rgbGen wave inversesawtooth 0 1 0 1 }\n"
+		"{ map textures/a.png blendFunc blend alphaGen wave sin 0 1 0.25 2 }\n"
+		"{ map textures/b.png blendFunc blend alphaGen wave triangle 0.5 0.5 0 1 }\n"
+		"{ map textures/c.png blendFunc blend alphaGen wave sawtooth 1 -1 0 0.5 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(acceptedMore), acceptedMore.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 4u);
+		if (stages.size() == 4) {
+			CHECK_EQ_INT(stages[0].rgbGenWaveFunc, VRHI_SHADER_WAVE_INVERSE_SAWTOOTH);
+			CHECK_EQ_INT(stages[0].alphaGenWaveFunc, VRHI_SHADER_WAVE_NONE);
+			CHECK_EQ_INT(stages[1].alphaGenWaveFunc, VRHI_SHADER_WAVE_SIN);
+			CHECK(stages[1].alphaWaveBase == 0.0f);
+			CHECK(stages[1].alphaWaveAmplitude == 1.0f);
+			CHECK(stages[1].alphaWavePhase == 0.25f);
+			CHECK(stages[1].alphaWaveFrequency == 2.0f);
+			CHECK_EQ_INT(stages[1].rgbGenWaveFunc, VRHI_SHADER_WAVE_NONE);
+			CHECK_EQ_INT(stages[2].alphaGenWaveFunc, VRHI_SHADER_WAVE_TRIANGLE);
+			CHECK(stages[2].alphaWaveBase == 0.5f);
+			CHECK(stages[2].alphaWaveAmplitude == 0.5f);
+			CHECK_EQ_INT(stages[3].alphaGenWaveFunc, VRHI_SHADER_WAVE_SAWTOOTH);
+			CHECK(stages[3].alphaWaveBase == 1.0f);
+			CHECK(stages[3].alphaWaveAmplitude == -1.0f);
+			CHECK(stages[3].alphaWaveFrequency == 0.5f);
+		}
+	}
+	// Keyword and waveform matching are case-insensitive, like every other
+	// directive.
+	const std::string upper = script(
+		"{ map textures/base.tga RGBGEN WAVE SIN 0 1 0 1 ALPHAGEN Wave Square 0.25 0.5 0 1 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(upper), upper.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK_EQ_INT(stages[0].rgbGenWaveFunc, VRHI_SHADER_WAVE_SIN);
+			CHECK_EQ_INT(stages[0].alphaGenWaveFunc, VRHI_SHADER_WAVE_SQUARE);
+		}
+	}
+	// Stage locality: each stage keeps its own generators, and stages without
+	// the keyword keep identity (func NONE), exactly as before the slice.
+	const std::string locality = script(
+		"{ map textures/base.tga rgbGen wave sin 0.5 0.5 0 1 }\n"
+		"{ map textures/a.png blendFunc blend }\n"
+		"{ map textures/b.png blendFunc blend alphaGen wave triangle 0 1 0 1 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(locality), locality.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			CHECK_EQ_INT(stages[0].rgbGenWaveFunc, VRHI_SHADER_WAVE_SIN);
+			CHECK_EQ_INT(stages[0].alphaGenWaveFunc, VRHI_SHADER_WAVE_NONE);
+			CHECK_EQ_INT(stages[1].rgbGenWaveFunc, VRHI_SHADER_WAVE_NONE);
+			CHECK_EQ_INT(stages[1].alphaGenWaveFunc, VRHI_SHADER_WAVE_NONE);
+			CHECK(stages[1].rgbWaveBase == 0.0f);
+			CHECK_EQ_INT(stages[2].alphaGenWaveFunc, VRHI_SHADER_WAVE_TRIANGLE);
+			CHECK_EQ_INT(stages[2].rgbGenWaveFunc, VRHI_SHADER_WAVE_NONE);
+		}
+	}
+	// The wave statement consumes exactly seven tokens, so a following
+	// directive on the same stage still parses, and the wave composes with
+	// every other bounded stage slice (blend, depthWrite, alphaFunc,
+	// clampMap, const generators, tcMods) without changing any of them. The
+	// pixel shader multiplies const * wave, so both generators stay set on
+	// the same stage.
+	const std::string composed = script(
+		"{ clampmap textures/clamped.tga tcMod scale 2 3 rgbGen wave sin 0.5 0.5 0 1 rgbGen const 0.5 0.5 0.5 alphaGen wave square 0.25 0.5 0 1 blendFunc blend depthWrite alphaFunc GE128 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(composed), composed.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK_EQ_INT(stages[0].rgbGenWaveFunc, VRHI_SHADER_WAVE_SIN);
+			CHECK(stages[0].rgbWaveBase == 0.5f);
+			CHECK(stages[0].rgbWaveAmplitude == 0.5f);
+			CHECK(stages[0].rgbGenConst);
+			CHECK_EQ_INT(stages[0].alphaGenWaveFunc, VRHI_SHADER_WAVE_SQUARE);
+			CHECK(stages[0].alphaWaveAmplitude == 0.5f);
+			CHECK(stages[0].clampMap);
+			CHECK_EQ_INT(stages[0].blendMode, VRHI_SHADER_BLEND_ALPHA);
+			CHECK(stages[0].depthWrite);
+			CHECK_EQ_INT(stages[0].alphaFunc, VRHI_SHADER_ALPHAFUNC_GE128);
+			CHECK(stages[0].tcModScale);
+		}
+	}
+	// Statement order is independent: a wave declared before the map on the
+	// same stage still parses and still consumes exactly its own tokens.
+	const std::string waveFirst = script(
+		"{ rgbGen wave sawtooth 0 1 0 1 map textures/base.tga }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(waveFirst), waveFirst.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK_EQ_INT(stages[0].rgbGenWaveFunc, VRHI_SHADER_WAVE_SAWTOOTH);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+		}
+	}
+	// Fallbacks: unknown waveform, out-of-range, non-numeric, trailing-junk,
+	// and truncated waves keep the stage accepted with identity modulation
+	// (func NONE) instead of rejecting the material.
+	const std::string fallbacks = script(
+		"{ map textures/base.tga rgbGen wave noise 0 1 0 1 }\n"
+		"{ map textures/a.png blendFunc blend rgbGen wave sin 1e30 1 0 1 }\n"
+		"{ map textures/b.png blendFunc blend alphaGen wave sin abc def ghi jkl }\n"
+		"{ map textures/c.png blendFunc blend alphaGen wave sin 0 1 0 1x }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(fallbacks), fallbacks.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 4u);
+		if (stages.size() == 4) {
+			for (std::size_t i = 0; i < stages.size(); ++i) {
+				CHECK_EQ_INT(stages[i].rgbGenWaveFunc, VRHI_SHADER_WAVE_NONE);
+				CHECK_EQ_INT(stages[i].alphaGenWaveFunc, VRHI_SHADER_WAVE_NONE);
+				CHECK(stages[i].rgbWaveBase == 0.0f);
+				CHECK(stages[i].rgbWaveAmplitude == 0.0f);
+				CHECK(stages[i].rgbWavePhase == 0.0f);
+				CHECK(stages[i].rgbWaveFrequency == 0.0f);
+				CHECK(stages[i].alphaWaveBase == 0.0f);
+				CHECK(stages[i].alphaWaveAmplitude == 0.0f);
+				CHECK(stages[i].alphaWavePhase == 0.0f);
+				CHECK(stages[i].alphaWaveFrequency == 0.0f);
+			}
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+			CHECK_EQ_STR(stages[3].path, "textures/c.png");
+		}
+	}
+	// Out-of-range magnitudes on any single parameter reject only that
+	// generator (identity fallback), never the stage.
+	const std::string outOfRange = script(
+		"{ map textures/base.tga rgbGen wave sin 0.5 17 0 1 }\n"
+		"{ map textures/a.png blendFunc blend rgbGen wave sin 0.5 1 -17 1 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(outOfRange), outOfRange.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 2u);
+		if (stages.size() == 2) {
+			CHECK_EQ_INT(stages[0].rgbGenWaveFunc, VRHI_SHADER_WAVE_NONE);
+			CHECK_EQ_INT(stages[1].rgbGenWaveFunc, VRHI_SHADER_WAVE_NONE);
+		}
+	}
+	// Truncated `rgbGen wave` statements at the end of a stage keep the
+	// fallback (identity) and never borrow tokens past the stage end.
+	const std::string truncated = script("{ map textures/base.tga rgbGen wave sin 0.5 0.5 0 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncated), truncated.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK_EQ_INT(stages[0].rgbGenWaveFunc, VRHI_SHADER_WAVE_NONE);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+		}
+	}
+	const std::string truncatedMarker = script("{ map textures/base.tga alphaGen wave }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncatedMarker), truncatedMarker.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK_EQ_INT(stages[0].alphaGenWaveFunc, VRHI_SHADER_WAVE_NONE);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+		}
+	}
+	// A syntactically complete wave statement with an invalid parameter
+	// consumes its whole declared argument count (seven tokens), so
+	// keyword-looking argument tokens (for example `rgbGen wave sin 0.5 map
+	// 0 1`) cannot be re-parsed as stage directives: the stage stays
+	// accepted with identity modulation and the real map still resolves.
+	const std::string keywordValues = script(
+		"{ map textures/base.tga rgbGen wave sin 0.5 map 0 1 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(keywordValues), keywordValues.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK_EQ_INT(stages[0].rgbGenWaveFunc, VRHI_SHADER_WAVE_NONE);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+		}
+	}
+	// Unsupported generators keep the existing dynamic fallback: the stage
+	// stays accepted with identity modulation, exactly as before this slice.
+	const std::string unsupported = script(
+		"{ map textures/base.tga rgbGen lightingSpecular }\n"
+		"{ map textures/a.png blendFunc blend alphaGen lightingSpecular }\n"
+		"{ map textures/b.png blendFunc blend rgbGen vertex }\n"
+		"{ map textures/c.png blendFunc blend alphaGen entity }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(unsupported), unsupported.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 4u);
+		if (stages.size() == 4) {
+			for (std::size_t i = 0; i < stages.size(); ++i) {
+				CHECK_EQ_INT(stages[i].rgbGenWaveFunc, VRHI_SHADER_WAVE_NONE);
+				CHECK_EQ_INT(stages[i].alphaGenWaveFunc, VRHI_SHADER_WAVE_NONE);
+			}
+		}
+	}
+	// A dynamic generator followed by a const one on the same stage keeps
+	// both bounded slices intact (wave is preserved and the const is
+	// preserved; the pixel shader multiplies const * wave).
+	const std::string mixed = script(
+		"{ map textures/base.tga rgbGen wave sin 0.5 0.5 0 1 rgbGen const 0.5 0.5 0.5 }\n"
+		"{ map textures/a.png blendFunc blend alphaGen const 0.5 alphaGen wave sin 0 1 0 1 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(mixed), mixed.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 2u);
+		if (stages.size() == 2) {
+			CHECK_EQ_INT(stages[0].rgbGenWaveFunc, VRHI_SHADER_WAVE_SIN);
+			CHECK(stages[0].rgbGenConst);
+			CHECK_EQ_INT(stages[1].alphaGenWaveFunc, VRHI_SHADER_WAVE_SIN);
+			CHECK(stages[1].alphaGenConst);
+		}
+	}
+	// The conservative first-stage opaque helper still rejects wave
+	// generators: only identity matches the fixed opaque diffuse pass, so a
+	// wave shader keeps its existing fallback there.
+	CHECK_EQ_STR(candidateBody(
+		"{ map textures/foo/bar.tga rgbGen wave sin 1 0 0 1 }", nullptr), "");
+	CHECK_EQ_STR(candidateBody(
+		"{ map textures/foo/bar.tga alphaGen wave square 0 1 0 1 }", nullptr), "");
+}
+
 void testConsoleScriptResolution() {
 	// OpenArena defines the in-game console background as a script shader
 	// (scripts/oanew.shader): `console { { map textures/sfx/logo256.tga } }`.
@@ -1823,6 +2160,7 @@ int main() {
 	testStageTcModScale();
 	testStageTcModScroll();
 	testStageTcModRotate();
+	testStageWaveGenerators();
 	testConsoleScriptResolution();
 	testPathSafetyHelpers();
 
