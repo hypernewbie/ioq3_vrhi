@@ -279,7 +279,19 @@ enum VRHI_ShaderBlendMode {
 	VRHI_SHADER_BLEND_PREMULTIPLIED = 5,
 	// Quake3 `blendFunc GL_SRC_ALPHA GL_ONE`: additive glow scaled by source
 	// alpha, distinct from plain additive (GL_ONE GL_ONE).
-	VRHI_SHADER_BLEND_ALPHA_ADDITIVE = 6
+	VRHI_SHADER_BLEND_ALPHA_ADDITIVE = 6,
+	// Quake3 `blendFunc GL_DST_COLOR GL_ONE`: multiply plus dst
+	// (src*dst + dst). Named systematically by factor pair.
+	VRHI_SHADER_BLEND_DST_COLOR_ONE = 7,
+	// Quake3 `blendFunc GL_ONE GL_SRC_ALPHA`: additive with dst scaled by
+	// source alpha (src + dst*srcA).
+	VRHI_SHADER_BLEND_ONE_SRC_ALPHA = 8,
+	// Quake3 `blendFunc GL_DST_COLOR GL_SRC_ALPHA`: multiply with dst
+	// scaled by source alpha (src*dst + dst*srcA).
+	VRHI_SHADER_BLEND_DST_COLOR_SRC_ALPHA = 9,
+	// Quake3 `blendFunc GL_DST_COLOR GL_ONE_MINUS_SRC_ALPHA`: multiply
+	// with dst scaled by inverse source alpha (src*dst + dst*(1-srcA)).
+	VRHI_SHADER_BLEND_DST_COLOR_ONE_MINUS_SRC_ALPHA = 10
 };
 // Bounded Quake3 wave-generator functions accepted by the simple multi-stage
 // parser (`rgbGen wave <func> ...` / `alphaGen wave <func> ...`). Exactly the
@@ -1236,6 +1248,14 @@ inline bool VRHI_ParseSimpleShaderBlock(
 						stage.blendMode = VRHI_SHADER_BLEND_ALPHA_ADDITIVE;
 					else if (arg == "gl_one" && dst == "gl_zero")
 						stage.blendMode = VRHI_SHADER_BLEND_OPAQUE;
+					else if (arg == "gl_dst_color" && dst == "gl_one")
+						stage.blendMode = VRHI_SHADER_BLEND_DST_COLOR_ONE;
+					else if (arg == "gl_one" && dst == "gl_src_alpha")
+						stage.blendMode = VRHI_SHADER_BLEND_ONE_SRC_ALPHA;
+					else if (arg == "gl_dst_color" && dst == "gl_src_alpha")
+						stage.blendMode = VRHI_SHADER_BLEND_DST_COLOR_SRC_ALPHA;
+					else if (arg == "gl_dst_color" && dst == "gl_one_minus_src_alpha")
+						stage.blendMode = VRHI_SHADER_BLEND_DST_COLOR_ONE_MINUS_SRC_ALPHA;
 					else
 						// A syntactically complete but unsupported blend pair drops
 						// only this stage. Earlier/later supported stages remain a

@@ -454,6 +454,33 @@ void testSimpleMultiStageExtraction() {
 	CHECK_EQ_INT(rejected.size(), 1u);
 	if (rejected.size() == 1)
 		CHECK_EQ_INT(rejected["textures/foo/bar"][0].blendMode, VRHI_SHADER_BLEND_PREMULTIPLIED);
+	// Factor-pair blends keep their exact GL semantics instead of dropping
+	// the stage.
+	const std::string dstColorOne = script(
+		"{ map textures/grate.tga blendFunc GL_DST_COLOR GL_ONE }");
+	rejected.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(dstColorOne), dstColorOne.size(), wanted, &rejected));
+	if (rejected.size() == 1)
+		CHECK_EQ_INT(rejected["textures/foo/bar"][0].blendMode, VRHI_SHADER_BLEND_DST_COLOR_ONE);
+	const std::string oneSrcAlpha = script(
+		"{ map textures/haze.tga blendFunc GL_ONE GL_SRC_ALPHA }");
+	rejected.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(oneSrcAlpha), oneSrcAlpha.size(), wanted, &rejected));
+	if (rejected.size() == 1)
+		CHECK_EQ_INT(rejected["textures/foo/bar"][0].blendMode, VRHI_SHADER_BLEND_ONE_SRC_ALPHA);
+	const std::string dstColorSrcAlpha = script(
+		"{ map textures/shade.tga blendFunc GL_DST_COLOR GL_SRC_ALPHA }");
+	rejected.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(dstColorSrcAlpha), dstColorSrcAlpha.size(), wanted, &rejected));
+	if (rejected.size() == 1)
+		CHECK_EQ_INT(rejected["textures/foo/bar"][0].blendMode, VRHI_SHADER_BLEND_DST_COLOR_SRC_ALPHA);
+	const std::string dstColorInvSrcAlpha = script(
+		"{ map textures/tint.tga blendFunc GL_DST_COLOR GL_ONE_MINUS_SRC_ALPHA }");
+	rejected.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(dstColorInvSrcAlpha), dstColorInvSrcAlpha.size(), wanted, &rejected));
+	if (rejected.size() == 1)
+		CHECK_EQ_INT(rejected["textures/foo/bar"][0].blendMode,
+			VRHI_SHADER_BLEND_DST_COLOR_ONE_MINUS_SRC_ALPHA);
 	const std::string explicitOpaqueOverlay = script(
 		"{ map textures/base.tga } { map textures/opaque.tga blendFunc GL_ONE GL_ZERO }");
 	rejected.clear();
