@@ -215,6 +215,10 @@ struct VRHI_SceneDraw {
 	float animFps = 0.0f;
 	uint8_t animFrames = 0;
 	int animImage[VRHI_SHADER_MAX_ANIM_FRAMES] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+	// Bounded per-draw `tcGen environment` carried from the base stage. The
+	// textured material pixel shaders replace the diffuse UVs with reflection
+	// coordinates when set and keep authored UVs otherwise.
+	bool tcGenEnv = false;
 };
 static std::vector<VRHI_SceneEntity> g_sceneEntities;
 static std::vector<VRHI_ScenePoly> g_scenePolys;
@@ -351,6 +355,11 @@ struct VRHI_WorldBatch {
 	int stageAnimImage[VRHI_SHADER_MAX_STAGES][VRHI_SHADER_MAX_ANIM_FRAMES] = {
 		{ -1, -1, -1, -1, -1, -1, -1, -1 }, { -1, -1, -1, -1, -1, -1, -1, -1 },
 		{ -1, -1, -1, -1, -1, -1, -1, -1 }, { -1, -1, -1, -1, -1, -1, -1, -1 } };
+	// Per-stage bounded `tcGen environment` flag carried from the parsed
+	// stage data to the pixel-shader UV selection. Flag 0 keeps the authored
+	// diffuse UVs, preserving the existing sampling; only the diffuse
+	// material sample is affected, never lightmaps, vertex colour, or UI.
+	uint8_t stageTcGenEnv[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 	// Shader surfaceparm trans is a sort hint, separate from blend mode. The
 	// world renderer sorts these and blended bases/overlays after opaque draws.
 	bool surfaceTranslucent = false;
@@ -438,6 +447,10 @@ struct VRHI_SceneShaderMaterial {
 	float animFps = 0.0f;
 	uint8_t animFrames = 0;
 	int animImage[VRHI_SHADER_MAX_ANIM_FRAMES] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+	// Base-stage bounded `tcGen environment` flag (the Quake3 reflection
+	// generator). The textured scene program replaces the base diffuse UVs
+	// with reflection coordinates when set and keeps authored UVs otherwise.
+	uint8_t tcGenEnv = 0;
 };
 // Minimal, decoded copies of the BSP PVS traversal state. Values are
 // byte-swapped out of the on-disk little-endian form at load time and copied
@@ -1426,6 +1439,8 @@ cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
     float4 u_tcModTurbTime; // tcMod turb: phase (x), frame time in seconds (y); 0,0,0,0 when absent
     float4 u_tcModStretch;  // tcMod stretch: func id (x), base (y), amplitude (z), frequency (w); 0,0,0,0 when absent
     float4 u_tcModStretchTime; // tcMod stretch: phase (x), frame time in seconds (y); 0,0,0,0 when absent
+    float4 u_tcGenEnv;      // tcGen environment flag (x); 0,0,0,0 when absent
+    float4 u_viewOrigin;    // current view origin in world coordinates (xyz)
 };
 struct PSInput {
     float4 position : SV_Position;
@@ -1434,6 +1449,7 @@ struct PSInput {
     float lightmapLayer : TEXCOORD2;
     float4 color : TEXCOORD3;
     float3 worldPos : TEXCOORD4;
+    float3 worldNormal : TEXCOORD5;
 };
 // Evaluates one bounded Quake3 wave generator exactly like the GL1 renderer's
 // EvalWaveForm/WAVEVALUE (tr_shade_calc.c): the table index is
@@ -1523,6 +1539,21 @@ float4 main(PSInput input) : SV_Target
     // statements; lightmap UVs, vertex colour, and blend state are never
     // modified.
     float2 uv = input.diffuse;
+    // Bounded `tcGen environment`: per-pixel reflection coordinates matching
+    // GL1's RB_CalcEnvironmentTexCoords (reflection of the view vector about
+    // the interpolated surface normal), applied before every tcMod. Other
+    // tcGen modes keep the authored diffuse UVs above.
+    if (u_tcGenEnv.x > 0.5) {
+        float3 viewDir = u_viewOrigin.xyz - input.worldPos;
+        const float viewLength = length(viewDir);
+        viewDir = viewLength > 0.000001 ? viewDir / viewLength : float3(0.0, 0.0, 1.0);
+        float3 shadeNormal = input.worldNormal;
+        const float normalLength = length(shadeNormal);
+        shadeNormal = normalLength > 0.0001 ? shadeNormal / normalLength : float3(0.0, 0.0, 1.0);
+        const float reflectD = dot(shadeNormal, viewDir);
+        const float3 reflected = shadeNormal * (2.0 * reflectD) - viewDir;
+        uv = float2(0.5 + reflected.y * 0.5, 0.5 - reflected.z * 0.5);
+    }
     // tcMod turb: GL1 adds sinTable[(((x+z)/128*0.125) + now)*1024] *
     // amplitude to s and sinTable[((y/128*0.125) + now)*1024] * amplitude to
     // t, where now = phase + time * frequency. Amplitude 0 (absent) is the
@@ -1603,6 +1634,8 @@ cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
     float4 u_tcModTurbTime; // tcMod turb: phase (x), frame time in seconds (y); 0,0,0,0 when absent
     float4 u_tcModStretch;  // tcMod stretch: func id (x), base (y), amplitude (z), frequency (w); 0,0,0,0 when absent
     float4 u_tcModStretchTime; // tcMod stretch: phase (x), frame time in seconds (y); 0,0,0,0 when absent
+    float4 u_tcGenEnv;      // tcGen environment flag (x); 0,0,0,0 when absent
+    float4 u_viewOrigin;    // current view origin in world coordinates (xyz)
 };
 struct PSInput {
     float4 position : SV_Position;
@@ -1611,6 +1644,7 @@ struct PSInput {
     float lightmapLayer : TEXCOORD2;
     float4 color : TEXCOORD3;
     float3 worldPos : TEXCOORD4;
+    float3 worldNormal : TEXCOORD5;
 };
 // Evaluates one bounded Quake3 wave generator exactly like the GL1 renderer's
 // EvalWaveForm/WAVEVALUE (tr_shade_calc.c): the table index is
@@ -1701,6 +1735,21 @@ float4 main(PSInput input) : SV_Target
     // lightmap UVs, vertex colour, lightmaps, and blend state are never
     // modified.
     float2 uv = input.diffuse;
+    // Bounded `tcGen environment`: per-pixel reflection coordinates matching
+    // GL1's RB_CalcEnvironmentTexCoords (reflection of the view vector about
+    // the interpolated surface normal), applied before every tcMod. Other
+    // tcGen modes keep the authored diffuse UVs above.
+    if (u_tcGenEnv.x > 0.5) {
+        float3 viewDir = u_viewOrigin.xyz - input.worldPos;
+        const float viewLength = length(viewDir);
+        viewDir = viewLength > 0.000001 ? viewDir / viewLength : float3(0.0, 0.0, 1.0);
+        float3 shadeNormal = input.worldNormal;
+        const float normalLength = length(shadeNormal);
+        shadeNormal = normalLength > 0.0001 ? shadeNormal / normalLength : float3(0.0, 0.0, 1.0);
+        const float reflectD = dot(shadeNormal, viewDir);
+        const float3 reflected = shadeNormal * (2.0 * reflectD) - viewDir;
+        uv = float2(0.5 + reflected.y * 0.5, 0.5 - reflected.z * 0.5);
+    }
     // tcMod turb: GL1 adds sinTable[(((x+z)/128*0.125) + now)*1024] *
     // amplitude to s and sinTable[((y/128*0.125) + now)*1024] * amplitude to
     // t, where now = phase + time * frequency. Amplitude 0 (absent) is the
@@ -3549,7 +3598,8 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 	float (*tcModStretchValues)[4] = nullptr,
 	float *animFpsValues = nullptr,
 	uint8_t *animFrameCounts = nullptr,
-	int (*animImageIndices)[VRHI_SHADER_MAX_ANIM_FRAMES] = nullptr) {
+	int (*animImageIndices)[VRHI_SHADER_MAX_ANIM_FRAMES] = nullptr,
+	uint8_t *tcGenEnvFlags = nullptr) {
 	if (images == nullptr || blends == nullptr || stageCount == nullptr) return false;
 	*stageCount = 0;
 	for (size_t i = 0; i < VRHI_SHADER_MAX_STAGES; ++i) {
@@ -3594,6 +3644,7 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 		}
 		if (animFpsValues != nullptr) animFpsValues[i] = 0.0f;
 		if (animFrameCounts != nullptr) animFrameCounts[i] = 0;
+		if (tcGenEnvFlags != nullptr) tcGenEnvFlags[i] = 0;
 		if (animImageIndices != nullptr) {
 			for (size_t f = 0; f < VRHI_SHADER_MAX_ANIM_FRAMES; ++f)
 				animImageIndices[i][f] = -1;
@@ -3698,6 +3749,7 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 		if (alphaFuncFlags != nullptr)
 			alphaFuncFlags[i] = static_cast<uint8_t>(stages[i].alphaFunc);
 		if (clampMapFlags != nullptr) clampMapFlags[i] = stages[i].clampMap ? 1 : 0;
+		if (tcGenEnvFlags != nullptr) tcGenEnvFlags[i] = stages[i].tcGenEnvironment ? 1 : 0;
 		if (tcModScaleFlags != nullptr) tcModScaleFlags[i] = stages[i].tcModScale ? 1 : 0;
 		if (tcModScaleValues != nullptr) {
 			tcModScaleValues[i][0] = stages[i].tcModScaleS;
@@ -4338,6 +4390,7 @@ static void VRHI_LoadWorld(const char *name) {
 			surface.lightmapNum >= 0 && surface.lightmapNum < g_worldLightmapLayers
 			? surface.lightmapNum : -1;
 		int diffuseImage = -1;
+		uint8_t stageTcGenEnv[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		float stageAnimFps[VRHI_SHADER_MAX_STAGES] = { 0.0f, 0.0f, 0.0f, 0.0f };
 		uint8_t stageAnimFrames[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		int stageAnimImage[VRHI_SHADER_MAX_STAGES][VRHI_SHADER_MAX_ANIM_FRAMES] = {
@@ -4394,7 +4447,8 @@ static void VRHI_LoadWorld(const char *name) {
 			stageAlphaGenWave, stageAlphaWaveValue,
 			stageTcModTurb, stageTcModTurbValue,
 			stageTcModStretchFunc, stageTcModStretchValue,
-			stageAnimFps, stageAnimFrames, stageAnimImage);
+			stageAnimFps, stageAnimFrames, stageAnimImage,
+			stageTcGenEnv);
 		diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 		if (surface.surfaceType == MST_PATCH) {
 			VRHI_PatchMesh patch;
@@ -4458,6 +4512,7 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageTcModStretchValue[stage][1] = stageTcModStretchValue[stage][1];
 				batch.stageTcModStretchValue[stage][2] = stageTcModStretchValue[stage][2];
 				batch.stageTcModStretchValue[stage][3] = stageTcModStretchValue[stage][3];
+				batch.stageTcGenEnv[stage] = stageTcGenEnv[stage];
 				batch.stageAnimFps[stage] = stageAnimFps[stage];
 				batch.stageAnimFrames[stage] = stageAnimFrames[stage];
 				for (size_t animFrame = 0; animFrame < VRHI_SHADER_MAX_ANIM_FRAMES; ++animFrame)
@@ -4593,6 +4648,7 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageTcModStretchValue[stage][1] = stageTcModStretchValue[stage][1];
 				batch.stageTcModStretchValue[stage][2] = stageTcModStretchValue[stage][2];
 				batch.stageTcModStretchValue[stage][3] = stageTcModStretchValue[stage][3];
+				batch.stageTcGenEnv[stage] = stageTcGenEnv[stage];
 				batch.stageAnimFps[stage] = stageAnimFps[stage];
 				batch.stageAnimFrames[stage] = stageAnimFrames[stage];
 				for (size_t animFrame = 0; animFrame < VRHI_SHADER_MAX_ANIM_FRAMES; ++animFrame)
@@ -4668,6 +4724,7 @@ static void VRHI_LoadWorld(const char *name) {
 			// return reads this pre-resolved draw state, so the metadata must live
 			// on the batch rather than being re-derived from the script table.
 			int stageImages[VRHI_SHADER_MAX_STAGES] = { -1, -1, -1, -1 };
+			uint8_t stageTcGenEnv[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 			float stageAnimFps[VRHI_SHADER_MAX_STAGES] = { 0.0f, 0.0f, 0.0f, 0.0f };
 			uint8_t stageAnimFrames[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 			int stageAnimImage[VRHI_SHADER_MAX_STAGES][VRHI_SHADER_MAX_ANIM_FRAMES] = {
@@ -4723,7 +4780,8 @@ static void VRHI_LoadWorld(const char *name) {
 				stageAlphaGenWave, stageAlphaWaveValue,
 				stageTcModTurb, stageTcModTurbValue,
 				stageTcModStretchFunc, stageTcModStretchValue,
-				stageAnimFps, stageAnimFrames, stageAnimImage);
+				stageAnimFps, stageAnimFrames, stageAnimImage,
+				stageTcGenEnv);
 			const int diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 			VRHI_InlineBSPModel surfaceModel;
 			if (!VRHI_BuildInlineSurface(vertsData, vertCount, indexesData, indexCount,
@@ -4770,6 +4828,7 @@ static void VRHI_LoadWorld(const char *name) {
 					batch.stageTcModStretchValue[stage][1] = stageTcModStretchValue[stage][1];
 					batch.stageTcModStretchValue[stage][2] = stageTcModStretchValue[stage][2];
 					batch.stageTcModStretchValue[stage][3] = stageTcModStretchValue[stage][3];
+					batch.stageTcGenEnv[stage] = stageTcGenEnv[stage];
 					batch.stageAnimFps[stage] = stageAnimFps[stage];
 					batch.stageAnimFrames[stage] = stageAnimFrames[stage];
 					for (size_t animFrame = 0; animFrame < VRHI_SHADER_MAX_ANIM_FRAMES; ++animFrame)
@@ -5131,7 +5190,7 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	uint8_t tcModStretchFunc = VRHI_SHADER_WAVE_NONE,
 	const float *tcModStretchValue = nullptr,
 	float animFps = 0.0f, uint8_t animFrames = 0,
-	const int *animImages = nullptr) {
+	const int *animImages = nullptr, bool tcGenEnv = false) {
 	if (indexCount == 0 || firstIndex > UINT32_MAX || indexCount > UINT32_MAX ||
 		g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) return false;
 	VRHI_SceneDraw draw;
@@ -5181,6 +5240,7 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 		draw.tcModStretchValue[2] = tcModStretchValue[2];
 		draw.tcModStretchValue[3] = tcModStretchValue[3];
 	}
+	draw.tcGenEnv = tcGenEnv;
 	draw.animFps = animFps;
 	draw.animFrames = animFrames;
 	if (animImages != nullptr) {
@@ -5296,6 +5356,7 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 			!shaderStages->empty() && shaderStages->front().surfaceTranslucent;
 		int images[VRHI_SHADER_MAX_STAGES];
 		uint8_t blends[VRHI_SHADER_MAX_STAGES];
+		uint8_t stageTcGenEnv[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		float stageAnimFps[VRHI_SHADER_MAX_STAGES] = { 0.0f, 0.0f, 0.0f, 0.0f };
 		uint8_t stageAnimFrames[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		int stageAnimImage[VRHI_SHADER_MAX_STAGES][VRHI_SHADER_MAX_ANIM_FRAMES] = {
@@ -5351,7 +5412,8 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 				stageAlphaGenWave, stageAlphaWaveValue,
 				stageTcModTurb, stageTcModTurbValue,
 				stageTcModStretchFunc, stageTcModStretchValue,
-				stageAnimFps, stageAnimFrames, stageAnimImage);
+				stageAnimFps, stageAnimFrames, stageAnimImage,
+				stageTcGenEnv);
 		if (stageCount > 0) {
 			material.diffuseImage = images[0];
 			material.blendMode = blends[0];
@@ -5382,6 +5444,7 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 			material.tcModStretchValue[1] = stageTcModStretchValue[0][1];
 			material.tcModStretchValue[2] = stageTcModStretchValue[0][2];
 			material.tcModStretchValue[3] = stageTcModStretchValue[0][3];
+			material.tcGenEnv = stageTcGenEnv[0];
 			material.animFps = stageAnimFps[0];
 			material.animFrames = stageAnimFrames[0];
 			for (size_t animFrame = 0; animFrame < VRHI_SHADER_MAX_ANIM_FRAMES; ++animFrame)
@@ -5451,6 +5514,7 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 	draw->tcModStretchValue[1] = material.tcModStretchValue[1];
 	draw->tcModStretchValue[2] = material.tcModStretchValue[2];
 	draw->tcModStretchValue[3] = material.tcModStretchValue[3];
+	draw->tcGenEnv = material.tcGenEnv != 0;
 	draw->animFps = material.animFps;
 	draw->animFrames = material.animFrames;
 	for (size_t animFrame = 0; animFrame < VRHI_SHADER_MAX_ANIM_FRAMES; ++animFrame)
@@ -5684,7 +5748,8 @@ static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4
 					color.a >= 0.999f,
 				batch.stageTcModTurb[0] != 0, batch.stageTcModTurbValue[0],
 				batch.stageTcModStretchFunc[0], batch.stageTcModStretchValue[0],
-				batch.stageAnimFps[0], batch.stageAnimFrames[0], batch.stageAnimImage[0])) {
+				batch.stageAnimFps[0], batch.stageAnimFrames[0], batch.stageAnimImage[0],
+				batch.stageTcGenEnv[0] != 0)) {
 				g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
 				g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
 				continue;
@@ -6338,6 +6403,16 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 					batch.stageTcModStretchValue[stage][2],
 					frameTimeSeconds, 0.0f, 0.0f);
 				g_worldState.SetUniform(12, { "u_tcModStretchTime", { tcModStretchTime } });
+				// Bounded `tcGen environment` flag for this stage plus the
+				// current view origin in world coordinates: the textured
+				// material pixel shaders replace the diffuse UVs with
+				// reflection coordinates when the flag is set. Always
+				// written so no stale reflection state persists.
+				const glm::vec4 tcGenEnv(
+					batch.stageTcGenEnv[stage] ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+				g_worldState.SetUniform(13, { "u_tcGenEnv", { tcGenEnv } });
+				const glm::vec4 viewOrigin(vieworg.x, vieworg.y, vieworg.z, 0.0f);
+				g_worldState.SetUniform(14, { "u_viewOrigin", { viewOrigin } });
 				// Bounded stage-local rgbGen wave generator for this stage plus
 				// the shared per-frame render time in seconds: the textured
 				// material pixel shaders modulate the material sample RGB by
@@ -6585,6 +6660,11 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 					draw.tcModStretchValue[2],
 					frameTimeSeconds, 0.0f, 0.0f);
 				g_worldState.SetUniform(12, { "u_tcModStretchTime", { tcModStretchTime } });
+				const glm::vec4 tcGenEnv(
+					draw.tcGenEnv ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+				g_worldState.SetUniform(13, { "u_tcGenEnv", { tcGenEnv } });
+				const glm::vec4 viewOrigin(vieworg.x, vieworg.y, vieworg.z, 0.0f);
+				g_worldState.SetUniform(14, { "u_viewOrigin", { viewOrigin } });
 				// Bounded rgbGen wave generator carried on the scene draw plus
 				// the shared per-frame render time in seconds: the textured
 				// material pixel shader modulates the material sample RGB by

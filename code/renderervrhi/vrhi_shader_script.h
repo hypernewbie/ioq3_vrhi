@@ -195,6 +195,17 @@ input buffer, so no FS storage can be referenced after FS_FreeFile.
 // tokens past the stage end. The conservative first-stage helper still
 // treats `tcMod` as unsupported and rejects such shaders.
 //
+// The bounded `tcGen environment` slice extends the same simple multi-stage
+// parser with exactly the Quake3 reflection-coordinate generator: the stage
+// samples its image with per-pixel view-dependent coordinates matching GL1's
+// RB_CalcEnvironmentTexCoords (reflection vector from the decoded surface
+// normal and the current view origin), applied before every tcMod in the
+// fixed composition order. `tcGen texture` stays the identity default and
+// every other tcGen keeps the existing fallback with pre-tcGen sampling.
+// Malformed or truncated statements keep the stage accepted with authored
+// UVs and never borrow past the stage end. The conservative first-stage
+// helper still treats `tcGen` as unsupported and rejects such shaders.
+//
 // The bounded stage-local `rgbGen wave` / `alphaGen wave` slice extends the
 // same simple multi-stage parser with exactly the five Quake3 waveform forms
 // `sin`, `square`, `triangle`, `sawtooth`, and `inversesawtooth` (matched
@@ -295,6 +306,12 @@ struct VRHI_ShaderStage {
 	// invalid speeds, matching GL1's atof-garbage speed of 0).
 	std::vector<std::string> animPaths;
 	float animFps = 0.0f;
+	// Bounded `tcGen environment`: the stage samples its image with
+	// view-dependent reflection coordinates (GL1 RB_CalcEnvironmentTexCoords)
+	// instead of the authored diffuse UVs. Every other tcGen keeps the
+	// existing fallback (identity `texture` or ignored variants) with this
+	// flag clear, so those stages sample exactly as before.
+	bool tcGenEnvironment = false;
 	int blendMode = VRHI_SHADER_BLEND_OPAQUE;
 	// Shader-level `surfaceparm trans` sorts the material with translucent
 	// geometry without necessarily enabling a blend function (e.g. a two-stage
@@ -1200,6 +1217,27 @@ inline bool VRHI_ParseSimpleShaderBlock(
 					if (arg == "ge128") stage.alphaFunc = VRHI_SHADER_ALPHAFUNC_GE128;
 					else if (arg == "gt0") stage.alphaFunc = VRHI_SHADER_ALPHAFUNC_GT0;
 					else if (arg == "lt128") stage.alphaFunc = VRHI_SHADER_ALPHAFUNC_LT128;
+					j += 2;
+				} else {
+					j += 1;
+				}
+				continue;
+			}
+			if (keyword == "tcgen") {
+				// Bounded `tcGen environment` (exactly two tokens): preserved
+				// as the per-stage reflection flag carried into the draw
+				// state. `tcGen texture` is the identity default (no flag,
+				// consumed so a following directive still parses). Every
+				// other tcGen variant (lightmap, vector, fog, entity, ...)
+				// keeps the existing fallback: only the keyword is consumed
+				// and the argument tokens are bounded by stageEnd and
+				// ignored below, exactly as before this slice. A truncated
+				// bare `tcGen` at the stage end is consumed the same way
+				// and never borrows past the stage.
+				if (j + 1 < stageEnd && VRHI_ShaderTokenIs(tokens[j + 1], "environment")) {
+					stage.tcGenEnvironment = true;
+					j += 2;
+				} else if (j + 1 < stageEnd && VRHI_ShaderTokenIs(tokens[j + 1], "texture")) {
 					j += 2;
 				} else {
 					j += 1;

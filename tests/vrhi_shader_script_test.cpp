@@ -2120,6 +2120,63 @@ void testStageAnimMap() {
 		"{ animMap 8 textures/foo/bar.tga textures/baz.tga }", nullptr), "");
 }
 
+void testStageTcGenEnvironment() {
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	// Chrome-style window stage: environment reflection plus blend.
+	const std::string accepted = script(
+		"{ map textures/base.tga }\n"
+		"{ map textures/chrome.tga tcGen environment rgbGen identity blendFunc blend depthFunc equal }");
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(accepted), accepted.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 2u);
+		if (stages.size() == 2) {
+			CHECK(!stages[0].tcGenEnvironment);
+			CHECK(stages[1].tcGenEnvironment);
+			CHECK_EQ_INT(stages[1].blendMode, VRHI_SHADER_BLEND_ALPHA);
+		}
+	}
+	// Matching is case-insensitive; `texture` is the identity default.
+	const std::string upper = script(
+		"{ map textures/a.tga tcGen ENVIRONMENT }\n"
+		"{ map textures/b.tga blendFunc blend tcGen TEXTURE }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(upper), upper.size(), wanted, &results));
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		if (stages.size() == 2) {
+			CHECK(stages[0].tcGenEnvironment);
+			CHECK(!stages[1].tcGenEnvironment);
+		}
+	}
+	// Other tcGen variants and a bare keyword keep the stage accepted with
+	// authored UVs, exactly as before this slice.
+	const std::string fallbacks = script(
+		"{ map textures/a.tga tcGen lightmap }\n"
+		"{ map textures/b.tga blendFunc blend tcGen vector 0 1 0 0 1 0 }\n"
+		"{ map textures/c.tga blendFunc blend tcGen fog }\n"
+		"{ map textures/d.tga blendFunc blend tcGen }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(fallbacks), fallbacks.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 4u);
+		if (stages.size() == 4) {
+			for (std::size_t i = 0; i < stages.size(); ++i)
+				CHECK(!stages[i].tcGenEnvironment);
+		}
+	}
+	// The conservative first-stage opaque helper still rejects tcGen.
+	CHECK_EQ_STR(candidateBody(
+		"{ map textures/foo/bar.tga tcGen environment }", nullptr), "");
+	CHECK_EQ_STR(candidateBody(
+		"{ map textures/foo/bar.tga tcGen texture }", nullptr), "");
+}
+
 void testStageWaveGenerators() {
 	// Direct parser-helper bounds/token safety: VRHI_ShaderParseWaveConstant
 	// accepts finite in-range parameters (zero and the inclusive |16| bound
@@ -2525,6 +2582,7 @@ int main() {
 	testStageTcModRotate();
 	testStageTcModTurbStretch();
 	testStageAnimMap();
+	testStageTcGenEnvironment();
 	testStageWaveGenerators();
 	testConsoleScriptResolution();
 	testPathSafetyHelpers();
