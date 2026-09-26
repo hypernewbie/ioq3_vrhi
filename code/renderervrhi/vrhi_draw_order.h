@@ -12,6 +12,7 @@
 struct VRHI_TranslucentDrawOrder {
 	float distanceSquared;
 	std::size_t index;
+	std::size_t stage;
 	bool scene;
 };
 

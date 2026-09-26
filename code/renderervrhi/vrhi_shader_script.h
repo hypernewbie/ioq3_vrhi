@@ -257,6 +257,10 @@ enum VRHI_ShaderAlphaFunc {
 struct VRHI_ShaderStage {
 	std::string path;
 	int blendMode = VRHI_SHADER_BLEND_OPAQUE;
+	// Shader-level `surfaceparm trans` sorts the material with translucent
+	// geometry without necessarily enabling a blend function (e.g. a two-stage
+	// liquid where only stage one blends). This hint is distinct from blendMode.
+	bool surfaceTranslucent = false;
 	// Bounded static const generators. rgbGen const r g b tints the stage
 	// texture RGB; alphaGen const a scales the stage texture alpha (both match
 	// the GL1 constant-colour modulate semantics). Only finite constants inside
@@ -817,6 +821,7 @@ inline bool VRHI_ParseSimpleShaderBlock(
 	std::size_t end, std::vector<VRHI_ShaderStage> *stages) {
 	if (stages != nullptr) stages->clear();
 	if (stages == nullptr || begin >= end || end > tokens.size()) return false;
+	bool surfaceTranslucent = false;
 	for (std::size_t i = begin; i < end;) {
 		// Shader-level directives (surfaceparm, cull, fogparms, q3map_* and
 		// similar) are bounded metadata. The renderer does not implement their
@@ -824,6 +829,12 @@ inline bool VRHI_ParseSimpleShaderBlock(
 		// usable transparent stages into a green placeholder. Stage directives
 		// are handled below; only their supported map/blend subset affects draw.
 		if (tokens[i].text != "{") {
+			if (VRHI_ShaderTokenIs(tokens[i], "surfaceparm") && i + 1 < end) {
+				if (VRHI_ShaderTokenIs(tokens[i + 1], "trans"))
+					surfaceTranslucent = true;
+				i += 2;
+				continue;
+			}
 			++i;
 			continue;
 		}
@@ -1202,7 +1213,13 @@ inline bool VRHI_ParseSimpleShaderBlock(
 			if (blendSpecified && stage.blendMode == VRHI_SHADER_BLEND_OPAQUE) return false;
 			if (!blendSpecified) stage.blendMode = VRHI_SHADER_BLEND_ALPHA;
 		}
+		stage.surfaceTranslucent = surfaceTranslucent;
 		stages->push_back(std::move(stage));
+	}
+	if (surfaceTranslucent) {
+		// surfaceparm metadata may legally occur after a stage in a shader
+		// block, so apply its sort hint to every parsed stage after the scan.
+		for (VRHI_ShaderStage &stage : *stages) stage.surfaceTranslucent = true;
 	}
 	return !stages->empty();
 }

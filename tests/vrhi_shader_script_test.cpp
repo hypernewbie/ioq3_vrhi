@@ -501,6 +501,7 @@ void testScriptStagesOverrideDirectImages() {
 		CHECK_EQ_INT((*wires)[0].blendMode, VRHI_SHADER_BLEND_OPAQUE);
 		CHECK_EQ_INT((*wires)[0].alphaFunc, VRHI_SHADER_ALPHAFUNC_GE128);
 		CHECK((*wires)[0].depthWrite);
+		CHECK((*wires)[0].surfaceTranslucent);
 	}
 	const auto *flare = VRHI_FindShaderScriptStages("textures/flares/lava", parsed);
 	CHECK(flare != nullptr);
@@ -543,6 +544,43 @@ void testScriptStagesOverrideDirectImages() {
 	CHECK(VRHI_ParseShaderScriptStages(asBytes(missingEqual), missingEqual.size(),
 		overlayWanted, &parsed));
 	CHECK(parsed.empty());
+}
+
+void testShaderFilePriority() {
+	// GL1 combines FS_ListFiles in reverse order, then uses the first
+	// definition. An OA patch replaces the old two-stage e8tinylight script
+	// whose optional blend texture no longer ships in the pak files.
+	const std::string newer =
+		"textures/evil8_lights/e8tinylight { "
+		"{ map textures/evil8_lights/e8tinylight.tga } "
+		"{ map $lightmap blendFunc filter tcGen lightmap } }";
+	const std::string older =
+		"textures/evil8_lights/e8tinylight { "
+		"{ map textures/evil8_lights/e8tinylight.tga } "
+		"{ map $lightmap blendFunc filter tcGen lightmap } "
+		"{ map textures/evil8_lights/e8tinylight.blend.tga blendFunc add } }";
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/evil8_lights/e8tinylight", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > selected;
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(newer), newer.size(), wanted, &selected));
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(older), older.size(), wanted, &selected));
+	CHECK_EQ_INT(selected.size(), 1u);
+	const auto *stages = VRHI_FindShaderScriptStages(
+		"textures/evil8_lights/e8tinylight", selected);
+	CHECK(stages != nullptr);
+	if (stages != nullptr) {
+		CHECK_EQ_INT(stages->size(), 1u);
+		CHECK_EQ_STR((*stages)[0].path, "textures/evil8_lights/e8tinylight.tga");
+		CHECK(!(*stages)[0].surfaceTranslucent);
+	}
+	const std::string lateTrans = script(
+		"{ map textures/base.tga } surfaceparm trans");
+	std::unordered_map<std::string, bool> lateWanted;
+	lateWanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > late;
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(lateTrans), lateTrans.size(),
+		lateWanted, &late));
+	CHECK(late["textures/foo/bar"][0].surfaceTranslucent);
 }
 
 void testBlockLevelBoundaries() {
@@ -2234,6 +2272,7 @@ int main() {
 	testBlockLevelBoundaries();
 	testSimpleMultiStageExtraction();
 	testScriptStagesOverrideDirectImages();
+	testShaderFilePriority();
 	testConstGenerators();
 	testStageDepthWrite();
 	testStageAlphaFunc();

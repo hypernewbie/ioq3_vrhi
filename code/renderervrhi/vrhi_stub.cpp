@@ -117,6 +117,7 @@ struct VRHI_SceneDraw {
 	qhandle_t shader = 0;
 	uint8_t blendMode = VRHI_SHADER_BLEND_OPAQUE;
 	bool translucent = false;
+	bool sortOnlyTranslucent = false;
 	// Inline BSP batches already resolved their map shader to a shared diffuse
 	// image.  Keep that image index on the draw instead of manufacturing a
 	// second scene-local texture table.
@@ -304,9 +305,9 @@ struct VRHI_WorldBatch {
 	float stageAlphaWaveValue[VRHI_SHADER_MAX_STAGES][4] = {
 		{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
 		{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
-	// A non-opaque stage zero is a translucent world batch. It is rendered
-	// after opaque batches in back-to-front order with depth writes disabled
-	// unless a stage explicitly declares depthWrite.
+	// Shader surfaceparm trans is a sort hint, separate from blend mode. The
+	// world renderer sorts these and blended bases/overlays after opaque draws.
+	bool surfaceTranslucent = false;
 	bool translucent = false;
 };
 struct VRHI_InlineBSPModel {
@@ -330,6 +331,7 @@ struct VRHI_SceneShaderMaterial {
 	// Cache the chosen source as well as its texture. A cached direct-image
 	// fallback must retain implicit image-alpha blending on later frames.
 	bool scriptResolved = false;
+	bool surfaceTranslucent = false;
 	uint8_t blendMode = VRHI_SHADER_BLEND_OPAQUE;
 	// Base-stage bounded static const generators; flags 0 mean identity tint.
 	uint8_t rgbConst = 0;
@@ -3124,7 +3126,11 @@ static void VRHI_ScanShaderScripts(const std::vector<std::string> &shaderNames) 
 			return;
 		}
 		size_t totalText = 0;
-		for (int i = 0; i < fileCount; ++i) {
+		// GL1 tr_shader.c concatenates shader files in reverse FS_ListFiles
+		// order before inserting the first matching definition into its hash
+		// table. Process the same order here so patch shaders override older
+		// definitions rather than reviving a stale/unfinished material.
+		for (int i = fileCount - 1; i >= 0; --i) {
 			std::string qpath;
 			if (!VRHI_ResolveShaderScriptFile(fileList[i], &qpath)) continue;
 			activeFileData = nullptr;
@@ -4094,7 +4100,9 @@ static void VRHI_LoadWorld(const char *name) {
 			batch.indexCount = static_cast<uint32_t>(patch.indexes.size());
 			batch.diffuseImage = diffuseImage;
 			batch.stageCount = static_cast<uint8_t>(stageCount);
-			batch.translucent = stageCount > 0 && stageBlend[0] != VRHI_SHADER_BLEND_OPAQUE;
+			batch.surfaceTranslucent = (shader.contentFlags & CONTENTS_TRANSLUCENT) != 0;
+			batch.translucent = (stageCount > 0 &&
+				stageBlend[0] != VRHI_SHADER_BLEND_OPAQUE) || batch.surfaceTranslucent;
 			for (int stage = 0; stage < stageCount; ++stage) {
 				batch.stageImages[stage] = stageImages[stage];
 				batch.stageBlend[stage] = stageBlend[stage];
@@ -4212,7 +4220,9 @@ static void VRHI_LoadWorld(const char *name) {
 			batch.indexCount = static_cast<uint32_t>(g_worldIndexes.size()) - surfaceFirstIndex;
 			batch.diffuseImage = diffuseImage;
 			batch.stageCount = static_cast<uint8_t>(stageCount);
-			batch.translucent = stageCount > 0 && stageBlend[0] != VRHI_SHADER_BLEND_OPAQUE;
+			batch.surfaceTranslucent = (shader.contentFlags & CONTENTS_TRANSLUCENT) != 0;
+			batch.translucent = (stageCount > 0 &&
+				stageBlend[0] != VRHI_SHADER_BLEND_OPAQUE) || batch.surfaceTranslucent;
 			for (int stage = 0; stage < stageCount; ++stage) {
 				batch.stageImages[stage] = stageImages[stage];
 				batch.stageBlend[stage] = stageBlend[stage];
@@ -4356,8 +4366,9 @@ static void VRHI_LoadWorld(const char *name) {
 			// rendering scope is unchanged.
 			for (VRHI_WorldBatch &batch : surfaceModel.batches) {
 				batch.stageCount = static_cast<uint8_t>(stageCount);
-				batch.translucent = stageCount > 0 &&
-					stageBlend[0] != VRHI_SHADER_BLEND_OPAQUE;
+				batch.surfaceTranslucent = (shader.contentFlags & CONTENTS_TRANSLUCENT) != 0;
+				batch.translucent = (stageCount > 0 &&
+					stageBlend[0] != VRHI_SHADER_BLEND_OPAQUE) || batch.surfaceTranslucent;
 				for (int stage = 0; stage < stageCount; ++stage) {
 					batch.stageImages[stage] = stageImages[stage];
 					batch.stageBlend[stage] = stageBlend[stage];
@@ -4728,7 +4739,7 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	uint8_t rgbGenWave = VRHI_SHADER_WAVE_NONE,
 	const float *rgbWaveValue = nullptr,
 	uint8_t alphaGenWave = VRHI_SHADER_WAVE_NONE,
-	const float *alphaWaveValue = nullptr) {
+	const float *alphaWaveValue = nullptr, bool sortOnlyTranslucent = false) {
 	if (indexCount == 0 || firstIndex > UINT32_MAX || indexCount > UINT32_MAX ||
 		g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) return false;
 	VRHI_SceneDraw draw;
@@ -4738,7 +4749,9 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	draw.diffuseImage = diffuseImage;
 	draw.lightmapped = lightmapped;
 	draw.blendMode = blendMode;
-	draw.translucent = translucent || blendMode != VRHI_SHADER_BLEND_OPAQUE;
+	draw.translucent = translucent || blendMode != VRHI_SHADER_BLEND_OPAQUE ||
+		sortOnlyTranslucent;
+	draw.sortOnlyTranslucent = sortOnlyTranslucent;
 	draw.rgbConst = rgbConst;
 	if (rgbConstColor != nullptr) {
 		draw.rgbConstColor[0] = rgbConstColor[0];
@@ -4824,7 +4837,10 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 	if (draw->diffuseImage >= 0 && static_cast<size_t>(draw->diffuseImage) < g_worldDiffuseImages.size()) {
 		const VRHI_WorldDiffuseImage &image =
 			g_worldDiffuseImages[static_cast<size_t>(draw->diffuseImage)];
-		applyMaterial(draw->blendMode, image.hasTransparency);
+		// Inline BSP draws already carry their script blend/alphaFunc metadata;
+		// this decoded image may also serve a direct registration, so its alpha
+		// alone must not override the material's explicit opaque stage.
+		applyMaterial(draw->blendMode, false);
 		return image.texture;
 	}
 	const std::unordered_map<qhandle_t, size_t>::const_iterator uiFound =
@@ -4862,6 +4878,10 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 		material = cached->second;
 	} else {
 		material.scriptResolved = hasScript;
+		const std::vector<VRHI_ShaderStage> *shaderStages =
+			VRHI_FindShaderScriptStages(shaderName.c_str(), g_worldShaderScriptStages);
+		material.surfaceTranslucent = shaderStages != nullptr &&
+			!shaderStages->empty() && shaderStages->front().surfaceTranslucent;
 		int images[VRHI_SHADER_MAX_STAGES];
 		uint8_t blends[VRHI_SHADER_MAX_STAGES];
 		int stageCount = 0;
@@ -4953,6 +4973,11 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 	const VRHI_WorldDiffuseImage &image =
 		g_worldDiffuseImages[static_cast<size_t>(material.diffuseImage)];
 	draw->alphaFunc = material.alphaFunc;
+	if (material.surfaceTranslucent && !draw->translucent &&
+		draw->blendMode == VRHI_SHADER_BLEND_OPAQUE) {
+		draw->sortOnlyTranslucent = true;
+		draw->translucent = true;
+	}
 	// A parsed opaque script without alphaFunc is still opaque in GL1 even
 	// when its image has an alpha channel. Implicit blending applies only to
 	// direct-image fallbacks used by sprites and other unscripted scene draws.
@@ -5169,7 +5194,9 @@ static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4
 				batch.stageTcModScroll[0] != 0, batch.stageTcModScrollValue[0],
 				batch.stageTcModRotate[0] != 0, batch.stageTcModRotateDegreesPerSecond[0],
 				batch.stageRgbGenWave[0], batch.stageRgbWaveValue[0],
-				batch.stageAlphaGenWave[0], batch.stageAlphaWaveValue[0])) {
+				batch.stageAlphaGenWave[0], batch.stageAlphaWaveValue[0],
+				batch.surfaceTranslucent && blendMode == VRHI_SHADER_BLEND_OPAQUE &&
+					color.a >= 0.999f)) {
 				g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
 				g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
 				continue;
@@ -5592,16 +5619,9 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		VRHI_UpdateWorldVertexLighting();
 	}
 	std::vector<size_t> opaqueBatches;
-	std::vector<size_t> translucentBatches;
+	std::vector<VRHI_TranslucentDrawOrder> translucentDraws;
 	opaqueBatches.reserve(g_worldBatches.size());
-	translucentBatches.reserve(g_worldBatches.size());
-	for (size_t batchIndex = 0; batchIndex < g_worldBatches.size(); ++batchIndex) {
-		const VRHI_WorldBatch &batch = g_worldBatches[batchIndex];
-		if (batch.indexCount == 0 ||
-			(cullActive && (batchIndex >= g_worldBatchMarked.size() ||
-				g_worldBatchMarked[batchIndex] != g_worldVisEpoch))) continue;
-		(batch.translucent ? translucentBatches : opaqueBatches).push_back(batchIndex);
-	}
+	translucentDraws.reserve(g_worldBatches.size());
 	const auto batchDistanceSquared = [&](size_t batchIndex) {
 		const VRHI_WorldBatch &batch = g_worldBatches[batchIndex];
 		glm::vec3 center(0.0f);
@@ -5620,12 +5640,27 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		const glm::vec3 delta = center - vieworg;
 		return glm::dot(delta, delta);
 	};
-	std::stable_sort(translucentBatches.begin(), translucentBatches.end(),
-		[&](size_t left, size_t right) {
-			return batchDistanceSquared(left) > batchDistanceSquared(right);
-		});
+	for (size_t batchIndex = 0; batchIndex < g_worldBatches.size(); ++batchIndex) {
+		const VRHI_WorldBatch &batch = g_worldBatches[batchIndex];
+		if (batch.indexCount == 0 ||
+			(cullActive && (batchIndex >= g_worldBatchMarked.size() ||
+				g_worldBatchMarked[batchIndex] != g_worldVisEpoch))) continue;
+		const int count = batch.stageCount > VRHI_SHADER_MAX_STAGES ? 0 : batch.stageCount;
+		const bool blendedBase = count > 0 &&
+			batch.stageBlend[0] != VRHI_SHADER_BLEND_OPAQUE;
+		if (blendedBase || batch.translucent)
+			translucentDraws.push_back({ batchDistanceSquared(batchIndex), batchIndex, 0, false });
+		else
+			opaqueBatches.push_back(batchIndex);
+		// Draw overlays as independently sorted items after every opaque base.
+		// This lets additive/lightmap/detail stages composite after opaque scene
+		// models instead of being buried inside the world opaque pass.
+		for (int stage = 1; stage < count; ++stage)
+			translucentDraws.push_back({ batchDistanceSquared(batchIndex), batchIndex,
+				static_cast<size_t>(stage), false });
+	}
 	bool submitted = false;
-	const auto drawWorldBatch = [&](size_t batchIndex) {
+	const auto drawWorldBatch = [&](size_t batchIndex, size_t drawStage) {
 		const VRHI_WorldBatch &batch = g_worldBatches[batchIndex];
 		const int declaredCount = batch.stageCount > VRHI_SHADER_MAX_STAGES ? 0 : batch.stageCount;
 		const bool baseImageValid = declaredCount > 0 && batch.stageImages[0] >= 0 &&
@@ -5635,22 +5670,26 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		// path rather than dropping the whole BSP batch.
 		const int count = baseImageValid && g_worldDiffusePixelShader != VRHI_INVALID_HANDLE
 			? declaredCount : 0;
-		for (int stage = 0; stage <= count; ++stage) {
-			const bool materialStage = stage < count;
+		const int drawableCount = count > 0 ? count : 1;
+		if (drawStage >= static_cast<size_t>(drawableCount)) return;
+		const int stage = static_cast<int>(drawStage);
+		{
+			const bool materialStage = count > 0;
 			const int imageIndex = materialStage ? batch.stageImages[stage] : -1;
 			const bool textured = materialStage && imageIndex >= 0 &&
 				static_cast<size_t>(imageIndex) < g_worldDiffuseImages.size() &&
 				g_worldDiffuseImages[imageIndex].texture != VRHI_INVALID_HANDLE;
-			if (materialStage && !textured) break;
-			if (!materialStage && count > 0) continue;
+			if (materialStage && !textured) return;
 			const bool overlay = materialStage && stage > 0;
 			const bool blended = materialStage &&
 				batch.stageBlend[stage] != VRHI_SHADER_BLEND_OPAQUE;
+			const bool sortedTransparentBase = stage == 0 && batch.translucent && !blended;
 			const bool useDiffuse = textured && g_worldDiffusePixelShader != VRHI_INVALID_HANDLE;
-			if (overlay && g_worldOverlayPixelShader == VRHI_INVALID_HANDLE) continue;
+			if (overlay && g_worldOverlayPixelShader == VRHI_INVALID_HANDLE) return;
 			g_worldState = worldBaseState;
-			if (overlay || blended) {
-				const uint64_t blend = VRHI_BlendStateForMode(batch.stageBlend[stage]);
+			if (overlay || blended || sortedTransparentBase) {
+				const uint64_t blend = blended
+					? VRHI_BlendStateForMode(batch.stageBlend[stage]) : 0;
 				// Translucent base stages are rendered after opaque geometry in
 				// back-to-front order. They test depth but never write it unless
 				// the stage explicitly declares `depthWrite`; overlay stages
@@ -5809,7 +5848,7 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 				batch.firstIndex, stage);
 		}
 	};
-	for (size_t batchIndex : opaqueBatches) drawWorldBatch(batchIndex);
+	for (size_t batchIndex : opaqueBatches) drawWorldBatch(batchIndex, 0);
 	// Resolve the opaque scene before drawing world transparency. Otherwise a
 	// model behind glass writes its opaque color over an already blended pane.
 	if (VRHI_BuildSceneGeometry(fd) && VRHI_EnsureSceneBuffers()) {
@@ -5850,7 +5889,9 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 			const bool lightmapped = draw.lightmapped && g_worldLightmapTexture != VRHI_INVALID_HANDLE &&
 				g_worldLightmapPixelShader != VRHI_INVALID_HANDLE;
 			g_worldState = worldBaseState;
-			const uint64_t sceneBlend = VRHI_BlendStateForMode(draw.blendMode);
+			const uint64_t sceneBlend = draw.sortOnlyTranslucent &&
+				draw.blendMode == VRHI_SHADER_BLEND_OPAQUE
+				? 0 : VRHI_BlendStateForMode(draw.blendMode);
 			// Translucent scene draws keep the default depth-test-on/
 			// depth-write-off behavior; WRITE_Z is added only when the base
 			// stage explicitly declared depthWrite. Opaque draws keep writing
@@ -6026,21 +6067,20 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		// pass. Sort by the same camera-distance approximation used previously
 		// for each group, so neither group always draws on top of the other.
 		// Full GL1 shader-sort and per-polygon sorting are not implemented.
-		std::vector<VRHI_TranslucentDrawOrder> translucentDraws;
-		translucentDraws.reserve(translucentBatches.size() + translucentSceneDraws.size());
-		for (size_t index : translucentBatches)
-			translucentDraws.push_back({ batchDistanceSquared(index), index, false });
+		translucentDraws.reserve(translucentDraws.size() + translucentSceneDraws.size());
 		for (size_t index : translucentSceneDraws)
-			translucentDraws.push_back({ sceneDrawDistanceSquared(index), index, true });
+			translucentDraws.push_back({ sceneDrawDistanceSquared(index), index, 0, true });
 		VRHI_SortTranslucentDraws(&translucentDraws);
 		for (const VRHI_TranslucentDrawOrder &draw : translucentDraws) {
 			if (draw.scene) drawScene(draw.index);
-			else drawWorldBatch(draw.index);
+			else drawWorldBatch(draw.index, draw.stage);
 		}
 	} else {
 		// Scene upload failure must never suppress previously visible world
-		// transparent batches. The world-only list is already back-to-front.
-		for (size_t batchIndex : translucentBatches) drawWorldBatch(batchIndex);
+		// transparent stages. The world-only list is sorted by the same key.
+		VRHI_SortTranslucentDraws(&translucentDraws);
+		for (const VRHI_TranslucentDrawOrder &draw : translucentDraws)
+			drawWorldBatch(draw.index, draw.stage);
 	}
 	g_worldDrawSubmitted = submitted;
 	// RenderScene is also used for world-less scene frames (menu/model previews),
