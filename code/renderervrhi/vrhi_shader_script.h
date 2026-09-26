@@ -1128,11 +1128,26 @@ inline bool VRHI_ParseSimpleShaderBlock(
 				const bool isAlphaGen = keyword == "alphagen";
 				if (VRHI_ShaderTokenIs(tokens[j + 1], "const")) {
 					const std::size_t argCount = isAlphaGen ? 1 : 3;
-					if (j + 1 + argCount >= stageEnd) return false;
+					// Optional GL1 parenthesized vector form `const ( r g b )`
+					// (rgbGen only; the corpus has no parenthesized alphaGen
+					// const). A truncated or unbalanced paren scope abandons
+					// just the const (identity fallback) and consumes to
+					// the stage end, so the stage still closes normally;
+					// only the bare form's truncation rejects the shader.
+					const bool paren = !isAlphaGen && j + 2 < stageEnd &&
+						tokens[j + 2].text == "(";
+					const std::size_t valueBegin = j + 2 + (paren ? 1 : 0);
+					const std::size_t available = valueBegin < stageEnd
+						? stageEnd - valueBegin : 0;
+					if (!paren && available < argCount) return false;
+					if (paren && available < argCount + 1) {
+						j = stageEnd;
+						continue;
+					}
 					float values[3] = { 1.0f, 1.0f, 1.0f };
 					bool valid = true;
 					for (std::size_t k = 0; k < argCount; ++k) {
-						if (!VRHI_ShaderParseFiniteConstant(tokens[j + 2 + k].text,
+						if (!VRHI_ShaderParseFiniteConstant(tokens[valueBegin + k].text,
 							VRHI_SCRIPT_GENCONST_MIN,
 							isAlphaGen ? VRHI_SCRIPT_GENCONST_ALPHA_MAX
 								: VRHI_SCRIPT_GENCONST_RGB_MAX,
@@ -1140,6 +1155,17 @@ inline bool VRHI_ParseSimpleShaderBlock(
 							valid = false;
 							break;
 						}
+					}
+					std::size_t statementEnd = valueBegin + argCount;
+					if (paren) {
+						if (tokens[valueBegin + argCount].text != ")") {
+							// Unbalanced closer with tokens present: identity
+							// fallback, consume through the last value; the
+							// offending token flows to the generic loop.
+							j = statementEnd;
+							continue;
+						}
+						statementEnd += 1;
 					}
 					if (valid) {
 						if (isAlphaGen) {
@@ -1153,13 +1179,14 @@ inline bool VRHI_ParseSimpleShaderBlock(
 						}
 					}
 					// Both accepted and rejected const statements consume the
-					// whole declared argument count (2 + argCount tokens). A
-					// syntactically complete but invalid or out-of-range const
-					// statement must not leave keyword-looking argument tokens
-					// (for example `rgbGen const 1 1 map`) behind to be re-parsed
-					// as stage directives; it simply keeps the dynamic fallback
-					// tint while the stage stays accepted.
-					j += 2 + argCount;
+					// whole declared argument count (plus both parens when
+					// present). A syntactically complete but invalid or
+					// out-of-range const statement must not leave
+					// keyword-looking argument tokens (for example
+					// `rgbGen const 1 1 map`) behind to be re-parsed as
+					// stage directives; it simply keeps the dynamic
+					// fallback tint while the stage stays accepted.
+					j = statementEnd;
 					continue;
 				}
 				if (VRHI_ShaderTokenIs(tokens[j + 1], "wave")) {

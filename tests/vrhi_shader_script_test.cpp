@@ -2318,6 +2318,74 @@ void testStageDeform() {
 	CHECK(deforms.empty());
 }
 
+void testStageSkyBackdrop() {
+	// A night-sky material with shader-level sky metadata parses its stages
+	// normally: sky surface parms, q3map directives, and skyParms never
+	// disturb stage extraction, and the star/cloud images resolve in order.
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	const std::string sky = script(
+		"surfaceparm noimpact surfaceparm nolightmap surfaceparm sky "
+		"q3map_surfacelight 20 skyParms full 1280 - "
+		"{ map textures/skies/stars.tga tcMod scale 3 3 } "
+		"{ map textures/skies/nitesky.tga blendFunc add tcMod scroll 0.02 0.07 }");
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(sky), sky.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 2u);
+		if (stages.size() == 2) {
+			CHECK_EQ_STR(stages[0].path, "textures/skies/stars.tga");
+			CHECK(stages[0].tcModScale);
+			CHECK_EQ_INT(stages[1].blendMode, VRHI_SHADER_BLEND_ADDITIVE);
+			CHECK(stages[1].tcModScroll);
+		}
+	}
+}
+
+void testConstParens() {
+	// GL1 parenthesized vector form `rgbGen const ( r g b )` carries the
+	// same bounded tint as the bare form; unbalanced or truncated parens
+	// keep the identity fallback with the stage accepted.
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	const std::string accepted = script(
+		"{ map textures/skies/stars.tga rgbGen const ( 0.407843 0.392157 0.356863 ) tcMod scale 5 5 }");
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(accepted), accepted.size(), wanted, &results));
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		if (stages.size() == 1) {
+			CHECK(stages[0].rgbGenConst);
+			CHECK(stages[0].rgbConst[0] > 0.40f && stages[0].rgbConst[0] < 0.41f);
+			CHECK(stages[0].rgbConst[2] > 0.35f && stages[0].rgbConst[2] < 0.36f);
+			CHECK(stages[0].tcModScale);
+		}
+	}
+	const std::string unbalanced = script(
+		"{ map textures/a.tga rgbGen const ( 0.5 0.5 0.5 } { map textures/b.tga blendFunc blend }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(unbalanced), unbalanced.size(), wanted, &results));
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		if (stages.size() == 2) {
+			CHECK(!stages[0].rgbGenConst);
+			CHECK_EQ_STR(stages[0].path, "textures/a.tga");
+		}
+	}
+	// A truncated paren scope abandons just the const: the stage stays
+	// accepted with the identity tint (unlike the bare form, which rejects).
+	const std::string truncated = script("{ map textures/a.tga rgbGen const ( 0.5 0.5 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncated), truncated.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		if (stages.size() == 1) CHECK(!stages[0].rgbGenConst);
+	}
+}
+
 void testStageWaveGenerators() {
 	// Direct parser-helper bounds/token safety: VRHI_ShaderParseWaveConstant
 	// accepts finite in-range parameters (zero and the inclusive |16| bound
@@ -2724,8 +2792,10 @@ int main() {
 	testStageTcModTurbStretch();
 	testStageAnimMap();
 	testStageTcGenEnvironment();
+	testConstParens();
 	testDeformWaveMath();
 	testStageDeform();
+	testStageSkyBackdrop();
 	testStageWaveGenerators();
 	testConsoleScriptResolution();
 	testPathSafetyHelpers();

@@ -219,6 +219,10 @@ struct VRHI_SceneDraw {
 	// textured material pixel shaders replace the diffuse UVs with reflection
 	// coordinates when set and keep authored UVs otherwise.
 	bool tcGenEnv = false;
+	// Sky backdrop flag for inline-model sky surfaces. The textured material
+	// pixel shaders replace the diffuse UVs with direction-projected box
+	// coordinates when set; always false for sprites, beams, polys, and MD3.
+	bool sky = false;
 };
 static std::vector<VRHI_SceneEntity> g_sceneEntities;
 static std::vector<VRHI_ScenePoly> g_scenePolys;
@@ -370,6 +374,10 @@ struct VRHI_WorldBatch {
 	float deformWaveValue[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 	float deformMoveValue[3] = { 0.0f, 0.0f, 0.0f };
 	float deformBulgeValue[3] = { 0.0f, 0.0f, 0.0f };
+	// Sky surfaces (SURF_SKY) render first with direction-projected box UVs
+	// instead of authored diffuse UVs. The script stages resolve normally;
+	// a sky material without accepted stages stays skipped (black, as before).
+	bool sky = false;
 	// Shader surfaceparm trans is a sort hint, separate from blend mode. The
 	// world renderer sorts these and blended bases/overlays after opaque draws.
 	bool surfaceTranslucent = false;
@@ -1447,6 +1455,7 @@ Texture2D<float4> u_diffuse : register(t0, VRHI_STAGE_SPACE);
 SamplerState u_diffuseSampler : register(s0, VRHI_STAGE_SPACE);
 cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
 {
+    float4 u_sky;           // sky backdrop flag (x); 0,0,0,0 when absent
     float4 u_materialConst; // rgbGen const tint (rgb), alphaGen const (a); 1,1,1,1 when absent
     float4 u_alphaTest;     // stage alphaFunc mode: 0 off, 1 GE128, 2 GT0, 3 LT128; 0 when absent
     float4 u_tcModScale;    // static tcMod scale (s, t); 1,1,0,0 when absent (identity UVs)
@@ -1560,6 +1569,46 @@ float4 main(PSInput input) : SV_Target
     // statements; lightmap UVs, vertex colour, and blend state are never
     // modified.
     float2 uv = input.diffuse;
+    // Bounded sky backdrop: direction-projected box UVs matching GL1's
+    // AddSkyPolygon face selection and vec_to_st mapping (evaluated
+    // per-pixel, so faces never pop), applied before every tcMod. The
+    // view-relative direction selects the dominant-axis face; s,t are the
+    // signed ratios over the dominant component, mapped to [0,1] with
+    // GL1's t flip. Cloud density follows the absolute box mapping (an
+    // approximation of GL1's clipped-region mapping) composed with the
+    // stage's own tcMod scroll/scale below.
+    if (u_sky.x > 0.5) {
+        const float3 skyDir = input.worldPos - u_viewOrigin.xyz;
+        const float skyAx = abs(skyDir.x);
+        const float skyAy = abs(skyDir.y);
+        const float skyAz = abs(skyDir.z);
+        float skyS;
+        float skyT;
+        if (skyAx > skyAy && skyAx > skyAz) {
+            if (skyDir.x < 0.0) {
+                skyS = skyDir.y / -skyDir.x;
+                skyT = skyDir.z / -skyDir.x;
+            } else {
+                skyS = -skyDir.y / skyDir.x;
+                skyT = skyDir.z / skyDir.x;
+            }
+        } else if (skyAy > skyAz && skyAy > skyAx) {
+            if (skyDir.y < 0.0) {
+                skyS = -skyDir.x / -skyDir.y;
+                skyT = skyDir.z / -skyDir.y;
+            } else {
+                skyS = skyDir.x / skyDir.y;
+                skyT = skyDir.z / skyDir.y;
+            }
+        } else if (skyDir.z < 0.0) {
+            skyS = -skyDir.y / -skyDir.z;
+            skyT = skyDir.x / -skyDir.z;
+        } else {
+            skyS = -skyDir.y / skyDir.z;
+            skyT = -skyDir.x / skyDir.z;
+        }
+        uv = float2(skyS * 0.5 + 0.5, (1.0 - skyT) * 0.5);
+    }
     // Bounded `tcGen environment`: per-pixel reflection coordinates matching
     // GL1's RB_CalcEnvironmentTexCoords (reflection of the view vector about
     // the interpolated surface normal), applied before every tcMod. Other
@@ -1642,6 +1691,7 @@ Texture2DArray<float4> u_lightmap : register(t1, VRHI_STAGE_SPACE);
 SamplerState u_lightmapSampler : register(s1, VRHI_STAGE_SPACE);
 cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
 {
+    float4 u_sky;           // sky backdrop flag (x); 0,0,0,0 when absent
     float4 u_materialConst; // rgbGen const tint (rgb), alphaGen const (a); 1,1,1,1 when absent
     float4 u_alphaTest;     // stage alphaFunc mode: 0 off, 1 GE128, 2 GT0, 3 LT128; 0 when absent
     float4 u_tcModScale;    // static tcMod scale (s, t); 1,1,0,0 when absent (identity UVs)
@@ -1756,6 +1806,46 @@ float4 main(PSInput input) : SV_Target
     // lightmap UVs, vertex colour, lightmaps, and blend state are never
     // modified.
     float2 uv = input.diffuse;
+    // Bounded sky backdrop: direction-projected box UVs matching GL1's
+    // AddSkyPolygon face selection and vec_to_st mapping (evaluated
+    // per-pixel, so faces never pop), applied before every tcMod. The
+    // view-relative direction selects the dominant-axis face; s,t are the
+    // signed ratios over the dominant component, mapped to [0,1] with
+    // GL1's t flip. Cloud density follows the absolute box mapping (an
+    // approximation of GL1's clipped-region mapping) composed with the
+    // stage's own tcMod scroll/scale below.
+    if (u_sky.x > 0.5) {
+        const float3 skyDir = input.worldPos - u_viewOrigin.xyz;
+        const float skyAx = abs(skyDir.x);
+        const float skyAy = abs(skyDir.y);
+        const float skyAz = abs(skyDir.z);
+        float skyS;
+        float skyT;
+        if (skyAx > skyAy && skyAx > skyAz) {
+            if (skyDir.x < 0.0) {
+                skyS = skyDir.y / -skyDir.x;
+                skyT = skyDir.z / -skyDir.x;
+            } else {
+                skyS = -skyDir.y / skyDir.x;
+                skyT = skyDir.z / skyDir.x;
+            }
+        } else if (skyAy > skyAz && skyAy > skyAx) {
+            if (skyDir.y < 0.0) {
+                skyS = -skyDir.x / -skyDir.y;
+                skyT = skyDir.z / -skyDir.y;
+            } else {
+                skyS = skyDir.x / skyDir.y;
+                skyT = skyDir.z / skyDir.y;
+            }
+        } else if (skyDir.z < 0.0) {
+            skyS = -skyDir.y / -skyDir.z;
+            skyT = skyDir.x / -skyDir.z;
+        } else {
+            skyS = -skyDir.y / skyDir.z;
+            skyT = -skyDir.x / skyDir.z;
+        }
+        uv = float2(skyS * 0.5 + 0.5, (1.0 - skyT) * 0.5);
+    }
     // Bounded `tcGen environment`: per-pixel reflection coordinates matching
     // GL1's RB_CalcEnvironmentTexCoords (reflection of the view vector about
     // the interpolated surface normal), applied before every tcMod. Other
@@ -3650,7 +3740,8 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 	float *animFpsValues = nullptr,
 	uint8_t *animFrameCounts = nullptr,
 	int (*animImageIndices)[VRHI_SHADER_MAX_ANIM_FRAMES] = nullptr,
-	uint8_t *tcGenEnvFlags = nullptr) {
+	uint8_t *tcGenEnvFlags = nullptr,
+	bool allowDirectImage = true) {
 	if (images == nullptr || blends == nullptr || stageCount == nullptr) return false;
 	*stageCount = 0;
 	for (size_t i = 0; i < VRHI_SHADER_MAX_STAGES; ++i) {
@@ -3728,6 +3819,13 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 	if (scriptStages != nullptr) {
 		stages = *scriptStages;
 		scriptResolved = true;
+	} else if (!allowDirectImage) {
+		// Sky backdrops without accepted script stages stay unresolved
+		// (black): a same-named direct image is never a sky stage in GL1
+		// (box-only skies render their outerbox, which this slice does not
+		// implement), so borrowing one would show wrong imagery.
+		VRHI_ReportUnresolvedMaterial(shaderName, "sky without accepted script stages");
+		return false;
 	} else if (VRHI_DecodeDirectImage(shaderName, VRHI_MAX_WORLD_DIFFUSE_DIMENSION,
 		VRHI_MAX_WORLD_DIFFUSE_BYTES, &directPath, &directDecoded)) {
 		VRHI_ShaderStage direct;
@@ -4429,7 +4527,7 @@ static void VRHI_LoadWorld(const char *name) {
 		if ((surface.surfaceType != MST_PLANAR && surface.surfaceType != MST_PATCH &&
 			surface.surfaceType != MST_TRIANGLE_SOUP) || surface.shaderNum < 0 ||
 			surface.shaderNum >= shaderCount || VRHI_IsPortalMaterial(shader.shader) ||
-			(shader.surfaceFlags & (SURF_SKY | SURF_NODRAW)) ||
+			(shader.surfaceFlags & SURF_NODRAW) ||
 			surface.firstVert < 0 || surface.numVerts < 3 || surface.firstVert > vertCount ||
 			surface.numVerts > vertCount - surface.firstVert ||
 			surface.numVerts > VRHI_MAX_WORLD_SURFACE_VERTICES) {
@@ -4499,7 +4597,8 @@ static void VRHI_LoadWorld(const char *name) {
 			stageTcModTurb, stageTcModTurbValue,
 			stageTcModStretchFunc, stageTcModStretchValue,
 			stageAnimFps, stageAnimFrames, stageAnimImage,
-			stageTcGenEnv);
+			stageTcGenEnv,
+			(shader.surfaceFlags & SURF_SKY) == 0);
 		diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 		if (surface.surfaceType == MST_PATCH) {
 			VRHI_PatchMesh patch;
@@ -4527,6 +4626,7 @@ static void VRHI_LoadWorld(const char *name) {
 			for (uint32_t index : patch.indexes) g_worldIndexes.push_back(baseVertex + index);
 			VRHI_WorldBatch batch;
 			VRHI_ResolveBatchDeform(shader, &batch);
+			batch.sky = (shader.surfaceFlags & SURF_SKY) != 0;
 			batch.firstIndex = firstIndex;
 			batch.indexCount = static_cast<uint32_t>(patch.indexes.size());
 			batch.diffuseImage = diffuseImage;
@@ -4664,6 +4764,7 @@ static void VRHI_LoadWorld(const char *name) {
 		if (surfaceTriangles > 0) {
 			VRHI_WorldBatch batch;
 			VRHI_ResolveBatchDeform(shader, &batch);
+			batch.sky = (shader.surfaceFlags & SURF_SKY) != 0;
 			batch.firstIndex = surfaceFirstIndex;
 			batch.indexCount = static_cast<uint32_t>(g_worldIndexes.size()) - surfaceFirstIndex;
 			batch.diffuseImage = diffuseImage;
@@ -4757,7 +4858,7 @@ static void VRHI_LoadWorld(const char *name) {
 			if ((surface.surfaceType != MST_PLANAR && surface.surfaceType != MST_PATCH &&
 				surface.surfaceType != MST_TRIANGLE_SOUP) || surface.shaderNum < 0 ||
 				surface.shaderNum >= shaderCount || VRHI_IsPortalMaterial(shader.shader) ||
-				(shader.surfaceFlags & (SURF_SKY | SURF_NODRAW)) ||
+				(shader.surfaceFlags & SURF_NODRAW) ||
 				surface.firstVert < 0 || surface.numVerts < 3 || surface.firstVert > vertCount ||
 				surface.numVerts > vertCount - surface.firstVert ||
 				surface.numVerts > VRHI_MAX_WORLD_SURFACE_VERTICES) {
@@ -4834,7 +4935,8 @@ static void VRHI_LoadWorld(const char *name) {
 				stageTcModTurb, stageTcModTurbValue,
 				stageTcModStretchFunc, stageTcModStretchValue,
 				stageAnimFps, stageAnimFrames, stageAnimImage,
-				stageTcGenEnv);
+				stageTcGenEnv,
+				(shader.surfaceFlags & SURF_SKY) == 0);
 			const int diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 			VRHI_InlineBSPModel surfaceModel;
 			if (!VRHI_BuildInlineSurface(vertsData, vertCount, indexesData, indexCount,
@@ -4847,6 +4949,7 @@ static void VRHI_LoadWorld(const char *name) {
 			// are retained for consistency and the existing single-stage inline
 			// rendering scope is unchanged.
 			for (VRHI_WorldBatch &batch : surfaceModel.batches) {
+				batch.sky = (shader.surfaceFlags & SURF_SKY) != 0;
 				VRHI_ResolveBatchDeform(shader, &batch);
 				batch.stageCount = static_cast<uint8_t>(stageCount);
 				batch.surfaceTranslucent = (shader.contentFlags & CONTENTS_TRANSLUCENT) != 0;
@@ -5251,7 +5354,7 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	uint8_t tcModStretchFunc = VRHI_SHADER_WAVE_NONE,
 	const float *tcModStretchValue = nullptr,
 	float animFps = 0.0f, uint8_t animFrames = 0,
-	const int *animImages = nullptr, bool tcGenEnv = false) {
+	const int *animImages = nullptr, bool tcGenEnv = false, bool sky = false) {
 	if (indexCount == 0 || firstIndex > UINT32_MAX || indexCount > UINT32_MAX ||
 		g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) return false;
 	VRHI_SceneDraw draw;
@@ -5302,6 +5405,7 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 		draw.tcModStretchValue[3] = tcModStretchValue[3];
 	}
 	draw.tcGenEnv = tcGenEnv;
+	draw.sky = sky;
 	draw.animFps = animFps;
 	draw.animFrames = animFrames;
 	if (animImages != nullptr) {
@@ -5824,7 +5928,7 @@ static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4
 				batch.stageTcModTurb[0] != 0, batch.stageTcModTurbValue[0],
 				batch.stageTcModStretchFunc[0], batch.stageTcModStretchValue[0],
 				batch.stageAnimFps[0], batch.stageAnimFrames[0], batch.stageAnimImage[0],
-				batch.stageTcGenEnv[0] != 0)) {
+				batch.stageTcGenEnv[0] != 0, batch.sky)) {
 				g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
 				g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
 				continue;
@@ -6367,6 +6471,7 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		VRHI_RefreshWorldVertices(frameTimeSeconds);
 	}
 	std::vector<size_t> opaqueBatches;
+	std::vector<size_t> skyBatches;
 	std::vector<VRHI_TranslucentDrawOrder> translucentDraws;
 	opaqueBatches.reserve(g_worldBatches.size());
 	translucentDraws.reserve(g_worldBatches.size());
@@ -6396,7 +6501,12 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		const int count = batch.stageCount > VRHI_SHADER_MAX_STAGES ? 0 : batch.stageCount;
 		const bool blendedBase = count > 0 &&
 			batch.stageBlend[0] != VRHI_SHADER_BLEND_OPAQUE;
-		if (blendedBase || batch.translucent)
+		// Sky backdrops submit before every other world pass (no depth
+		// writes, so later geometry always overwrites them), each with all
+		// of its material stages. Anything else sorts as before.
+		if (batch.sky)
+			skyBatches.push_back(batchIndex);
+		else if (blendedBase || batch.translucent)
 			translucentDraws.push_back({ batchDistanceSquared(batchIndex), batchIndex, 0, false });
 		else
 			opaqueBatches.push_back(batchIndex);
@@ -6418,6 +6528,10 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		// path rather than dropping the whole BSP batch.
 		const int count = baseImageValid && g_worldDiffusePixelShader != VRHI_INVALID_HANDLE
 			? declaredCount : 0;
+		// A sky material without accepted stages stays a hole (black, as
+		// before sky backdrops); it must never fall through to the solid
+		// fallback below.
+		if (batch.sky && count == 0) return;
 		const int drawableCount = count > 0 ? count : 1;
 		if (drawStage >= static_cast<size_t>(drawableCount)) return;
 		const int stage = static_cast<int>(drawStage);
@@ -6448,6 +6562,12 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 			const bool useDiffuse = textured && g_worldDiffusePixelShader != VRHI_INVALID_HANDLE;
 			if (overlay && g_worldOverlayPixelShader == VRHI_INVALID_HANDLE) return;
 			g_worldState = worldBaseState;
+			// Sky draws never write depth (later geometry always overwrites
+			// them); they are submitted before every other world pass below.
+			if (batch.sky)
+				g_worldState.SetStateFlags(VRHI_STATE_WRITE_RGB | VRHI_STATE_WRITE_A |
+					VRHI_STATE_DEPTH_TEST_ENABLE | VRHI_STATE_DEPTH_TEST_LESS |
+					VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES);
 			if (overlay || blended || sortedTransparentBase) {
 				const uint64_t blend = blended
 					? VRHI_BlendStateForMode(batch.stageBlend[stage]) : 0;
@@ -6461,7 +6581,7 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 						VRHI_STATE_DEPTH_TEST_ENABLE |
 						(overlay ? VRHI_STATE_DEPTH_TEST_LEQUAL : VRHI_STATE_DEPTH_TEST_LESS) |
 						VRHI_STATE_CULL_NONE | VRHI_STATE_PT_TRIANGLES | blend |
-						(batch.stageDepthWrite[stage] ? VRHI_STATE_WRITE_Z : 0));
+						(batch.stageDepthWrite[stage] && !batch.sky ? VRHI_STATE_WRITE_Z : 0));
 			} else {
 				g_worldState.SetProgram(useDiffuse ? g_worldDiffuseProgram :
 					(useLightmap ? g_worldLightmapProgram : g_worldSolidProgram));
@@ -6594,6 +6714,12 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 				g_worldState.SetUniform(13, { "u_tcGenEnv", { tcGenEnv } });
 				const glm::vec4 viewOrigin(vieworg.x, vieworg.y, vieworg.z, 0.0f);
 				g_worldState.SetUniform(14, { "u_viewOrigin", { viewOrigin } });
+				// Bounded sky backdrop flag for this stage: the textured
+				// material pixel shaders replace the diffuse UVs with
+				// direction-projected box coordinates when set. Always
+				// written so no stale sky state persists.
+				const glm::vec4 skyFlag(batch.sky ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+				g_worldState.SetUniform(15, { "u_sky", { skyFlag } });
 				// Bounded stage-local rgbGen wave generator for this stage plus
 				// the shared per-frame render time in seconds: the textured
 				// material pixel shaders modulate the material sample RGB by
@@ -6654,6 +6780,9 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 				batch.firstIndex, stage);
 		}
 	};
+	for (size_t skyBatch : skyBatches)
+		for (int skyStage = 0; skyStage <= VRHI_SHADER_MAX_STAGES; ++skyStage)
+			drawWorldBatch(skyBatch, static_cast<size_t>(skyStage));
 	for (size_t batchIndex : opaqueBatches) drawWorldBatch(batchIndex, 0);
 	// Resolve the opaque scene before drawing world transparency. Otherwise a
 	// model behind glass writes its opaque color over an already blended pane.
@@ -6846,6 +6975,11 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 				g_worldState.SetUniform(13, { "u_tcGenEnv", { tcGenEnv } });
 				const glm::vec4 viewOrigin(vieworg.x, vieworg.y, vieworg.z, 0.0f);
 				g_worldState.SetUniform(14, { "u_viewOrigin", { viewOrigin } });
+				// Scene sky flag carried on the draw (set for inline-model
+				// sky surfaces, clear otherwise); always written so no
+				// stale world sky state persists.
+				const glm::vec4 skyFlag(draw.sky ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+				g_worldState.SetUniform(15, { "u_sky", { skyFlag } });
 				// Bounded rgbGen wave generator carried on the scene draw plus
 				// the shared per-frame render time in seconds: the textured
 				// material pixel shader modulates the material sample RGB by
