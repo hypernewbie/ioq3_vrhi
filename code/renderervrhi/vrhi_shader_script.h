@@ -1035,6 +1035,15 @@ inline bool VRHI_ParseSimpleShaderBlock(
 				j += consumed;
 				continue;
 			}
+			if (keyword == "depthfunc" && j + 1 < stageEnd &&
+				VRHI_ShaderTokenIs(tokens[j + 1], "equal")) {
+				// Quake3 lightmap/overlay stages frequently use depthFunc
+				// equal. A skipped $lightmap stage must not reject the entire
+				// material (including an earlier alpha-tested texture). Active
+				// overlays currently use the adapter's LEQUAL fallback.
+				j += 2;
+				continue;
+			}
 			if (keyword == "depthwrite") {
 				// Bounded per-stage depthWrite: the bare keyword sets the
 				// stage-local depth-write flag carried into the draw state. It
@@ -1223,6 +1232,21 @@ inline bool VRHI_ParseShaderScriptStages(
 			results->emplace(shaderName, std::move(stages));
 	}
 	return true;
+}
+
+// A registered shader name takes its accepted script stages before a
+// same-named direct image. The image is only a fallback when the name has no
+// accepted stages. Keep this lookup shared and dependency-free so the world's
+// and scene's source selection use the same bounded, case-insensitive key.
+inline const std::vector<VRHI_ShaderStage> *VRHI_FindShaderScriptStages(
+	const char *shaderName,
+	const std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > &parsed) {
+	if (shaderName == nullptr) return nullptr;
+	std::size_t length = 0;
+	while (length < VRHI_SCRIPT_MAX_QPATH && shaderName[length] != '\0') ++length;
+	if (length == 0 || length >= VRHI_SCRIPT_MAX_QPATH) return nullptr;
+	const auto found = parsed.find(VRHI_ShaderLowerASCII(std::string(shaderName, length)));
+	return found != parsed.end() && !found->second.empty() ? &found->second : nullptr;
 }
 
 #endif // __VRHI_SHADER_SCRIPT_H

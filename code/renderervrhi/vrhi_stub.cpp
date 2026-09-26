@@ -326,6 +326,9 @@ struct VRHI_UITexture {
 };
 struct VRHI_SceneShaderMaterial {
 	int diffuseImage = -1;
+	// Cache the chosen source as well as its texture. A cached direct-image
+	// fallback must retain implicit image-alpha blending on later frames.
+	bool scriptResolved = false;
 	uint8_t blendMode = VRHI_SHADER_BLEND_OPAQUE;
 	// Base-stage bounded static const generators; flags 0 mean identity tint.
 	uint8_t rgbConst = 0;
@@ -3363,25 +3366,23 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 	std::string directPath;
 	vrhi_image::DecodeResult directDecoded;
 	bool scriptResolved = false;
-	if (VRHI_DecodeDirectImage(shaderName, VRHI_MAX_WORLD_DIFFUSE_DIMENSION,
+	// A Quake shader definition overrides a same-named image. Probe the
+	// already-scanned, bounded stage table first: otherwise materials such as
+	// beam.jpg silently lose their additive blend and scroll, while alpha-cutout
+	// surfaces lose alphaFunc. No file I/O is introduced in the draw loop.
+	const std::vector<VRHI_ShaderStage> *scriptStages = g_worldShaderScriptsScanned
+		? VRHI_FindShaderScriptStages(shaderName, g_worldShaderScriptStages) : nullptr;
+	if (scriptStages != nullptr) {
+		stages = *scriptStages;
+		scriptResolved = true;
+	} else if (VRHI_DecodeDirectImage(shaderName, VRHI_MAX_WORLD_DIFFUSE_DIMENSION,
 		VRHI_MAX_WORLD_DIFFUSE_BYTES, &directPath, &directDecoded)) {
 		VRHI_ShaderStage direct;
 		direct.path = directPath;
 		stages.push_back(std::move(direct));
 	} else {
-		std::string key;
-		if (shaderName != nullptr) {
-			size_t length = 0;
-			while (length < MAX_QPATH && shaderName[length] != '\0') ++length;
-			if (length > 0 && length < MAX_QPATH) key = VRHI_LowerASCII(std::string(shaderName, length));
-		}
-		const auto found = g_worldShaderScriptStages.find(key);
-		if (!g_worldShaderScriptsScanned || found == g_worldShaderScriptStages.end() || found->second.empty()) {
-			VRHI_ReportUnresolvedMaterial(shaderName, "no direct image or accepted script stages");
-			return false;
-		}
-		stages = found->second;
-		scriptResolved = true;
+		VRHI_ReportUnresolvedMaterial(shaderName, "no accepted script stages or direct image");
+		return false;
 	}
 	for (size_t i = 0; i < stages.size() && i < VRHI_SHADER_MAX_STAGES; ++i) {
 		vrhi_image::DecodeResult decoded;
@@ -4810,10 +4811,13 @@ static void VRHI_RefreshSceneShaderScripts(void) {
 static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 	if (draw == nullptr) return VRHI_INVALID_HANDLE;
 	const auto applyMaterial = [&](uint8_t blendMode, bool hasTransparency) {
-		if (draw->blendMode == VRHI_SHADER_BLEND_OPAQUE && hasTransparency)
-			draw->blendMode = VRHI_SHADER_BLEND_ALPHA;
-		else if (blendMode != VRHI_SHADER_BLEND_OPAQUE)
+		// Script blendFunc wins over decoded texture alpha. Alpha-tested stages
+		// cut holes and keep opaque depth writing; do not blend the whole quad.
+		if (blendMode != VRHI_SHADER_BLEND_OPAQUE)
 			draw->blendMode = blendMode;
+		else if (draw->blendMode == VRHI_SHADER_BLEND_OPAQUE && hasTransparency &&
+			draw->alphaFunc == VRHI_SHADER_ALPHAFUNC_OFF)
+			draw->blendMode = VRHI_SHADER_BLEND_ALPHA;
 		if (draw->blendMode != VRHI_SHADER_BLEND_OPAQUE) draw->translucent = true;
 	};
 	if (draw->diffuseImage >= 0 && static_cast<size_t>(draw->diffuseImage) < g_worldDiffuseImages.size()) {
@@ -4824,24 +4828,39 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 	}
 	const std::unordered_map<qhandle_t, size_t>::const_iterator uiFound =
 		g_uiTextureByHandle.find(draw->shader);
-	if (uiFound != g_uiTextureByHandle.end() && uiFound->second < g_uiTextures.size()) {
-		const VRHI_UITexture &image = g_uiTextures[uiFound->second];
-		applyMaterial(draw->blendMode, image.hasTransparency);
-		return image.texture;
-	}
-	if (draw->shader == 0 || !g_worldShaderScriptsScanned) return VRHI_INVALID_HANDLE;
-	VRHI_SceneShaderMaterial material;
+	const bool hasUITexture = uiFound != g_uiTextureByHandle.end() &&
+		uiFound->second < g_uiTextures.size();
 	const auto cached = g_sceneShaderDiffuseByHandle.find(draw->shader);
-	if (cached != g_sceneShaderDiffuseByHandle.end()) {
-		material = cached->second;
-	} else {
-		std::string shaderName;
+	std::string shaderName;
+	if (cached == g_sceneShaderDiffuseByHandle.end() && draw->shader != 0 &&
+		g_worldShaderScriptsScanned) {
 		for (const auto &entry : g_shaderHandles) {
 			if (entry.second == draw->shader) {
 				shaderName = entry.first;
 				break;
 			}
 		}
+	}
+	// UI image registration is independent of scene material registration.
+	// An MD3/effect shader with a same-named image must still use its accepted
+	// shader stages. Actual 2D UI draws never pass through VRHI_SceneTexture.
+	// Once the material is cached, its source was already chosen; avoid
+	// scanning shader handles again for every draw of the same effect.
+	const bool hasScript = cached != g_sceneShaderDiffuseByHandle.end()
+		? cached->second.scriptResolved
+		: (g_worldShaderScriptsScanned &&
+			VRHI_FindShaderScriptStages(shaderName.c_str(), g_worldShaderScriptStages) != nullptr);
+	if (hasUITexture && !hasScript) {
+		const VRHI_UITexture &image = g_uiTextures[uiFound->second];
+		applyMaterial(draw->blendMode, image.hasTransparency);
+		return image.texture;
+	}
+	if (draw->shader == 0 || !g_worldShaderScriptsScanned) return VRHI_INVALID_HANDLE;
+	VRHI_SceneShaderMaterial material;
+	if (cached != g_sceneShaderDiffuseByHandle.end()) {
+		material = cached->second;
+	} else {
+		material.scriptResolved = hasScript;
 		int images[VRHI_SHADER_MAX_STAGES];
 		uint8_t blends[VRHI_SHADER_MAX_STAGES];
 		int stageCount = 0;
@@ -4918,11 +4937,25 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 		if (material.diffuseImage >= 0) VRHI_UploadWorldDiffuse();
 	}
 	if (material.diffuseImage < 0 ||
-		static_cast<size_t>(material.diffuseImage) >= g_worldDiffuseImages.size())
+		static_cast<size_t>(material.diffuseImage) >= g_worldDiffuseImages.size() ||
+		g_worldDiffuseImages[static_cast<size_t>(material.diffuseImage)].texture ==
+			VRHI_INVALID_HANDLE) {
+		// If a script's stage image cannot be loaded, retain the existing
+		// registered direct image without claiming the script's semantics.
+		if (hasUITexture) {
+			const VRHI_UITexture &uiImage = g_uiTextures[uiFound->second];
+			applyMaterial(draw->blendMode, uiImage.hasTransparency);
+			return uiImage.texture;
+		}
 		return VRHI_INVALID_HANDLE;
+	}
 	const VRHI_WorldDiffuseImage &image =
 		g_worldDiffuseImages[static_cast<size_t>(material.diffuseImage)];
-	applyMaterial(material.blendMode, image.hasTransparency);
+	draw->alphaFunc = material.alphaFunc;
+	// A parsed opaque script without alphaFunc is still opaque in GL1 even
+	// when its image has an alpha channel. Implicit blending applies only to
+	// direct-image fallbacks used by sprites and other unscripted scene draws.
+	applyMaterial(material.blendMode, !hasScript && image.hasTransparency);
 	draw->rgbConst = material.rgbConst;
 	draw->rgbConstColor[0] = material.rgbConstColor[0];
 	draw->rgbConstColor[1] = material.rgbConstColor[1];
@@ -4930,7 +4963,6 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 	draw->alphaConst = material.alphaConst;
 	draw->alphaConstValue = material.alphaConstValue;
 	draw->depthWrite = material.depthWrite != 0;
-	draw->alphaFunc = material.alphaFunc;
 	draw->clampMap = material.clampMap != 0;
 	draw->tcModScale = material.tcModScale != 0;
 	draw->tcModScaleValue[0] = material.tcModScaleValue[0];

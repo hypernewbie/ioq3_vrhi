@@ -465,6 +465,86 @@ void testSimpleMultiStageExtraction() {
 	CHECK_EQ_INT(rejected.size(), 0u);
 }
 
+void testScriptStagesOverrideDirectImages() {
+	// These OpenArena-style shaders also have same-named JPG/TGA images. The
+	// accepted script must win when the adapter selects a world/scene source.
+	const std::string text =
+		"textures/sfx/beam { surfaceparm trans { map textures/sfx/beam.jpg "
+		"tcMod Scroll .3 0 blendFunc GL_ONE GL_ONE } }\n"
+		"textures/acc_dm3/wires2 { surfaceparm trans { map "
+		"textures/acc_dm3/wires2.tga alphaFunc GE128 depthWrite } "
+		"{ map $lightmap rgbGen identity blendFunc filter depthFunc equal } }\n"
+		"textures/flares/lava { { clampMap textures/flares/lava.tga "
+		"blendFunc add rgbGen Vertex tcMod rotate 12 } "
+		"{ clampMap textures/flares/lava.tga blendFunc add tcMod rotate -5 } }\n"
+		"textures/unsupported { { map textures/unsupported.tga } "
+		"{ map textures/2.tga } { map textures/3.tga } "
+		"{ map textures/4.tga } { map textures/5.tga } }\n";
+	std::unordered_map<std::string, bool> wanted;
+	for (const char *name : { "textures/sfx/beam", "textures/acc_dm3/wires2",
+		"textures/flares/lava", "textures/unsupported" }) wanted.emplace(name, true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > parsed;
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(text), text.size(), wanted, &parsed));
+	CHECK_EQ_INT(parsed.size(), 3u);
+	const auto *beam = VRHI_FindShaderScriptStages("TEXTURES/SFX/BEAM", parsed);
+	CHECK(beam != nullptr);
+	if (beam != nullptr) {
+		CHECK_EQ_INT(beam->size(), 1u);
+		CHECK_EQ_STR((*beam)[0].path, "textures/sfx/beam.jpg");
+		CHECK_EQ_INT((*beam)[0].blendMode, VRHI_SHADER_BLEND_ADDITIVE);
+		CHECK((*beam)[0].tcModScroll);
+	}
+	const auto *wires = VRHI_FindShaderScriptStages("textures/acc_dm3/wires2", parsed);
+	CHECK(wires != nullptr);
+	if (wires != nullptr) {
+		CHECK_EQ_INT(wires->size(), 1u);
+		CHECK_EQ_INT((*wires)[0].blendMode, VRHI_SHADER_BLEND_OPAQUE);
+		CHECK_EQ_INT((*wires)[0].alphaFunc, VRHI_SHADER_ALPHAFUNC_GE128);
+		CHECK((*wires)[0].depthWrite);
+	}
+	const auto *flare = VRHI_FindShaderScriptStages("textures/flares/lava", parsed);
+	CHECK(flare != nullptr);
+	if (flare != nullptr) {
+		CHECK_EQ_INT(flare->size(), 2u);
+		CHECK_EQ_INT((*flare)[0].blendMode, VRHI_SHADER_BLEND_ADDITIVE);
+		CHECK((*flare)[0].clampMap);
+		CHECK_EQ_INT((*flare)[1].blendMode, VRHI_SHADER_BLEND_ADDITIVE);
+	}
+	// An absent or rejected script leaves direct-image fallback available.
+	CHECK(VRHI_FindShaderScriptStages("textures/unsupported", parsed) == nullptr);
+	CHECK(VRHI_FindShaderScriptStages("textures/directonly", parsed) == nullptr);
+	CHECK(VRHI_FindShaderScriptStages("", parsed) == nullptr);
+	CHECK(VRHI_FindShaderScriptStages(nullptr, parsed) == nullptr);
+	std::string tooLong(VRHI_SCRIPT_MAX_QPATH, 'x');
+	CHECK(VRHI_FindShaderScriptStages(tooLong.c_str(), parsed) == nullptr);
+	// The simple stage parser accepts GL1's depthFunc equal on an active
+	// overlay and in a skipped $lightmap stage, without relaxing the strict
+	// opaque-only first-stage parser or reading past a stage boundary.
+	const std::string equalOverlay = script(
+		"{ map textures/base.tga } { map textures/overlay.tga "
+		"blendFunc blend depthFunc equal }");
+	std::unordered_map<std::string, bool> overlayWanted;
+	overlayWanted.emplace("textures/foo/bar", true);
+	parsed.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(equalOverlay),
+		equalOverlay.size(), overlayWanted, &parsed));
+	CHECK_EQ_INT(parsed["textures/foo/bar"].size(), 2u);
+	std::unordered_map<std::string, std::string> opaqueOnly;
+	CHECK(VRHI_ParseShaderScript(asBytes(equalOverlay), equalOverlay.size(),
+		overlayWanted, &opaqueOnly));
+	CHECK(opaqueOnly.empty());
+	const std::string badEqual = script("{ map textures/base.tga depthFunc never }");
+	parsed.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(badEqual), badEqual.size(),
+		overlayWanted, &parsed));
+	CHECK(parsed.empty());
+	const std::string missingEqual = script("{ map textures/base.tga depthFunc }");
+	parsed.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(missingEqual), missingEqual.size(),
+		overlayWanted, &parsed));
+	CHECK(parsed.empty());
+}
+
 void testBlockLevelBoundaries() {
 	// Direct block-level checks: the allowlist validator never reads past the
 	// stage, so a truncated statement at stage end rejects instead of
@@ -2153,6 +2233,7 @@ int main() {
 	testWantedFilteringAndNames();
 	testBlockLevelBoundaries();
 	testSimpleMultiStageExtraction();
+	testScriptStagesOverrideDirectImages();
 	testConstGenerators();
 	testStageDepthWrite();
 	testStageAlphaFunc();
