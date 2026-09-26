@@ -181,6 +181,14 @@ struct VRHI_SceneDraw {
 	// exactly as before.
 	bool tcModRotate = false;
 	float tcModRotateDegreesPerSecond = 0.0f;
+	// Bounded per-draw `tcMod turb`/`stretch` carried from the base stage.
+	// Turb values are base/amplitude/phase/frequency; stretch values are
+	// base/amplitude/phase/frequency with a separate wave func id (NONE keeps
+	// identity UVs). Only the diffuse material sample is affected.
+	bool tcModTurb = false;
+	float tcModTurbValue[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	uint8_t tcModStretchFunc = VRHI_SHADER_WAVE_NONE;
+	float tcModStretchValue[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 	// Bounded per-draw wave generators (`rgbGen wave` / `alphaGen wave`)
 	// carried from the base stage's script statement. The textured material
 	// pixel shaders modulate the material sample RGB/alpha by the clamped
@@ -288,6 +296,21 @@ struct VRHI_WorldBatch {
 	uint8_t stageTcModRotate[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 	float stageTcModRotateDegreesPerSecond[VRHI_SHADER_MAX_STAGES] = {
 		0.0f, 0.0f, 0.0f, 0.0f };
+	// Per-stage bounded `tcMod turb` (base/amplitude/phase/frequency) and
+	// `tcMod stretch` (wave func + base/amplitude/phase/frequency) carried
+	// from the parsed stage data to the pixel-shader UV perturbation. Turb
+	// flag 0 and stretch func NONE mean identity UVs, preserving the existing
+	// sampling; only the diffuse material sample is affected, never lightmaps,
+	// vertex colour, or UI. Values are stored in script parameter order.
+	uint8_t stageTcModTurb[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+	float stageTcModTurbValue[VRHI_SHADER_MAX_STAGES][4] = {
+		{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
+		{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
+	uint8_t stageTcModStretchFunc[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_WAVE_NONE,
+		VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE };
+	float stageTcModStretchValue[VRHI_SHADER_MAX_STAGES][4] = {
+		{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
+		{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
 	// Per-stage bounded wave generators (`rgbGen wave`/`alphaGen wave`)
 	// carried from the parsed stage data to the pixel-shader material
 	// modulation. Func id 0 (VRHI_SHADER_WAVE_NONE) means no generator
@@ -370,6 +393,13 @@ struct VRHI_SceneShaderMaterial {
 	// rotate statement.
 	uint8_t tcModRotate = 0;
 	float tcModRotateDegreesPerSecond = 0.0f;
+	// Base-stage bounded `tcMod turb`/`stretch`. Turb values are
+	// base/amplitude/phase/frequency; stretch adds a wave func id (NONE keeps
+	// identity UVs). Only the diffuse material sample is affected.
+	uint8_t tcModTurb = 0;
+	float tcModTurbValue[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	uint8_t tcModStretchFunc = VRHI_SHADER_WAVE_NONE;
+	float tcModStretchValue[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 	// Base-stage bounded wave generators (`rgbGen wave`/`alphaGen wave` in
 	// the base stage's script statement). The textured scene program
 	// modulates the material sample RGB/alpha by the clamped GL1
@@ -1294,6 +1324,7 @@ struct VSOutput {
     float2 lightmap : TEXCOORD1;
     float lightmapLayer : TEXCOORD2;
     float4 color : TEXCOORD3;
+    float3 worldPos : TEXCOORD4;
 };
 [shader("vertex")]
 VSOutput main(float3 position : POSITION, float2 diffuse : TEXCOORD0,
@@ -1302,6 +1333,7 @@ VSOutput main(float3 position : POSITION, float2 diffuse : TEXCOORD0,
 {
     VSOutput output;
     output.position = mul(u_worldViewProj, float4(position, 1.0));
+    output.worldPos = position;
     output.diffuse = diffuse;
     output.lightmap = lightmap;
     output.lightmapLayer = lightmapLayer;
@@ -1360,8 +1392,19 @@ cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
     float4 u_rgbWaveTime;   // rgbGen wave: phase (x), frame time in seconds (y); 0,0,0,0 when absent
     float4 u_alphaWave;     // alphaGen wave: func id (x), base (y), amplitude (z), frequency (w); 0,0,0,0 when absent
     float4 u_alphaWaveTime; // alphaGen wave: phase (x), frame time in seconds (y); 0,0,0,0 when absent
+    float4 u_tcModTurb;     // tcMod turb: base (x, ignored like GL1), amplitude (y), frequency (z); 0,0,0,0 when absent
+    float4 u_tcModTurbTime; // tcMod turb: phase (x), frame time in seconds (y); 0,0,0,0 when absent
+    float4 u_tcModStretch;  // tcMod stretch: func id (x), base (y), amplitude (z), frequency (w); 0,0,0,0 when absent
+    float4 u_tcModStretchTime; // tcMod stretch: phase (x), frame time in seconds (y); 0,0,0,0 when absent
 };
-struct PSInput { float4 position : SV_Position; float2 diffuse : TEXCOORD0; float2 lightmap : TEXCOORD1; float lightmapLayer : TEXCOORD2; float4 color : TEXCOORD3; };
+struct PSInput {
+    float4 position : SV_Position;
+    float2 diffuse : TEXCOORD0;
+    float2 lightmap : TEXCOORD1;
+    float lightmapLayer : TEXCOORD2;
+    float4 color : TEXCOORD3;
+    float3 worldPos : TEXCOORD4;
+};
 // Evaluates one bounded Quake3 wave generator exactly like the GL1 renderer's
 // EvalWaveForm/WAVEVALUE (tr_shade_calc.c): the table index is
 // ((int64)((phase + shaderTime * freq) * FUNCTABLE_SIZE)) & FUNCTABLE_MASK,
@@ -1396,20 +1439,79 @@ float VRHI_EvalWave(float func, float4 wave, float4 waveTime)
         value = 1.0 - fraction;
     return clamp(wave.y + value * wave.z, 0.0, 1.0);
 }
+// Samples the GL1 sine table at a fractional cycle count, matching tr_init.c
+// (DEG2RAD(i*360/1023)) with the truncation-toward-zero index wrap used by
+// RB_CalcTurbulentTexCoords. Used by tcMod turb below.
+float VRHI_TurbTable(float cycles)
+{
+    const float scaled = cycles * 1024.0;
+    const float truncated = scaled >= 0.0 ? floor(scaled) : ceil(scaled);
+    const float wrapped = truncated - 1024.0 * floor(truncated / 1024.0);
+    const float fraction = wrapped / 1024.0;
+    return sin(6.283185307179586 * fraction * (1024.0 / 1023.0));
+}
+// Unclamped waveform value for tcMod stretch (the caller applies the inverse
+// with a near-zero guard). Same tables and wrap as VRHI_EvalWave; func 0
+// (VRHI_SHADER_WAVE_NONE) returns 1, the identity scale. wave = (func, base,
+// amplitude, frequency); waveTime = (phase, frameTimeSeconds, 0, 0).
+float VRHI_EvalWaveUnclamped(float func, float4 wave, float4 waveTime)
+{
+    if (func < 0.5) return 1.0;
+    const float scaled = (waveTime.x + waveTime.y * wave.w) * 1024.0;
+    const float truncated = scaled >= 0.0 ? floor(scaled) : ceil(scaled);
+    const float wrapped = truncated - 1024.0 * floor(truncated / 1024.0);
+    const float fraction = wrapped / 1024.0;
+    float value = 0.0;
+    if (func < 1.5)
+        value = sin(6.283185307179586 * fraction * (1024.0 / 1023.0));
+    else if (func < 2.5)
+        value = fraction < 0.5 ? 1.0 : -1.0;
+    else if (func < 3.5)
+        value = 4.0 * abs(frac(fraction + 0.75) - 0.5) - 1.0;
+    else if (func < 4.5)
+        value = fraction;
+    else
+        value = 1.0 - fraction;
+    return wave.y + value * wave.z;
+}
 [shader("pixel")]
 float4 main(PSInput input) : SV_Target
 {
-    // Bounded fixed-order tcMod composition (static scale, then rotate
-    // about the texture center, then time scroll): only the diffuse
-    // (material) UVs are affected. The UVs are scaled by (s, t), rotated
-    // around (0.5, 0.5) by -rate * frameTimeSeconds degrees exactly like
-    // the GL1 renderer's RB_CalcRotateTexCoords, then scrolled by
-    // rate * frameTimeSeconds wrapped into [0,1) exactly like the GL1
-    // RB_CalcScrollTexCoords, so the coordinates never grow without bound.
-    // Identity scale / zero rotation / zero scroll when the stage has no
+    // Bounded fixed-order tcMod composition (turb, then stretch about the
+    // texture center, then static scale, then rotate about the texture
+    // center, then time scroll): only the diffuse (material) UVs are
+    // affected. Turb offsets the UVs by the GL1 world-position sine-table
+    // terms (a per-pixel approximation of the per-vertex
+    // RB_CalcTurbulentTexCoords; the base parameter is ignored exactly like
+    // GL1), stretch scales about (0.5, 0.5) by the inverse unclamped
+    // waveform value (near-zero guarded to a bounded magnitude), then the
+    // UVs are scaled by (s, t), rotated around (0.5, 0.5) by
+    // -rate * frameTimeSeconds degrees exactly like the GL1 renderer's
+    // RB_CalcRotateTexCoords, then scrolled by rate * frameTimeSeconds
+    // wrapped into [0,1) exactly like the GL1 RB_CalcScrollTexCoords, so the
+    // coordinates never grow without bound. Identity when the stage has no
     // statements; lightmap UVs, vertex colour, and blend state are never
     // modified.
-    float2 uv = input.diffuse * u_tcModScale.xy;
+    float2 uv = input.diffuse;
+    // tcMod turb: GL1 adds sinTable[(((x+z)/128*0.125) + now)*1024] *
+    // amplitude to s and sinTable[((y/128*0.125) + now)*1024] * amplitude to
+    // t, where now = phase + time * frequency. Amplitude 0 (absent) is the
+    // identity no-op.
+    {
+        const float turbNow = u_tcModTurbTime.x + u_tcModTurbTime.y * u_tcModTurb.z;
+        uv.x += VRHI_TurbTable((input.worldPos.x + input.worldPos.z) * (1.0 / 128.0) * 0.125 + turbNow) * u_tcModTurb.y;
+        uv.y += VRHI_TurbTable(input.worldPos.y * (1.0 / 128.0) * 0.125 + turbNow) * u_tcModTurb.y;
+    }
+    // tcMod stretch: GL1 scales about (0.5, 0.5) by 1/EvalWaveForm(wf)
+    // (unclamped). The inverse is guarded so a near-zero wave yields a
+    // bounded magnitude instead of unbounded coordinates; func NONE (absent)
+    // evaluates to 1 (identity).
+    {
+        const float stretchW = VRHI_EvalWaveUnclamped(u_tcModStretch.x, u_tcModStretch, u_tcModStretchTime);
+        const float stretchP = abs(stretchW) < 0.05 ? (stretchW < 0.0 ? -20.0 : 20.0) : 1.0 / stretchW;
+        uv = (uv - 0.5) * stretchP + 0.5;
+    }
+    uv *= u_tcModScale.xy;
     // Rotate about (0.5, 0.5) by -rate * frameTimeSeconds degrees. The
     // angle is wrapped into [0,360) degrees first (like the GL1 sine-table
     // mask), so huge times cannot erode the sin/cos precision; a stage
@@ -1467,6 +1569,10 @@ cbuffer globalParams : register(b300, VRHI_STAGE_SPACE)
     float4 u_rgbWaveTime;   // rgbGen wave: phase (x), frame time in seconds (y); 0,0,0,0 when absent
     float4 u_alphaWave;     // alphaGen wave: func id (x), base (y), amplitude (z), frequency (w); 0,0,0,0 when absent
     float4 u_alphaWaveTime; // alphaGen wave: phase (x), frame time in seconds (y); 0,0,0,0 when absent
+    float4 u_tcModTurb;     // tcMod turb: base (x, ignored like GL1), amplitude (y), frequency (z); 0,0,0,0 when absent
+    float4 u_tcModTurbTime; // tcMod turb: phase (x), frame time in seconds (y); 0,0,0,0 when absent
+    float4 u_tcModStretch;  // tcMod stretch: func id (x), base (y), amplitude (z), frequency (w); 0,0,0,0 when absent
+    float4 u_tcModStretchTime; // tcMod stretch: phase (x), frame time in seconds (y); 0,0,0,0 when absent
 };
 struct PSInput {
     float4 position : SV_Position;
@@ -1474,6 +1580,7 @@ struct PSInput {
     float2 lightmap : TEXCOORD1;
     float lightmapLayer : TEXCOORD2;
     float4 color : TEXCOORD3;
+    float3 worldPos : TEXCOORD4;
 };
 // Evaluates one bounded Quake3 wave generator exactly like the GL1 renderer's
 // EvalWaveForm/WAVEVALUE (tr_shade_calc.c): the table index is
@@ -1509,21 +1616,80 @@ float VRHI_EvalWave(float func, float4 wave, float4 waveTime)
         value = 1.0 - fraction;
     return clamp(wave.y + value * wave.z, 0.0, 1.0);
 }
+// Samples the GL1 sine table at a fractional cycle count, matching tr_init.c
+// (DEG2RAD(i*360/1023)) with the truncation-toward-zero index wrap used by
+// RB_CalcTurbulentTexCoords. Used by tcMod turb below.
+float VRHI_TurbTable(float cycles)
+{
+    const float scaled = cycles * 1024.0;
+    const float truncated = scaled >= 0.0 ? floor(scaled) : ceil(scaled);
+    const float wrapped = truncated - 1024.0 * floor(truncated / 1024.0);
+    const float fraction = wrapped / 1024.0;
+    return sin(6.283185307179586 * fraction * (1024.0 / 1023.0));
+}
+// Unclamped waveform value for tcMod stretch (the caller applies the inverse
+// with a near-zero guard). Same tables and wrap as VRHI_EvalWave; func 0
+// (VRHI_SHADER_WAVE_NONE) returns 1, the identity scale. wave = (func, base,
+// amplitude, frequency); waveTime = (phase, frameTimeSeconds, 0, 0).
+float VRHI_EvalWaveUnclamped(float func, float4 wave, float4 waveTime)
+{
+    if (func < 0.5) return 1.0;
+    const float scaled = (waveTime.x + waveTime.y * wave.w) * 1024.0;
+    const float truncated = scaled >= 0.0 ? floor(scaled) : ceil(scaled);
+    const float wrapped = truncated - 1024.0 * floor(truncated / 1024.0);
+    const float fraction = wrapped / 1024.0;
+    float value = 0.0;
+    if (func < 1.5)
+        value = sin(6.283185307179586 * fraction * (1024.0 / 1023.0));
+    else if (func < 2.5)
+        value = fraction < 0.5 ? 1.0 : -1.0;
+    else if (func < 3.5)
+        value = 4.0 * abs(frac(fraction + 0.75) - 0.5) - 1.0;
+    else if (func < 4.5)
+        value = fraction;
+    else
+        value = 1.0 - fraction;
+    return wave.y + value * wave.z;
+}
 [shader("pixel")]
 float4 main(PSInput input) : SV_Target
 {
-    // Bounded fixed-order tcMod composition (static scale, then rotate
-    // about the texture center, then time scroll): only the diffuse
-    // (material) UVs are affected. The UVs are scaled by (s, t), rotated
-    // around (0.5, 0.5) by -rate * frameTimeSeconds degrees exactly like
-    // the GL1 renderer's RB_CalcRotateTexCoords, then scrolled by
-    // rate * frameTimeSeconds wrapped into [0,1) exactly like the GL1
-    // RB_CalcScrollTexCoords, so the coordinates never grow without bound.
-    // Identity scale / zero rotation / zero scroll when the stage has no
+    // Bounded fixed-order tcMod composition (turb, then stretch about the
+    // texture center, then static scale, then rotate about the texture
+    // center, then time scroll): only the diffuse (material) UVs are
+    // affected. Turb offsets the UVs by the GL1 world-position sine-table
+    // terms (a per-pixel approximation of the per-vertex
+    // RB_CalcTurbulentTexCoords; the base parameter is ignored exactly like
+    // GL1), stretch scales about (0.5, 0.5) by the inverse unclamped
+    // waveform value (near-zero guarded to a bounded magnitude), then the
+    // UVs are scaled by (s, t), rotated around (0.5, 0.5) by
+    // -rate * frameTimeSeconds degrees exactly like the GL1 renderer's
+    // RB_CalcRotateTexCoords, then scrolled by rate * frameTimeSeconds
+    // wrapped into [0,1) exactly like the GL1 RB_CalcScrollTexCoords, so the
+    // coordinates never grow without bound. Identity when the stage has no
     // statements, so draws without the keyword sample exactly as before;
     // lightmap UVs, vertex colour, lightmaps, and blend state are never
     // modified.
-    float2 uv = input.diffuse * u_tcModScale.xy;
+    float2 uv = input.diffuse;
+    // tcMod turb: GL1 adds sinTable[(((x+z)/128*0.125) + now)*1024] *
+    // amplitude to s and sinTable[((y/128*0.125) + now)*1024] * amplitude to
+    // t, where now = phase + time * frequency. Amplitude 0 (absent) is the
+    // identity no-op.
+    {
+        const float turbNow = u_tcModTurbTime.x + u_tcModTurbTime.y * u_tcModTurb.z;
+        uv.x += VRHI_TurbTable((input.worldPos.x + input.worldPos.z) * (1.0 / 128.0) * 0.125 + turbNow) * u_tcModTurb.y;
+        uv.y += VRHI_TurbTable(input.worldPos.y * (1.0 / 128.0) * 0.125 + turbNow) * u_tcModTurb.y;
+    }
+    // tcMod stretch: GL1 scales about (0.5, 0.5) by 1/EvalWaveForm(wf)
+    // (unclamped). The inverse is guarded so a near-zero wave yields a
+    // bounded magnitude instead of unbounded coordinates; func NONE (absent)
+    // evaluates to 1 (identity).
+    {
+        const float stretchW = VRHI_EvalWaveUnclamped(u_tcModStretch.x, u_tcModStretch, u_tcModStretchTime);
+        const float stretchP = abs(stretchW) < 0.05 ? (stretchW < 0.0 ? -20.0 : 20.0) : 1.0 / stretchW;
+        uv = (uv - 0.5) * stretchP + 0.5;
+    }
+    uv *= u_tcModScale.xy;
     // Rotate about (0.5, 0.5) by -rate * frameTimeSeconds degrees. The
     // angle is wrapped into [0,360) degrees first (like the GL1 sine-table
     // mask), so huge times cannot erode the sin/cos precision; a stage
@@ -3325,7 +3491,11 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 	uint8_t *rgbGenWaveFuncs = nullptr,
 	float (*rgbWaveValues)[4] = nullptr,
 	uint8_t *alphaGenWaveFuncs = nullptr,
-	float (*alphaWaveValues)[4] = nullptr) {
+	float (*alphaWaveValues)[4] = nullptr,
+	uint8_t *tcModTurbFlags = nullptr,
+	float (*tcModTurbValues)[4] = nullptr,
+	uint8_t *tcModStretchFuncs = nullptr,
+	float (*tcModStretchValues)[4] = nullptr) {
 	if (images == nullptr || blends == nullptr || stageCount == nullptr) return false;
 	*stageCount = 0;
 	for (size_t i = 0; i < VRHI_SHADER_MAX_STAGES; ++i) {
@@ -3354,6 +3524,20 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 		}
 		if (tcModRotateFlags != nullptr) tcModRotateFlags[i] = 0;
 		if (tcModRotateDegreesPerSecond != nullptr) tcModRotateDegreesPerSecond[i] = 0.0f;
+		if (tcModTurbFlags != nullptr) tcModTurbFlags[i] = 0;
+		if (tcModTurbValues != nullptr) {
+			tcModTurbValues[i][0] = 0.0f;
+			tcModTurbValues[i][1] = 0.0f;
+			tcModTurbValues[i][2] = 0.0f;
+			tcModTurbValues[i][3] = 0.0f;
+		}
+		if (tcModStretchFuncs != nullptr) tcModStretchFuncs[i] = VRHI_SHADER_WAVE_NONE;
+		if (tcModStretchValues != nullptr) {
+			tcModStretchValues[i][0] = 0.0f;
+			tcModStretchValues[i][1] = 0.0f;
+			tcModStretchValues[i][2] = 0.0f;
+			tcModStretchValues[i][3] = 0.0f;
+		}
 		if (rgbGenWaveFuncs != nullptr) rgbGenWaveFuncs[i] = VRHI_SHADER_WAVE_NONE;
 		if (rgbWaveValues != nullptr) {
 			rgbWaveValues[i][0] = 0.0f;
@@ -3430,6 +3614,21 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 		if (tcModRotateFlags != nullptr) tcModRotateFlags[i] = stages[i].tcModRotate ? 1 : 0;
 		if (tcModRotateDegreesPerSecond != nullptr)
 			tcModRotateDegreesPerSecond[i] = stages[i].tcModRotateDegreesPerSecond;
+		if (tcModTurbFlags != nullptr) tcModTurbFlags[i] = stages[i].tcModTurb ? 1 : 0;
+		if (tcModTurbValues != nullptr) {
+			tcModTurbValues[i][0] = stages[i].tcModTurbValues[0];
+			tcModTurbValues[i][1] = stages[i].tcModTurbValues[1];
+			tcModTurbValues[i][2] = stages[i].tcModTurbValues[2];
+			tcModTurbValues[i][3] = stages[i].tcModTurbValues[3];
+		}
+		if (tcModStretchFuncs != nullptr)
+			tcModStretchFuncs[i] = static_cast<uint8_t>(stages[i].tcModStretchFunc);
+		if (tcModStretchValues != nullptr) {
+			tcModStretchValues[i][0] = stages[i].tcModStretchValues[0];
+			tcModStretchValues[i][1] = stages[i].tcModStretchValues[1];
+			tcModStretchValues[i][2] = stages[i].tcModStretchValues[2];
+			tcModStretchValues[i][3] = stages[i].tcModStretchValues[3];
+		}
 		if (rgbGenWaveFuncs != nullptr)
 			rgbGenWaveFuncs[i] = static_cast<uint8_t>(stages[i].rgbGenWaveFunc);
 		if (rgbWaveValues != nullptr) {
@@ -4032,6 +4231,15 @@ static void VRHI_LoadWorld(const char *name) {
 		int diffuseImage = -1;
 		int stageImages[VRHI_SHADER_MAX_STAGES] = { -1, -1, -1, -1 };
 		uint8_t stageBlend[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		uint8_t stageTcModTurb[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		float stageTcModTurbValue[VRHI_SHADER_MAX_STAGES][4] = {
+			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
+			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
+		uint8_t stageTcModStretchFunc[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_WAVE_NONE,
+			VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE };
+		float stageTcModStretchValue[VRHI_SHADER_MAX_STAGES][4] = {
+			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
+			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
 		int stageCount = 0;
 		uint8_t stageRgbConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		float stageRgbConstColor[VRHI_SHADER_MAX_STAGES][3] = {
@@ -4069,7 +4277,9 @@ static void VRHI_LoadWorld(const char *name) {
 			stageTcModScroll, stageTcModScrollValue,
 			stageTcModRotate, stageTcModRotateDegreesPerSecond,
 			stageRgbGenWave, stageRgbWaveValue,
-			stageAlphaGenWave, stageAlphaWaveValue);
+			stageAlphaGenWave, stageAlphaWaveValue,
+			stageTcModTurb, stageTcModTurbValue,
+			stageTcModStretchFunc, stageTcModStretchValue);
 		diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 		if (surface.surfaceType == MST_PATCH) {
 			VRHI_PatchMesh patch;
@@ -4123,6 +4333,16 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageTcModScrollValue[stage][1] = stageTcModScrollValue[stage][1];
 				batch.stageTcModRotate[stage] = stageTcModRotate[stage];
 				batch.stageTcModRotateDegreesPerSecond[stage] = stageTcModRotateDegreesPerSecond[stage];
+				batch.stageTcModTurb[stage] = stageTcModTurb[stage];
+				batch.stageTcModTurbValue[stage][0] = stageTcModTurbValue[stage][0];
+				batch.stageTcModTurbValue[stage][1] = stageTcModTurbValue[stage][1];
+				batch.stageTcModTurbValue[stage][2] = stageTcModTurbValue[stage][2];
+				batch.stageTcModTurbValue[stage][3] = stageTcModTurbValue[stage][3];
+				batch.stageTcModStretchFunc[stage] = stageTcModStretchFunc[stage];
+				batch.stageTcModStretchValue[stage][0] = stageTcModStretchValue[stage][0];
+				batch.stageTcModStretchValue[stage][1] = stageTcModStretchValue[stage][1];
+				batch.stageTcModStretchValue[stage][2] = stageTcModStretchValue[stage][2];
+				batch.stageTcModStretchValue[stage][3] = stageTcModStretchValue[stage][3];
 				batch.stageRgbGenWave[stage] = stageRgbGenWave[stage];
 				batch.stageRgbWaveValue[stage][0] = stageRgbWaveValue[stage][0];
 				batch.stageRgbWaveValue[stage][1] = stageRgbWaveValue[stage][1];
@@ -4243,6 +4463,16 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageTcModScrollValue[stage][1] = stageTcModScrollValue[stage][1];
 				batch.stageTcModRotate[stage] = stageTcModRotate[stage];
 				batch.stageTcModRotateDegreesPerSecond[stage] = stageTcModRotateDegreesPerSecond[stage];
+				batch.stageTcModTurb[stage] = stageTcModTurb[stage];
+				batch.stageTcModTurbValue[stage][0] = stageTcModTurbValue[stage][0];
+				batch.stageTcModTurbValue[stage][1] = stageTcModTurbValue[stage][1];
+				batch.stageTcModTurbValue[stage][2] = stageTcModTurbValue[stage][2];
+				batch.stageTcModTurbValue[stage][3] = stageTcModTurbValue[stage][3];
+				batch.stageTcModStretchFunc[stage] = stageTcModStretchFunc[stage];
+				batch.stageTcModStretchValue[stage][0] = stageTcModStretchValue[stage][0];
+				batch.stageTcModStretchValue[stage][1] = stageTcModStretchValue[stage][1];
+				batch.stageTcModStretchValue[stage][2] = stageTcModStretchValue[stage][2];
+				batch.stageTcModStretchValue[stage][3] = stageTcModStretchValue[stage][3];
 				batch.stageRgbGenWave[stage] = stageRgbGenWave[stage];
 				batch.stageRgbWaveValue[stage][0] = stageRgbWaveValue[stage][0];
 				batch.stageRgbWaveValue[stage][1] = stageRgbWaveValue[stage][1];
@@ -4315,6 +4545,15 @@ static void VRHI_LoadWorld(const char *name) {
 			// on the batch rather than being re-derived from the script table.
 			int stageImages[VRHI_SHADER_MAX_STAGES] = { -1, -1, -1, -1 };
 			uint8_t stageBlend[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+			uint8_t stageTcModTurb[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+			float stageTcModTurbValue[VRHI_SHADER_MAX_STAGES][4] = {
+				{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
+				{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
+			uint8_t stageTcModStretchFunc[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_WAVE_NONE,
+				VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE };
+			float stageTcModStretchValue[VRHI_SHADER_MAX_STAGES][4] = {
+				{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
+				{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
 			int stageCount = 0;
 			uint8_t stageRgbConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 			float stageRgbConstColor[VRHI_SHADER_MAX_STAGES][3] = {
@@ -4352,7 +4591,9 @@ static void VRHI_LoadWorld(const char *name) {
 				stageTcModScroll, stageTcModScrollValue,
 				stageTcModRotate, stageTcModRotateDegreesPerSecond,
 				stageRgbGenWave, stageRgbWaveValue,
-				stageAlphaGenWave, stageAlphaWaveValue);
+				stageAlphaGenWave, stageAlphaWaveValue,
+				stageTcModTurb, stageTcModTurbValue,
+				stageTcModStretchFunc, stageTcModStretchValue);
 			const int diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 			VRHI_InlineBSPModel surfaceModel;
 			if (!VRHI_BuildInlineSurface(vertsData, vertCount, indexesData, indexCount,
@@ -4389,6 +4630,16 @@ static void VRHI_LoadWorld(const char *name) {
 					batch.stageTcModScrollValue[stage][1] = stageTcModScrollValue[stage][1];
 					batch.stageTcModRotate[stage] = stageTcModRotate[stage];
 					batch.stageTcModRotateDegreesPerSecond[stage] = stageTcModRotateDegreesPerSecond[stage];
+					batch.stageTcModTurb[stage] = stageTcModTurb[stage];
+					batch.stageTcModTurbValue[stage][0] = stageTcModTurbValue[stage][0];
+					batch.stageTcModTurbValue[stage][1] = stageTcModTurbValue[stage][1];
+					batch.stageTcModTurbValue[stage][2] = stageTcModTurbValue[stage][2];
+					batch.stageTcModTurbValue[stage][3] = stageTcModTurbValue[stage][3];
+					batch.stageTcModStretchFunc[stage] = stageTcModStretchFunc[stage];
+					batch.stageTcModStretchValue[stage][0] = stageTcModStretchValue[stage][0];
+					batch.stageTcModStretchValue[stage][1] = stageTcModStretchValue[stage][1];
+					batch.stageTcModStretchValue[stage][2] = stageTcModStretchValue[stage][2];
+					batch.stageTcModStretchValue[stage][3] = stageTcModStretchValue[stage][3];
 					batch.stageRgbGenWave[stage] = stageRgbGenWave[stage];
 					batch.stageRgbWaveValue[stage][0] = stageRgbWaveValue[stage][0];
 					batch.stageRgbWaveValue[stage][1] = stageRgbWaveValue[stage][1];
@@ -4739,7 +4990,10 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	uint8_t rgbGenWave = VRHI_SHADER_WAVE_NONE,
 	const float *rgbWaveValue = nullptr,
 	uint8_t alphaGenWave = VRHI_SHADER_WAVE_NONE,
-	const float *alphaWaveValue = nullptr, bool sortOnlyTranslucent = false) {
+	const float *alphaWaveValue = nullptr, bool sortOnlyTranslucent = false,
+	bool tcModTurb = false, const float *tcModTurbValue = nullptr,
+	uint8_t tcModStretchFunc = VRHI_SHADER_WAVE_NONE,
+	const float *tcModStretchValue = nullptr) {
 	if (indexCount == 0 || firstIndex > UINT32_MAX || indexCount > UINT32_MAX ||
 		g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) return false;
 	VRHI_SceneDraw draw;
@@ -4775,6 +5029,20 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	}
 	draw.tcModRotate = tcModRotate;
 	draw.tcModRotateDegreesPerSecond = tcModRotateDegreesPerSecond;
+	draw.tcModTurb = tcModTurb;
+	if (tcModTurbValue != nullptr) {
+		draw.tcModTurbValue[0] = tcModTurbValue[0];
+		draw.tcModTurbValue[1] = tcModTurbValue[1];
+		draw.tcModTurbValue[2] = tcModTurbValue[2];
+		draw.tcModTurbValue[3] = tcModTurbValue[3];
+	}
+	draw.tcModStretchFunc = tcModStretchFunc;
+	if (tcModStretchValue != nullptr) {
+		draw.tcModStretchValue[0] = tcModStretchValue[0];
+		draw.tcModStretchValue[1] = tcModStretchValue[1];
+		draw.tcModStretchValue[2] = tcModStretchValue[2];
+		draw.tcModStretchValue[3] = tcModStretchValue[3];
+	}
 	draw.rgbGenWave = rgbGenWave;
 	if (rgbWaveValue != nullptr) {
 		draw.rgbWaveValue[0] = rgbWaveValue[0];
@@ -4884,6 +5152,15 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 			!shaderStages->empty() && shaderStages->front().surfaceTranslucent;
 		int images[VRHI_SHADER_MAX_STAGES];
 		uint8_t blends[VRHI_SHADER_MAX_STAGES];
+		uint8_t stageTcModTurb[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		float stageTcModTurbValue[VRHI_SHADER_MAX_STAGES][4] = {
+			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
+			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
+		uint8_t stageTcModStretchFunc[VRHI_SHADER_MAX_STAGES] = { VRHI_SHADER_WAVE_NONE,
+			VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE, VRHI_SHADER_WAVE_NONE };
+		float stageTcModStretchValue[VRHI_SHADER_MAX_STAGES][4] = {
+			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
+			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
 		int stageCount = 0;
 		uint8_t stageRgbConst[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		float stageRgbConstColor[VRHI_SHADER_MAX_STAGES][3] = {
@@ -4922,7 +5199,9 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 				stageTcModScroll, stageTcModScrollValue,
 				stageTcModRotate, stageTcModRotateDegreesPerSecond,
 				stageRgbGenWave, stageRgbWaveValue,
-				stageAlphaGenWave, stageAlphaWaveValue);
+				stageAlphaGenWave, stageAlphaWaveValue,
+				stageTcModTurb, stageTcModTurbValue,
+				stageTcModStretchFunc, stageTcModStretchValue);
 		if (stageCount > 0) {
 			material.diffuseImage = images[0];
 			material.blendMode = blends[0];
@@ -4943,6 +5222,16 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 			material.tcModScrollValue[1] = stageTcModScrollValue[0][1];
 			material.tcModRotate = stageTcModRotate[0];
 			material.tcModRotateDegreesPerSecond = stageTcModRotateDegreesPerSecond[0];
+			material.tcModTurb = stageTcModTurb[0];
+			material.tcModTurbValue[0] = stageTcModTurbValue[0][0];
+			material.tcModTurbValue[1] = stageTcModTurbValue[0][1];
+			material.tcModTurbValue[2] = stageTcModTurbValue[0][2];
+			material.tcModTurbValue[3] = stageTcModTurbValue[0][3];
+			material.tcModStretchFunc = stageTcModStretchFunc[0];
+			material.tcModStretchValue[0] = stageTcModStretchValue[0][0];
+			material.tcModStretchValue[1] = stageTcModStretchValue[0][1];
+			material.tcModStretchValue[2] = stageTcModStretchValue[0][2];
+			material.tcModStretchValue[3] = stageTcModStretchValue[0][3];
 			material.rgbGenWave = static_cast<uint8_t>(stageRgbGenWave[0]);
 			material.rgbWaveValue[0] = stageRgbWaveValue[0][0];
 			material.rgbWaveValue[1] = stageRgbWaveValue[0][1];
@@ -4998,6 +5287,16 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 	draw->tcModScrollValue[1] = material.tcModScrollValue[1];
 	draw->tcModRotate = material.tcModRotate != 0;
 	draw->tcModRotateDegreesPerSecond = material.tcModRotateDegreesPerSecond;
+	draw->tcModTurb = material.tcModTurb != 0;
+	draw->tcModTurbValue[0] = material.tcModTurbValue[0];
+	draw->tcModTurbValue[1] = material.tcModTurbValue[1];
+	draw->tcModTurbValue[2] = material.tcModTurbValue[2];
+	draw->tcModTurbValue[3] = material.tcModTurbValue[3];
+	draw->tcModStretchFunc = material.tcModStretchFunc;
+	draw->tcModStretchValue[0] = material.tcModStretchValue[0];
+	draw->tcModStretchValue[1] = material.tcModStretchValue[1];
+	draw->tcModStretchValue[2] = material.tcModStretchValue[2];
+	draw->tcModStretchValue[3] = material.tcModStretchValue[3];
 	draw->rgbGenWave = material.rgbGenWave;
 	draw->rgbWaveValue[0] = material.rgbWaveValue[0];
 	draw->rgbWaveValue[1] = material.rgbWaveValue[1];
@@ -5196,7 +5495,9 @@ static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4
 				batch.stageRgbGenWave[0], batch.stageRgbWaveValue[0],
 				batch.stageAlphaGenWave[0], batch.stageAlphaWaveValue[0],
 				batch.surfaceTranslucent && blendMode == VRHI_SHADER_BLEND_OPAQUE &&
-					color.a >= 0.999f)) {
+					color.a >= 0.999f,
+				batch.stageTcModTurb[0] != 0, batch.stageTcModTurbValue[0],
+				batch.stageTcModStretchFunc[0], batch.stageTcModStretchValue[0])) {
 				g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
 				g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
 				continue;
@@ -5788,6 +6089,41 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 					batch.stageTcModRotate[stage] ? batch.stageTcModRotateDegreesPerSecond[stage] : 0.0f,
 					0.0f, frameTimeSeconds, 0.0f);
 				g_worldState.SetUniform(4, { "u_tcModRotate", { tcModRotate } });
+				// Bounded tcMod turb for this stage plus the shared per-frame
+				// render time: the textured material pixel shaders offset the
+				// diffuse UVs by the GL1 world-position sine-table terms
+				// (amplitude-scaled; base is ignored exactly like
+				// RB_CalcTurbulentTexCoords). Zeros when the stage has no
+				// turb, always written so no stale perturbation persists.
+				// stageTcModTurbValue is [base, amplitude, phase, frequency]
+				// (script order); u_tcModTurb carries (base, amplitude,
+				// frequency, 0) and u_tcModTurbTime carries (phase,
+				// frameTimeSeconds, 0, 0).
+				const glm::vec4 tcModTurb(
+					batch.stageTcModTurb[stage] ? batch.stageTcModTurbValue[stage][0] : 0.0f,
+					batch.stageTcModTurb[stage] ? batch.stageTcModTurbValue[stage][1] : 0.0f,
+					batch.stageTcModTurb[stage] ? batch.stageTcModTurbValue[stage][3] : 0.0f,
+					0.0f);
+				g_worldState.SetUniform(9, { "u_tcModTurb", { tcModTurb } });
+				const glm::vec4 tcModTurbTime(
+					batch.stageTcModTurb[stage] ? batch.stageTcModTurbValue[stage][2] : 0.0f,
+					frameTimeSeconds, 0.0f, 0.0f);
+				g_worldState.SetUniform(10, { "u_tcModTurbTime", { tcModTurbTime } });
+				// Bounded tcMod stretch for this stage plus the shared
+				// per-frame render time: the textured material pixel shaders
+				// scale the diffuse UVs about (0.5, 0.5) by the inverse
+				// unclamped waveform value. Func NONE (0) keeps identity,
+				// always written so no stale scale persists.
+				const glm::vec4 tcModStretch(
+					static_cast<float>(batch.stageTcModStretchFunc[stage]),
+					batch.stageTcModStretchValue[stage][0],
+					batch.stageTcModStretchValue[stage][1],
+					batch.stageTcModStretchValue[stage][3]);
+				g_worldState.SetUniform(11, { "u_tcModStretch", { tcModStretch } });
+				const glm::vec4 tcModStretchTime(
+					batch.stageTcModStretchValue[stage][2],
+					frameTimeSeconds, 0.0f, 0.0f);
+				g_worldState.SetUniform(12, { "u_tcModStretchTime", { tcModStretchTime } });
 				// Bounded stage-local rgbGen wave generator for this stage plus
 				// the shared per-frame render time in seconds: the textured
 				// material pixel shaders modulate the material sample RGB by
@@ -6001,6 +6337,26 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 					draw.tcModRotate ? draw.tcModRotateDegreesPerSecond : 0.0f,
 					0.0f, frameTimeSeconds, 0.0f);
 				g_worldState.SetUniform(4, { "u_tcModRotate", { tcModRotate } });
+				const glm::vec4 tcModTurb(
+					draw.tcModTurb ? draw.tcModTurbValue[0] : 0.0f,
+					draw.tcModTurb ? draw.tcModTurbValue[1] : 0.0f,
+					draw.tcModTurb ? draw.tcModTurbValue[3] : 0.0f,
+					0.0f);
+				g_worldState.SetUniform(9, { "u_tcModTurb", { tcModTurb } });
+				const glm::vec4 tcModTurbTime(
+					draw.tcModTurb ? draw.tcModTurbValue[2] : 0.0f,
+					frameTimeSeconds, 0.0f, 0.0f);
+				g_worldState.SetUniform(10, { "u_tcModTurbTime", { tcModTurbTime } });
+				const glm::vec4 tcModStretch(
+					static_cast<float>(draw.tcModStretchFunc),
+					draw.tcModStretchValue[0],
+					draw.tcModStretchValue[1],
+					draw.tcModStretchValue[3]);
+				g_worldState.SetUniform(11, { "u_tcModStretch", { tcModStretch } });
+				const glm::vec4 tcModStretchTime(
+					draw.tcModStretchValue[2],
+					frameTimeSeconds, 0.0f, 0.0f);
+				g_worldState.SetUniform(12, { "u_tcModStretchTime", { tcModStretchTime } });
 				// Bounded rgbGen wave generator carried on the scene draw plus
 				// the shared per-frame render time in seconds: the textured
 				// material pixel shader modulates the material sample RGB by

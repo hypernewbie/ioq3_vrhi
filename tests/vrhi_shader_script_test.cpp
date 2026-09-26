@@ -36,11 +36,18 @@
 // shader rotates the diffuse UVs around the texture center (0.5, 0.5) by
 // -rate * frameTimeSeconds degrees, matching the GL1 renderer's
 // RB_CalcRotateTexCoords sign and units exactly; the fixed documented order
-// when a stage carries several supported tcMods is scale, then rotate, then
-// time scroll (script order is intentionally not tracked). Every other tcMod
-// variant (turb/stretch/entityTranslate) and every malformed, truncated,
-// non-finite, or out-of-range rate keeps the no-rotate fallback with the
-// stage still accepted. The bounded stage-local `rgbGen wave` / `alphaGen
+// when a stage carries several supported tcMods is turb, then stretch, then
+// scale, then rotate, then time scroll (script order is intentionally not
+// tracked). Every other tcMod variant (entityTranslate) and every malformed,
+// truncated, non-finite, or out-of-range rate keeps the no-rotate fallback
+// with the stage still accepted. The bounded stage-local `tcMod turb base
+// amplitude phase frequency` slice offsets the diffuse UVs by the GL1
+// world-position sine-table terms (per-pixel approximation of
+// RB_CalcTurbulentTexCoords; base ignored like GL1), and `tcMod stretch
+// <func> base amplitude phase frequency` scales about (0.5, 0.5) by the
+// inverse unclamped waveform value (near-zero guarded); malformed,
+// truncated, non-finite, or out-of-range statements keep identity UVs with
+// the stage still accepted. The bounded stage-local `rgbGen wave` / `alphaGen
 // wave` slice accepts exactly the five Quake3 waveform forms sin/square/
 // triangle/sawtooth/inversesawtooth (case-insensitive) with four finite,
 // safely bounded (|value| <= 16) parameters base/amplitude/phase/frequency
@@ -1877,6 +1884,142 @@ void testStageTcModRotate() {
 		"{ map textures/foo/bar.tga tcMod rotate 90 }", nullptr), "");
 }
 
+void testStageTcModTurbStretch() {
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	// Lava-style turb plus a flame-style stretch: both preserved with
+	// script-order parameter values.
+	const std::string accepted = script(
+		"{ map textures/base.tga tcMod turb .5 -0.4 0.5 0.1 }\n"
+		"{ map textures/a.png blendFunc blend tcMod stretch sin 0 1 0 8 }");
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(accepted), accepted.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 2u);
+		if (stages.size() == 2) {
+			CHECK(stages[0].tcModTurb);
+			CHECK(stages[0].tcModTurbValues[0] > 0.49f && stages[0].tcModTurbValues[0] < 0.51f);
+			CHECK(stages[0].tcModTurbValues[1] > -0.41f && stages[0].tcModTurbValues[1] < -0.39f);
+			CHECK(stages[0].tcModTurbValues[2] > 0.49f && stages[0].tcModTurbValues[2] < 0.51f);
+			CHECK(stages[0].tcModTurbValues[3] > 0.09f && stages[0].tcModTurbValues[3] < 0.11f);
+			CHECK_EQ_INT(stages[0].tcModStretchFunc, VRHI_SHADER_WAVE_NONE);
+			CHECK_EQ_INT(stages[1].tcModStretchFunc, VRHI_SHADER_WAVE_SIN);
+			CHECK(stages[1].tcModStretchValues[1] > 0.99f && stages[1].tcModStretchValues[1] < 1.01f);
+			CHECK(stages[1].tcModStretchValues[3] > 7.99f && stages[1].tcModStretchValues[3] < 8.01f);
+			CHECK(!stages[1].tcModTurb);
+		}
+	}
+	// Every stretch waveform is accepted; matching is case-insensitive and a
+	// stage may carry turb, stretch, scale, rotate, and scroll together.
+	const std::string composed = script(
+		"{ map textures/base.tga tcMod TURB 0 1 0 1 tcMod STRETCH inverseSawTooth 1 0.5 0 2 tcMod scale 2 3 tcMod rotate 30 tcMod scroll 0.5 -0.5 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(composed), composed.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(stages[0].tcModTurb);
+			CHECK_EQ_INT(stages[0].tcModStretchFunc, VRHI_SHADER_WAVE_INVERSE_SAWTOOTH);
+			CHECK(stages[0].tcModScale);
+			CHECK(stages[0].tcModRotate);
+			CHECK(stages[0].tcModScroll);
+		}
+	}
+	const std::string funcs = script(
+		"{ map textures/0.tga tcMod stretch square 0 1 0 1 } "
+		"{ map textures/1.tga blendFunc blend tcMod stretch triangle 0 1 0 1 } "
+		"{ map textures/2.tga blendFunc blend tcMod stretch sawtooth 0 1 0 1 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(funcs), funcs.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			CHECK_EQ_INT(stages[0].tcModStretchFunc, VRHI_SHADER_WAVE_SQUARE);
+			CHECK_EQ_INT(stages[1].tcModStretchFunc, VRHI_SHADER_WAVE_TRIANGLE);
+			CHECK_EQ_INT(stages[2].tcModStretchFunc, VRHI_SHADER_WAVE_SAWTOOTH);
+		}
+	}
+	// Invalid statements keep the stage accepted with identity UVs: unknown
+	// stretch func (noise), non-numeric, and out-of-range parameters.
+	const std::string fallbacks = script(
+		"{ map textures/base.tga tcMod stretch noise 0 1 0 1 }\n"
+		"{ map textures/a.png blendFunc blend tcMod turb 0 abc 0 1 }\n"
+		"{ map textures/b.png blendFunc blend tcMod turb 0 100 0 1 }\n"
+		"{ map textures/c.png blendFunc blend tcMod stretch sin 0 1 0 100 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(fallbacks), fallbacks.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 4u);
+		if (stages.size() == 4) {
+			for (std::size_t i = 0; i < stages.size(); ++i) {
+				CHECK(!stages[i].tcModTurb);
+				CHECK_EQ_INT(stages[i].tcModStretchFunc, VRHI_SHADER_WAVE_NONE);
+			}
+		}
+	}
+	// Truncated statements at the stage end consume only the keyword and the
+	// variant marker, keep identity UVs, and never borrow past the stage.
+	const std::string truncated = script(
+		"{ map textures/base.tga tcMod turb }\n"
+		"{ map textures/a.png blendFunc blend tcMod turb 0.5 0.5 }\n"
+		"{ map textures/b.png blendFunc blend tcMod stretch sin 0 1 0 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncated), truncated.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 3u);
+		if (stages.size() == 3) {
+			CHECK(!stages[0].tcModTurb);
+			CHECK(!stages[1].tcModTurb);
+			CHECK_EQ_INT(stages[2].tcModStretchFunc, VRHI_SHADER_WAVE_NONE);
+		}
+	}
+	// Keyword-looking arguments are fully consumed, never re-parsed as stage
+	// directives: `blend` stays a turb amplitude, `map` stays a stretch func.
+	const std::string keywordValues = script(
+		"{ map textures/base.tga tcMod turb blend 1 2 3 tcMod stretch map 0 1 0 1 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(keywordValues), keywordValues.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(!stages[0].tcModTurb);
+			CHECK_EQ_INT(stages[0].tcModStretchFunc, VRHI_SHADER_WAVE_NONE);
+			CHECK_EQ_INT(stages[0].blendMode, VRHI_SHADER_BLEND_OPAQUE);
+			CHECK_EQ_STR(stages[0].path, "textures/base.tga");
+		}
+	}
+	// A repeated turb keeps the last statement, matching scale/scroll/rotate.
+	const std::string repeated = script(
+		"{ map textures/base.tga tcMod turb 0 1 0 1 tcMod turb 0 2 0 1 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(repeated), repeated.size(), wanted, &results));
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		if (stages.size() == 1) {
+			CHECK(stages[0].tcModTurb);
+			CHECK(stages[0].tcModTurbValues[1] > 1.99f && stages[0].tcModTurbValues[1] < 2.01f);
+		}
+	}
+	// The conservative first-stage opaque helper still rejects tcMod: only
+	// identity matches the fixed opaque diffuse pass.
+	CHECK_EQ_STR(candidateBody(
+		"{ map textures/foo/bar.tga tcMod turb 0 1 0 1 }", nullptr), "");
+	CHECK_EQ_STR(candidateBody(
+		"{ map textures/foo/bar.tga tcMod stretch sin 0 1 0 1 }", nullptr), "");
+}
+
 void testStageWaveGenerators() {
 	// Direct parser-helper bounds/token safety: VRHI_ShaderParseWaveConstant
 	// accepts finite in-range parameters (zero and the inclusive |16| bound
@@ -2280,6 +2423,7 @@ int main() {
 	testStageTcModScale();
 	testStageTcModScroll();
 	testStageTcModRotate();
+	testStageTcModTurbStretch();
 	testStageWaveGenerators();
 	testConsoleScriptResolution();
 	testPathSafetyHelpers();

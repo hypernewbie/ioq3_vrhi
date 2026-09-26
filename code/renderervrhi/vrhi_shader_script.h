@@ -164,6 +164,23 @@ input buffer, so no FS storage can be referenced after FS_FreeFile.
 // stage end. The conservative first-stage helper still treats `tcMod` as
 // unsupported and rejects such shaders.
 //
+// The bounded stage-local `tcMod turb` / `tcMod stretch` slice extends the
+// same simple multi-stage parser with exactly the Quake3 liquid-motion
+// forms: `tcMod turb base amplitude phase frequency` (four finite parameters
+// inside VRHI_SCRIPT_TCMOD_TURB_MAX) and `tcMod stretch <func> base
+// amplitude phase frequency` (one of the five wave forms plus four finite
+// parameters inside VRHI_SCRIPT_TCMOD_STRETCH_MAX). Turb offsets the diffuse
+// UVs by the GL1 world-position sine-table terms (amplitude-scaled, base
+// ignored exactly like RB_CalcTurbulentTexCoords); stretch scales the
+// diffuse UVs about (0.5, 0.5) by the inverse unclamped waveform value
+// (1/EvalWaveForm, near-zero clamped to a bounded magnitude). Both compose
+// before scale/rotate/scroll in the fixed documented order turb, stretch,
+// scale, rotate, scroll (script order is not tracked) and apply to the
+// diffuse sample only. Malformed, truncated, non-finite, or out-of-range
+// statements keep the stage accepted with identity UVs and never borrow
+// tokens past the stage end. The conservative first-stage helper still
+// treats `tcMod` as unsupported and rejects such shaders.
+//
 // The bounded stage-local `rgbGen wave` / `alphaGen wave` slice extends the
 // same simple multi-stage parser with exactly the five Quake3 waveform forms
 // `sin`, `square`, `triangle`, `sawtooth`, and `inversesawtooth` (matched
@@ -335,6 +352,15 @@ struct VRHI_ShaderStage {
 	// center, then time scroll.
 	bool tcModRotate = false;
 	float tcModRotateDegreesPerSecond = 0.0f;
+	// Bounded stage-local tcMod turb and stretch waveforms. Turb applies the
+	// GL1 world-position sine offsets to diffuse UVs; stretch applies the
+	// inverse waveform scale around (0.5,0.5), clamping near-zero scales to
+	// avoid unbounded coordinates. Parameter order is base/amplitude/phase/
+	// frequency as in the shader script.
+	bool tcModTurb = false;
+	float tcModTurbValues[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	int tcModStretchFunc = VRHI_SHADER_WAVE_NONE;
+	float tcModStretchValues[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 	// Bounded stage-local wave generators (`rgbGen wave <func> <base>
 	// <amplitude> <phase> <frequency>` and `alphaGen wave <func> <base>
 	// <amplitude> <phase> <frequency>`): func is one of the five Quake3
@@ -405,6 +431,9 @@ static const float VRHI_SCRIPT_TCMOD_SCROLL_MAX = 16.0f;
 // (the angle is wrapped into [0,360) degrees like the GL1 sine-table mask,
 // so extreme magnitudes can never erode the sin/cos precision).
 static const float VRHI_SCRIPT_TCMOD_ROTATE_MAX = 3600.0f;
+// Bounded tcMod turb/stretches reuse the finite wave parameter domain.
+static const float VRHI_SCRIPT_TCMOD_TURB_MAX = 16.0f;
+static const float VRHI_SCRIPT_TCMOD_STRETCH_MAX = 16.0f;
 
 // Bounded wave-generator parameter range (`rgbGen wave` / `alphaGen wave`):
 // each of the four parameters (base, amplitude, phase, frequency) must be
@@ -1088,23 +1117,53 @@ inline bool VRHI_ParseSimpleShaderBlock(
 				continue;
 			}
 			if (keyword == "tcmod") {
-				// Bounded static `tcMod scale s t`, time-based `tcMod scroll
-				// s t`, and time-based `tcMod rotate degsPerSecond`: preserved
-				// only when the next token is the `scale`, `scroll`, or
-				// `rotate` variant and every argument is finite and inside the
+				// Bounded `tcMod turb`, `stretch`, static `scale`, time-based
+				// `scroll`, and `rotate`: preserved only when the next token is a
+				// supported variant and every argument is finite and inside the
 				// defined safe range (scale: nonzero, |value| in
 				// [VRHI_SCRIPT_TCMOD_SCALE_MIN, VRHI_SCRIPT_TCMOD_SCALE_MAX];
 				// scroll: |value| <= VRHI_SCRIPT_TCMOD_SCROLL_MAX, zero
 				// accepted as the identity no-scroll rate; rotate: |value| <=
-				// VRHI_SCRIPT_TCMOD_ROTATE_MAX degrees per second, zero
-				// accepted as the identity no-rotate rate). Every other tcMod
-				// variant (turb, stretch, entityTranslate, ...) keeps the
-				// existing unsupported fallback: the keyword is consumed and its
-				// argument tokens remain bounded and ignored below, exactly as
-				// before this slice. A stage may carry a scale, a rotate, and a
-				// scroll; the pixel shader applies the fixed documented order
-				// scale, then rotate about the texture center, then time
-				// scroll (script order is intentionally not tracked).
+				// VRHI_SCRIPT_TCMOD_ROTATE_MAX degrees/sec; turb/stretch wave
+				// parameters use the finite wave bound. Other variants
+				// (entityTranslate, ...) remain identity fallbacks. Supported
+				// variants compose in the fixed order turb, stretch, scale,
+				// rotate, scroll (script order is not tracked).
+				if (j + 1 < stageEnd && VRHI_ShaderTokenIs(tokens[j + 1], "turb")) {
+					if (j + 5 < stageEnd) {
+						float values[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+						bool valid = true;
+						for (std::size_t k = 0; k < 4; ++k)
+							if (!VRHI_ShaderParseFiniteConstant(tokens[j + 2 + k].text,
+								-VRHI_SCRIPT_TCMOD_TURB_MAX, VRHI_SCRIPT_TCMOD_TURB_MAX,
+								&values[k])) valid = false;
+						if (valid) {
+							stage.tcModTurb = true;
+							for (std::size_t k = 0; k < 4; ++k)
+								stage.tcModTurbValues[k] = values[k];
+						}
+						j += 6;
+					} else j += 2;
+					continue;
+				}
+				if (j + 1 < stageEnd && VRHI_ShaderTokenIs(tokens[j + 1], "stretch")) {
+					if (j + 6 < stageEnd) {
+						const int func = VRHI_ShaderWaveFuncFromName(tokens[j + 2].text);
+						float values[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+						bool valid = func != VRHI_SHADER_WAVE_NONE;
+						for (std::size_t k = 0; k < 4; ++k)
+							if (!VRHI_ShaderParseFiniteConstant(tokens[j + 3 + k].text,
+								-VRHI_SCRIPT_TCMOD_STRETCH_MAX,
+								VRHI_SCRIPT_TCMOD_STRETCH_MAX, &values[k])) valid = false;
+						if (valid) {
+							stage.tcModStretchFunc = func;
+							for (std::size_t k = 0; k < 4; ++k)
+								stage.tcModStretchValues[k] = values[k];
+						}
+						j += 7;
+					} else j += 2;
+					continue;
+				}
 				if (j + 1 < stageEnd && VRHI_ShaderTokenIs(tokens[j + 1], "scale")) {
 					// A syntactically complete `tcMod scale s t` statement
 					// consumes exactly four tokens (keyword + "scale" + s + t)
@@ -1191,10 +1250,8 @@ inline bool VRHI_ParseSimpleShaderBlock(
 					j += 2;
 					continue;
 				}
-				// Non-scale/scroll/rotate tcMod (turb/stretch/entityTranslate/...):
-				// keep the existing fallback by consuming just the keyword; the
-				// remaining argument tokens are bounded by stageEnd and ignored
-				// below.
+				// Unsupported tcMod (entityTranslate, ...): consume just the
+				// keyword; bounded argument tokens are ignored below.
 				j += 1;
 				continue;
 			}
