@@ -56,6 +56,7 @@
 #include "renderervrhi/vrhi_beam.h"
 #include "renderervrhi/vrhi_video_capture.h"
 #include "renderervrhi/vrhi_shader_script.h"
+#include "renderervrhi/vrhi_draw_order.h"
 
 // vrhi.h is the public header for the copied prebuilt VRHI library.  The
 // implementation deliberately uses only its device, swapchain, state,
@@ -5809,7 +5810,8 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		}
 	};
 	for (size_t batchIndex : opaqueBatches) drawWorldBatch(batchIndex);
-	for (size_t batchIndex : translucentBatches) drawWorldBatch(batchIndex);
+	// Resolve the opaque scene before drawing world transparency. Otherwise a
+	// model behind glass writes its opaque color over an already blended pane.
 	if (VRHI_BuildSceneGeometry(fd) && VRHI_EnsureSceneBuffers()) {
 		VRHI_Printf(PRINT_DEVELOPER,
 			"renderer_vrhi: scene submissions: entities=%zu polys=%zu modelDraws=%zu draws=%zu vertices=%zu indexes=%zu lights=%zu\n",
@@ -5840,10 +5842,6 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 			const glm::vec3 delta = center - vieworg;
 			return glm::dot(delta, delta);
 		};
-		std::stable_sort(translucentSceneDraws.begin(), translucentSceneDraws.end(),
-			[&](size_t left, size_t right) {
-				return sceneDrawDistanceSquared(left) > sceneDrawDistanceSquared(right);
-			});
 		const auto drawScene = [&](size_t drawIndex) {
 			VRHI_SceneDraw &draw = g_sceneDraws[drawIndex];
 			const vhTexture texture = VRHI_SceneTexture(&draw);
@@ -6024,7 +6022,25 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 			}
 		};
 		for (size_t drawIndex : opaqueSceneDraws) drawScene(drawIndex);
-		for (size_t drawIndex : translucentSceneDraws) drawScene(drawIndex);
+		// World and scene transparency share one depth-tested, no-depth-write
+		// pass. Sort by the same camera-distance approximation used previously
+		// for each group, so neither group always draws on top of the other.
+		// Full GL1 shader-sort and per-polygon sorting are not implemented.
+		std::vector<VRHI_TranslucentDrawOrder> translucentDraws;
+		translucentDraws.reserve(translucentBatches.size() + translucentSceneDraws.size());
+		for (size_t index : translucentBatches)
+			translucentDraws.push_back({ batchDistanceSquared(index), index, false });
+		for (size_t index : translucentSceneDraws)
+			translucentDraws.push_back({ sceneDrawDistanceSquared(index), index, true });
+		VRHI_SortTranslucentDraws(&translucentDraws);
+		for (const VRHI_TranslucentDrawOrder &draw : translucentDraws) {
+			if (draw.scene) drawScene(draw.index);
+			else drawWorldBatch(draw.index);
+		}
+	} else {
+		// Scene upload failure must never suppress previously visible world
+		// transparent batches. The world-only list is already back-to-front.
+		for (size_t batchIndex : translucentBatches) drawWorldBatch(batchIndex);
 	}
 	g_worldDrawSubmitted = submitted;
 	// RenderScene is also used for world-less scene frames (menu/model previews),
