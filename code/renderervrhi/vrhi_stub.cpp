@@ -99,6 +99,12 @@ struct VRHI_WorldVertex {
 	glm::vec2 lightmap;
 	float lightmapLayer;
 	glm::vec4 color;
+	// Decoded surface normal in object space (== world space: the adapter
+	// keeps an identity world transform and bakes entity rotation on the
+	// CPU). Defaults to up so producers without normal data still feed a
+	// stable vector to later view-dependent stages. Must stay the last field
+	// to match the vertex layout strings (float3 ... float3).
+	glm::vec3 normal = glm::vec3(0.0f, 0.0f, 1.0f);
 };
 // Scene submissions are retained between ClearScene and RenderScene. The
 // generated geometry uses a separate bounded upload so static BSP buffers are
@@ -1347,15 +1353,17 @@ struct VSOutput {
     float lightmapLayer : TEXCOORD2;
     float4 color : TEXCOORD3;
     float3 worldPos : TEXCOORD4;
+    float3 worldNormal : TEXCOORD5;
 };
 [shader("vertex")]
 VSOutput main(float3 position : POSITION, float2 diffuse : TEXCOORD0,
     float2 lightmap : TEXCOORD1, float lightmapLayer : TEXCOORD2,
-    float4 color : TEXCOORD3)
+    float4 color : TEXCOORD3, float3 normal : NORMAL)
 {
     VSOutput output;
     output.position = mul(u_worldViewProj, float4(position, 1.0));
     output.worldPos = position;
+    output.worldNormal = normal;
     output.diffuse = diffuse;
     output.lightmap = lightmap;
     output.lightmapLayer = lightmapLayer;
@@ -2145,7 +2153,7 @@ static bool VRHI_UploadWorldGeometry(void) {
 	std::memcpy(indexes->data(), g_worldIndexes.data(), indexes->size());
 	const int32_t errorsBefore = g_vhErrorCounter.load(std::memory_order_relaxed);
 	vhCreateVertexBuffer(g_worldVertexBuffer, "VRHI_WorldVertices", vertices,
-		"float3 float2 float2 float float4", g_worldVertices.size());
+		"float3 float2 float2 float float4 float3", g_worldVertices.size());
 	vhCreateIndexBuffer(g_worldIndexBuffer, "VRHI_WorldIndexes", indexes,
 		g_worldIndexes.size(), VRHI_BUFFER_INDEX32);
 	vhFinish();
@@ -3144,6 +3152,27 @@ static drawVert_t VRHI_DecodeDrawVert(const drawVert_t &disk) {
 	return host;
 }
 
+// Normalizes a BSP draw-vertex normal into object space, falling back to up
+// for missing, non-finite, or degenerate vectors so later view-dependent
+// stages always receive a stable unit vector.
+static glm::vec3 VRHI_DrawVertNormal(const drawVert_t &vertex) {
+	const glm::vec3 normal(vertex.normal[0], vertex.normal[1], vertex.normal[2]);
+	const float lengthSquared = glm::dot(normal, normal);
+	if (!std::isfinite(normal.x) || !std::isfinite(normal.y) || !std::isfinite(normal.z) ||
+		!std::isfinite(lengthSquared) || !(lengthSquared > 1.0e-10f))
+		return glm::vec3(0.0f, 0.0f, 1.0f);
+	return normal / std::sqrt(lengthSquared);
+}
+
+// Decodes an MD3 spherical-encoded normal (lat in the high byte, lng in the
+// low byte) with float trig, matching the GL1 table lookup up to table
+// quantization. Always finite and unit length by construction.
+static glm::vec3 VRHI_MD3DecodeNormal(int16_t packed) {
+	const float lat = static_cast<float>((packed >> 8) & 0xff) * (6.283185307179586f / 255.0f);
+	const float lng = static_cast<float>(packed & 0xff) * (6.283185307179586f / 255.0f);
+	return glm::vec3(std::cos(lat) * std::sin(lng), std::sin(lat) * std::sin(lng), std::cos(lng));
+}
+
 static dmodel_t VRHI_ReadModel(const byte *lumpData, int index) {
 	dmodel_t disk;
 	std::memcpy(&disk, lumpData + static_cast<size_t>(index) * sizeof(disk), sizeof(disk));
@@ -3899,6 +3928,7 @@ static bool VRHI_TessellatePatch(const byte *vertsData, int vertCount,
 							2.0f * u * (1.0f - u), u * u };
 						VRHI_WorldVertex vertex;
 						vertex.position = glm::vec3(0.0f);
+						vertex.normal = glm::vec3(0.0f);
 						vertex.diffuse = glm::vec2(0.0f);
 						vertex.lightmap = glm::vec2(0.0f);
 						vertex.lightmapLayer = -1.0f;
@@ -3911,12 +3941,22 @@ static bool VRHI_TessellatePatch(const byte *vertsData, int vertCount,
 								vertex.position += weight * glm::vec3(control.xyz[0], control.xyz[1], control.xyz[2]);
 								vertex.diffuse += weight * glm::vec2(control.st[0], control.st[1]);
 								vertex.lightmap += weight * glm::vec2(control.lightmap[0], control.lightmap[1]);
+								vertex.normal += weight * glm::vec3(control.normal[0], control.normal[1], control.normal[2]);
 							}
 						}
 						if (!std::isfinite(vertex.position.x) || !std::isfinite(vertex.position.y) ||
 							!std::isfinite(vertex.position.z) || !std::isfinite(vertex.diffuse.x) ||
 							!std::isfinite(vertex.diffuse.y) || !std::isfinite(vertex.lightmap.x) ||
 							!std::isfinite(vertex.lightmap.y)) return false;
+						// Bilinear control normals are renormalized here so every
+						// tessellated vertex carries a stable unit vector (or up
+						// when the controls are degenerate). Position/UV
+						// validation above is unchanged.
+						const float normalLengthSquared = glm::dot(vertex.normal, vertex.normal);
+						vertex.normal = (std::isfinite(normalLengthSquared) &&
+							normalLengthSquared > 1.0e-10f)
+							? vertex.normal / std::sqrt(normalLengthSquared)
+							: glm::vec3(0.0f, 0.0f, 1.0f);
 						mesh->vertices.push_back(vertex);
 					}
 				}
@@ -4024,6 +4064,7 @@ static bool VRHI_BuildInlineSurface(const byte *vertsData, int vertCount,
 						sourceVertices[corner].lightmap[0] >= 0.0f && sourceVertices[corner].lightmap[0] <= 1.0f &&
 						sourceVertices[corner].lightmap[1] >= 0.0f && sourceVertices[corner].lightmap[1] <= 1.0f;
 					VRHI_WorldVertex vertex;
+					vertex.normal = VRHI_DrawVertNormal(sourceVertices[corner]);
 					vertex.position = positions[corner];
 					vertex.diffuse = diffuseImage >= 0 ? glm::vec2(sourceVertices[corner].st[0], sourceVertices[corner].st[1]) : glm::vec2(0.0f);
 					vertex.lightmap = lightmapped ? glm::vec2(sourceVertices[corner].lightmap[0], sourceVertices[corner].lightmap[1]) : glm::vec2(0.0f);
@@ -4493,6 +4534,7 @@ static void VRHI_LoadWorld(const char *name) {
 						vertices[corner].lightmap[1] >= 0.0f &&
 						vertices[corner].lightmap[1] <= 1.0f;
 					VRHI_WorldVertex worldVertex;
+					worldVertex.normal = VRHI_DrawVertNormal(vertices[corner]);
 					worldVertex.position = position[corner];
 					worldVertex.diffuse = (diffuseImage >= 0 &&
 						std::isfinite(vertices[corner].st[0]) &&
@@ -5051,8 +5093,10 @@ static bool VRHI_FiniteEntity(const refEntity_t &entity) {
 }
 
 static VRHI_WorldVertex VRHI_SceneVertex(const glm::vec3 &position,
-	const glm::vec2 &uv, const glm::vec4 &color) {
+	const glm::vec2 &uv, const glm::vec4 &color,
+	const glm::vec3 &normal = glm::vec3(0.0f, 0.0f, 1.0f)) {
 	VRHI_WorldVertex vertex;
+	vertex.normal = normal;
 	vertex.position = position;
 	vertex.diffuse = uv;
 	vertex.lightmap = glm::vec2(0.0f);
@@ -5433,7 +5477,19 @@ static bool VRHI_AppendSceneQuad(const glm::vec3 corners[4],
 	const uint32_t firstIndex = static_cast<uint32_t>(g_sceneIndexes.size());
 	const glm::vec2 uv[4] = { glm::vec2(0.0f, 0.0f), glm::vec2(1.0f, 0.0f),
 		glm::vec2(1.0f, 1.0f), glm::vec2(0.0f, 1.0f) };
-	for (int i = 0; i < 4; ++i) g_sceneVertices.push_back(VRHI_SceneVertex(corners[i], uv[i], color));
+	// Planar quad face normal for later view-dependent stages (an
+	// approximation for camera-facing sprites/beams, which carry no authored
+	// normals; degenerate quads fall back to up).
+	const glm::vec3 quadEdge1 = corners[1] - corners[0];
+	const glm::vec3 quadEdge2 = corners[3] - corners[0];
+	glm::vec3 quadNormal = glm::cross(quadEdge1, quadEdge2);
+	const float quadNormalLengthSquared = glm::dot(quadNormal, quadNormal);
+	quadNormal = (std::isfinite(quadNormalLengthSquared) &&
+		quadNormalLengthSquared > 1.0e-10f)
+		? quadNormal / std::sqrt(quadNormalLengthSquared)
+		: glm::vec3(0.0f, 0.0f, 1.0f);
+	for (int i = 0; i < 4; ++i)
+		g_sceneVertices.push_back(VRHI_SceneVertex(corners[i], uv[i], color, quadNormal));
 	const uint32_t indexes[6] = { 0, 1, 2, 0, 2, 3 };
 	for (uint32_t index : indexes) g_sceneIndexes.push_back(firstVertex + index);
 	return VRHI_AppendSceneDraw(shader, firstIndex, 6, -1, false,
@@ -5490,13 +5546,28 @@ static bool VRHI_AppendMD3Model(const refEntity_t &entity, const glm::vec4 &colo
 				entity.axis[0][0] * local.x + entity.axis[1][0] * local.y + entity.axis[2][0] * local.z,
 				entity.axis[0][1] * local.x + entity.axis[1][1] * local.y + entity.axis[2][1] * local.z,
 				entity.axis[0][2] * local.x + entity.axis[1][2] * local.y + entity.axis[2][2] * local.z);
+			const glm::vec3 currentNormal = VRHI_MD3DecodeNormal(current.normal);
+			const glm::vec3 oldNormal = VRHI_MD3DecodeNormal(old.normal);
+			// Lerp the decoded frame normals like the positions, then rotate
+			// by the entity basis (no translation). Degenerate mixes fall
+			// back to up so view-dependent stages stay stable.
+			glm::vec3 localNormal = currentNormal * (1.0f - backlerp) + oldNormal * backlerp;
+			const float localNormalLengthSquared = glm::dot(localNormal, localNormal);
+			localNormal = (std::isfinite(localNormalLengthSquared) &&
+				localNormalLengthSquared > 1.0e-10f)
+				? localNormal / std::sqrt(localNormalLengthSquared)
+				: glm::vec3(0.0f, 0.0f, 1.0f);
+			const glm::vec3 normal = glm::vec3(
+				entity.axis[0][0] * localNormal.x + entity.axis[1][0] * localNormal.y + entity.axis[2][0] * localNormal.z,
+				entity.axis[0][1] * localNormal.x + entity.axis[1][1] * localNormal.y + entity.axis[2][1] * localNormal.z,
+				entity.axis[0][2] * localNormal.x + entity.axis[1][2] * localNormal.y + entity.axis[2][2] * localNormal.z);
 			const glm::vec2 uv = surface.st[static_cast<size_t>(vertex)];
 			if (!std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z) ||
 				!std::isfinite(uv.x) || !std::isfinite(uv.y)) {
 				valid = false;
 				break;
 			}
-			scratchVertices.push_back(VRHI_SceneVertex(position, uv, color));
+			scratchVertices.push_back(VRHI_SceneVertex(position, uv, color, normal));
 		}
 		if (!valid) continue;
 		const uint32_t baseVertex = static_cast<uint32_t>(g_sceneVertices.size());
@@ -5578,6 +5649,7 @@ static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4
 					// lightmapLayer (< -0.5 means no lightmap for this vertex).
 					VRHI_WorldVertex sceneVertex = VRHI_SceneVertex(position,
 						localVertex.diffuse, color);
+					sceneVertex.normal = localVertex.normal;
 					sceneVertex.lightmap = localVertex.lightmap;
 					sceneVertex.lightmapLayer = localVertex.lightmapLayer;
 					scratchVertices.push_back(sceneVertex);
@@ -5698,12 +5770,26 @@ static bool VRHI_BuildSceneGeometry(const refdef_t *fd) {
 			g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) continue;
 		const uint32_t firstVertex = static_cast<uint32_t>(g_sceneVertices.size());
 		const uint32_t firstIndex = static_cast<uint32_t>(g_sceneIndexes.size());
+		glm::vec3 polyNormal(0.0f, 0.0f, 1.0f);
+		if (poly.numVerts >= 3) {
+			// Planar polygon face normal for later view-dependent stages;
+			// degenerate polygons fall back to up.
+			const polyVert_t &a = g_scenePolyVerts[poly.firstVertex + 0];
+			const polyVert_t &b = g_scenePolyVerts[poly.firstVertex + 1];
+			const polyVert_t &c = g_scenePolyVerts[poly.firstVertex + 2];
+			const glm::vec3 edge1(b.xyz[0] - a.xyz[0], b.xyz[1] - a.xyz[1], b.xyz[2] - a.xyz[2]);
+			const glm::vec3 edge2(c.xyz[0] - a.xyz[0], c.xyz[1] - a.xyz[1], c.xyz[2] - a.xyz[2]);
+			const glm::vec3 crossed = glm::cross(edge1, edge2);
+			const float crossedLengthSquared = glm::dot(crossed, crossed);
+			if (std::isfinite(crossedLengthSquared) && crossedLengthSquared > 1.0e-10f)
+				polyNormal = crossed / std::sqrt(crossedLengthSquared);
+		}
 		for (uint32_t i = 0; i < poly.numVerts; ++i) {
 			const polyVert_t &source = g_scenePolyVerts[poly.firstVertex + i];
 			const glm::vec4 color(source.modulate[0] / 255.0f, source.modulate[1] / 255.0f,
 				source.modulate[2] / 255.0f, source.modulate[3] / 255.0f);
 			g_sceneVertices.push_back(VRHI_SceneVertex(glm::vec3(source.xyz[0], source.xyz[1], source.xyz[2]),
-				glm::vec2(source.st[0], source.st[1]), color));
+				glm::vec2(source.st[0], source.st[1]), color, polyNormal));
 		}
 		for (uint32_t i = 1; i + 1 < poly.numVerts; ++i) {
 			g_sceneIndexes.push_back(firstVertex);
@@ -5738,7 +5824,7 @@ static bool VRHI_EnsureSceneBuffers(void) {
 	if (!g_sceneBuffersCreated) {
 		const int32_t errorsBefore = g_vhErrorCounter.load(std::memory_order_relaxed);
 		vhCreateVertexBuffer(g_sceneVertexBuffer, "VRHI_SceneVertices", nullptr,
-			"float3 float2 float2 float float4", VRHI_MAX_SCENE_VERTICES);
+			"float3 float2 float2 float float4 float3", VRHI_MAX_SCENE_VERTICES);
 		vhCreateIndexBuffer(g_sceneIndexBuffer, "VRHI_SceneIndexes", nullptr,
 			VRHI_MAX_SCENE_INDEXES, VRHI_BUFFER_INDEX32);
 		vhFinish();
