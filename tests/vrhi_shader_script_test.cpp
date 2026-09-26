@@ -2177,6 +2177,120 @@ void testStageTcGenEnvironment() {
 		"{ map textures/foo/bar.tga tcGen texture }", nullptr), "");
 }
 
+void testDeformWaveMath() {
+	// GL1 tr_init.c table shapes evaluated through the shared CPU helper:
+	// exact values at canonical fractions, truncation wrap for negatives.
+	CHECK(VRHI_WaveTableValue(VRHI_SHADER_WAVE_SIN, 0.0f) == 0.0f);
+	const float sinQuarter = VRHI_WaveTableValue(VRHI_SHADER_WAVE_SIN, 0.25f);
+	CHECK(sinQuarter > 0.999f && sinQuarter <= 1.0f);
+	CHECK_EQ_INT(VRHI_WaveTableValue(VRHI_SHADER_WAVE_SQUARE, 0.0f) > 0.0f ? 1 : 0, 1);
+	CHECK_EQ_INT(VRHI_WaveTableValue(VRHI_SHADER_WAVE_SQUARE, 0.75f) < 0.0f ? 1 : 0, 1);
+	const float saw = VRHI_WaveTableValue(VRHI_SHADER_WAVE_SAWTOOTH, 0.5f);
+	CHECK(saw > 0.499f && saw < 0.501f);
+	const float invSaw = VRHI_WaveTableValue(VRHI_SHADER_WAVE_INVERSE_SAWTOOTH, 0.5f);
+	CHECK(invSaw > 0.499f && invSaw < 0.501f);
+	const float triZero = VRHI_WaveTableValue(VRHI_SHADER_WAVE_TRIANGLE, 0.0f);
+	CHECK(triZero > -0.001f && triZero < 0.001f);
+	const float triQuarter = VRHI_WaveTableValue(VRHI_SHADER_WAVE_TRIANGLE, 0.25f);
+	CHECK(triQuarter > 0.999f && triQuarter <= 1.0f);
+	CHECK_EQ_INT(VRHI_WaveTableValue(VRHI_SHADER_WAVE_NONE, 0.3f) == 0.0f ? 1 : 0, 1);
+	// Negative cycles wrap identically to positive ones (C-cast semantics).
+	CHECK(VRHI_WaveTableValue(VRHI_SHADER_WAVE_SIN, -0.25f) ==
+		VRHI_WaveTableValue(VRHI_SHADER_WAVE_SIN, 0.75f));
+	CHECK(VRHI_WaveTableValue(VRHI_SHADER_WAVE_SAWTOOTH, -0.5f) ==
+		VRHI_WaveTableValue(VRHI_SHADER_WAVE_SAWTOOTH, 0.5f));
+	// Unclamped evaluation keeps signed values (no [0,1] clamp): base plus
+	// table times amplitude at phase + time * frequency.
+	const float waveZero = VRHI_EvalWaveFormUnclamped(
+		VRHI_SHADER_WAVE_SIN, 0.5f, 0.5f, 0.0f, 1.0f, 0.0f);
+	CHECK(waveZero > 0.499f && waveZero < 0.501f);
+	const float waveNeg = VRHI_EvalWaveFormUnclamped(
+		VRHI_SHADER_WAVE_SAWTOOTH, 0.0f, 2.0f, 0.75f, 0.0f, 100.0f);
+	CHECK(waveNeg > 1.499f && waveNeg < 1.501f);
+}
+
+void testStageDeform() {
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	std::unordered_map<std::string, VRHI_ShaderDeform> deforms;
+	// Lava-style wave plus a blended stage: shader-level deform attaches to
+	// the material while stages parse normally.
+	const std::string wave = script(
+		"deformVertexes wave 1 sin .01 .03 0 0.2 "
+		"{ map textures/base.tga } "
+		"{ map textures/a.png blendFunc blend }");
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(wave), wave.size(), wanted, &results, &deforms));
+	CHECK_EQ_INT(results.size(), 1u);
+	CHECK_EQ_INT(deforms.size(), 1u);
+	if (deforms.size() == 1) {
+		const VRHI_ShaderDeform &deform = deforms["textures/foo/bar"];
+		CHECK_EQ_INT(deform.kind, VRHI_SHADER_DEFORM_WAVE);
+		CHECK_EQ_INT(deform.waveFunc, VRHI_SHADER_WAVE_SIN);
+		CHECK(deform.spread > 0.99f && deform.spread < 1.01f);
+		CHECK(deform.wave[0] > 0.009f && deform.wave[0] < 0.011f);
+		CHECK(deform.wave[1] > 0.029f && deform.wave[1] < 0.031f);
+		CHECK(deform.wave[3] > 0.19f && deform.wave[3] < 0.21f);
+	}
+	// Divisor semantics: spread is 1/divisor, matched case-insensitively.
+	const std::string spread = script(
+		"{ map textures/base.tga } DEFORMVERTEXES WAVE 32 SIN 1.5 1.7 .5 1");
+	results.clear();
+	deforms.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(spread), spread.size(), wanted, &results, &deforms));
+	if (deforms.size() == 1) {
+		const VRHI_ShaderDeform &deform = deforms["textures/foo/bar"];
+		CHECK_EQ_INT(deform.kind, VRHI_SHADER_DEFORM_WAVE);
+		CHECK(deform.spread > 0.031f && deform.spread < 0.032f);
+	}
+	// Mover-style translation and bulge forms.
+	const std::string move = script(
+		"deformVertexes move 0 0 8 sin 0 1 0 0.5 { map textures/base.tga }");
+	results.clear();
+	deforms.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(move), move.size(), wanted, &results, &deforms));
+	if (deforms.size() == 1) {
+		const VRHI_ShaderDeform &deform = deforms["textures/foo/bar"];
+		CHECK_EQ_INT(deform.kind, VRHI_SHADER_DEFORM_MOVE);
+		CHECK(deform.move[2] > 7.99f && deform.move[2] < 8.01f);
+		CHECK_EQ_INT(deform.waveFunc, VRHI_SHADER_WAVE_SIN);
+		CHECK(deform.wave[1] > 0.99f && deform.wave[1] < 1.01f);
+	}
+	const std::string bulge = script(
+		"{ map textures/base.tga } deformVertexes bulge 4 2 1.5");
+	results.clear();
+	deforms.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(bulge), bulge.size(), wanted, &results, &deforms));
+	if (deforms.size() == 1) {
+		const VRHI_ShaderDeform &deform = deforms["textures/foo/bar"];
+		CHECK_EQ_INT(deform.kind, VRHI_SHADER_DEFORM_BULGE);
+		CHECK(deform.bulge[0] > 3.99f && deform.bulge[0] < 4.01f);
+		CHECK(deform.bulge[1] > 1.99f && deform.bulge[1] < 2.01f);
+		CHECK(deform.bulge[2] > 1.49f && deform.bulge[2] < 1.51f);
+	}
+	// Only the first valid statement is kept; ignored subtypes (autosprite,
+	// normal, unknown) and invalid statements (zero divisor, bad func,
+	// truncated, out-of-range) leave the material static but accepted.
+	const std::string firstWins = script(
+		"deformVertexes wave 1 sin 0 1 0 1 deformVertexes move 0 0 8 sin 0 1 0 1 "
+		"{ map textures/base.tga }");
+	results.clear();
+	deforms.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(firstWins), firstWins.size(), wanted, &results, &deforms));
+	if (deforms.size() == 1)
+		CHECK_EQ_INT(deforms["textures/foo/bar"].kind, VRHI_SHADER_DEFORM_WAVE);
+	const std::string ignored = script(
+		"deformVertexes autosprite deformVertexes normal 3 0.5 deformVertexes frobnicate 1 2 "
+		"deformVertexes wave 0 sin 0 1 0 1 deformVertexes wave 1 noise 0 1 0 1 "
+		"deformVertexes move 0 0 99999 sin 0 1 0 1 deformVertexes bulge 1 2 "
+		"{ map textures/base.tga }");
+	results.clear();
+	deforms.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(ignored), ignored.size(), wanted, &results, &deforms));
+	CHECK_EQ_INT(results.size(), 1u);
+	CHECK(deforms.empty());
+}
+
 void testStageWaveGenerators() {
 	// Direct parser-helper bounds/token safety: VRHI_ShaderParseWaveConstant
 	// accepts finite in-range parameters (zero and the inclusive |16| bound
@@ -2583,6 +2697,8 @@ int main() {
 	testStageTcModTurbStretch();
 	testStageAnimMap();
 	testStageTcGenEnvironment();
+	testDeformWaveMath();
+	testStageDeform();
 	testStageWaveGenerators();
 	testConsoleScriptResolution();
 	testPathSafetyHelpers();

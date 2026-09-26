@@ -360,6 +360,16 @@ struct VRHI_WorldBatch {
 	// diffuse UVs, preserving the existing sampling; only the diffuse
 	// material sample is affected, never lightmaps, vertex colour, or UI.
 	uint8_t stageTcGenEnv[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+	// Shader-level bounded `deformVertexes` displacement (wave/move/bulge)
+	// shared by every stage of this material. NONE renders statically.
+	// waveValue holds base/amplitude/phase/frequency in script order;
+	// moveValue the translation vector; bulgeValue width/height/speed.
+	uint8_t deformKind = VRHI_SHADER_DEFORM_NONE;
+	uint8_t deformWaveFunc = VRHI_SHADER_WAVE_NONE;
+	float deformWaveSpread = 0.0f;
+	float deformWaveValue[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	float deformMoveValue[3] = { 0.0f, 0.0f, 0.0f };
+	float deformBulgeValue[3] = { 0.0f, 0.0f, 0.0f };
 	// Shader surfaceparm trans is a sort hint, separate from blend mode. The
 	// world renderer sorts these and blended bases/overlays after opaque draws.
 	bool surfaceTranslucent = false;
@@ -487,6 +497,10 @@ static std::unordered_map<qhandle_t, size_t> g_inlineBSPModelByHandle;
 // Script results are map-scoped. Stage paths are copied qpaths, never pointers
 // into FS_ListFiles/FS_ReadFile storage; missing or rejected scripts are absent.
 static std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > g_worldShaderScriptStages;
+// Shader-level deformVertexes metadata, keyed exactly like the stage table
+// (lowercased shader name, first file wins). Only shaders with a valid
+// wave/move/bulge statement are present.
+static std::unordered_map<std::string, VRHI_ShaderDeform> g_worldShaderDeforms;
 static std::vector<std::string> g_worldShaderNames;
 static std::unordered_set<std::string> g_unresolvedMaterialReports;
 static bool g_worldShaderScriptsScanned = false;
@@ -602,6 +616,13 @@ static std::vector<int32_t> g_worldSurfaceBatch; // surface index -> batch index
 static std::vector<byte> g_worldVisBits;         // numClusters * clusterBytes rows
 static std::vector<int32_t> g_worldBatchMarked;  // per-batch visible epoch stamp
 static int32_t g_worldVisEpoch = 0;
+// Per-map vertex-deformation state. g_worldDeformActive is set at load when
+// any batch carries a wave/move/bulge deformation; the per-frame refresh is
+// skipped entirely otherwise. Stamps guard index-shared vertices so each is
+// displaced exactly once per frame from its pristine base position.
+static bool g_worldDeformActive = false;
+static std::vector<int32_t> g_worldDeformStamps;
+static int32_t g_worldDeformEpoch = 0;
 static int32_t g_worldNumClusters = 0;
 static int32_t g_worldClusterBytes = 0;
 static bool g_worldVisAvailable = false;
@@ -1946,6 +1967,10 @@ static void VRHI_DestroyWorldResources(bool clearGeometry) {
 	g_worldVisBits.clear();
 	g_worldBatchMarked.clear();
 	g_worldVisEpoch = 0;
+	g_worldDeformActive = false;
+	g_worldDeformStamps.clear();
+	g_worldDeformEpoch = 0;
+	g_worldShaderDeforms.clear();
 	g_worldNumClusters = 0;
 	g_worldClusterBytes = 0;
 	g_worldVisAvailable = false;
@@ -3372,6 +3397,7 @@ static bool VRHI_IsUIScriptShader(const char *name) {
 static void VRHI_ScanShaderScripts(const std::vector<std::string> &shaderNames) {
 	g_worldShaderNames = shaderNames;
 	g_worldShaderScriptStages.clear();
+	g_worldShaderDeforms.clear();
 	g_worldShaderScriptsScanned = true;
 	std::unordered_map<std::string, bool> wanted;
 	char **fileList = nullptr;
@@ -3411,10 +3437,20 @@ static void VRHI_ScanShaderScripts(const std::vector<std::string> &shaderNames) 
 				if (fileSize <= VRHI_MAX_SHADER_FILE_BYTES && totalText <= VRHI_MAX_SHADER_TEXT_BYTES - fileSize) {
 					totalText += fileSize;
 					std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > parsedResults;
-					if (VRHI_ParseShaderScriptStages(static_cast<const byte *>(activeFileData), fileSize, wanted, &parsedResults)) {
-						for (auto &result : parsedResults)
-							if (g_worldShaderScriptStages.find(result.first) == g_worldShaderScriptStages.end())
+					std::unordered_map<std::string, VRHI_ShaderDeform> parsedDeforms;
+					if (VRHI_ParseShaderScriptStages(static_cast<const byte *>(activeFileData), fileSize, wanted, &parsedResults, &parsedDeforms)) {
+						for (auto &result : parsedResults) {
+							if (g_worldShaderScriptStages.find(result.first) == g_worldShaderScriptStages.end()) {
 								g_worldShaderScriptStages.emplace(result.first, std::move(result.second));
+								// Deform metadata travels with the winning stages:
+								// a lower-priority file's deform never attaches to
+								// higher-priority stages, matching GL1's first
+								// definition wins.
+								const auto deformFound = parsedDeforms.find(result.first);
+								if (deformFound != parsedDeforms.end())
+									g_worldShaderDeforms.emplace(deformFound->first, deformFound->second);
+							}
+						}
 					}
 				} else {
 					VRHI_Printf(PRINT_WARNING, "renderer_vrhi: shader script scan text cap reached at '%s'\n", qpath.c_str());
@@ -3576,6 +3612,21 @@ static void VRHI_ReportUnresolvedMaterial(const char *shaderName, const char *re
 	VRHI_Printf(PRINT_DEVELOPER,
 		"renderer_vrhi: unresolved material '%s' (%s); solid fallback\n",
 		shaderName, reason != nullptr ? reason : "unknown");
+}
+
+// Resolves shader-level deformVertexes metadata for one batch. Batches
+// default to static (NONE); only a scanned wave/move/bulge deformation is
+// copied, so unscanned or undeforming materials keep existing behavior.
+static void VRHI_ResolveBatchDeform(const dshader_t &shader, VRHI_WorldBatch *batch) {
+	if (batch == nullptr) return;
+	const VRHI_ShaderDeform *found = VRHI_FindShaderDeform(shader.shader, g_worldShaderDeforms);
+	if (found == nullptr || found->kind == VRHI_SHADER_DEFORM_NONE) return;
+	batch->deformKind = static_cast<uint8_t>(found->kind);
+	batch->deformWaveFunc = static_cast<uint8_t>(found->waveFunc);
+	batch->deformWaveSpread = found->spread;
+	for (int i = 0; i < 4; ++i) batch->deformWaveValue[i] = found->wave[i];
+	for (int i = 0; i < 3; ++i) batch->deformMoveValue[i] = found->move[i];
+	for (int i = 0; i < 3; ++i) batch->deformBulgeValue[i] = found->bulge[i];
 }
 
 static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
@@ -4475,6 +4526,7 @@ static void VRHI_LoadWorld(const char *name) {
 			const uint32_t firstIndex = static_cast<uint32_t>(g_worldIndexes.size());
 			for (uint32_t index : patch.indexes) g_worldIndexes.push_back(baseVertex + index);
 			VRHI_WorldBatch batch;
+			VRHI_ResolveBatchDeform(shader, &batch);
 			batch.firstIndex = firstIndex;
 			batch.indexCount = static_cast<uint32_t>(patch.indexes.size());
 			batch.diffuseImage = diffuseImage;
@@ -4611,6 +4663,7 @@ static void VRHI_LoadWorld(const char *name) {
 		}
 		if (surfaceTriangles > 0) {
 			VRHI_WorldBatch batch;
+			VRHI_ResolveBatchDeform(shader, &batch);
 			batch.firstIndex = surfaceFirstIndex;
 			batch.indexCount = static_cast<uint32_t>(g_worldIndexes.size()) - surfaceFirstIndex;
 			batch.diffuseImage = diffuseImage;
@@ -4794,6 +4847,7 @@ static void VRHI_LoadWorld(const char *name) {
 			// are retained for consistency and the existing single-stage inline
 			// rendering scope is unchanged.
 			for (VRHI_WorldBatch &batch : surfaceModel.batches) {
+				VRHI_ResolveBatchDeform(shader, &batch);
 				batch.stageCount = static_cast<uint8_t>(stageCount);
 				batch.surfaceTranslucent = (shader.contentFlags & CONTENTS_TRANSLUCENT) != 0;
 				batch.translucent = (stageCount > 0 &&
@@ -4875,16 +4929,23 @@ static void VRHI_LoadWorld(const char *name) {
 	}
 	VRHI_RefreshInlineModelHandles();
 	int multiStageBatches = 0;
-	for (const VRHI_WorldBatch &batch : g_worldBatches)
+	int deformBatches = 0;
+	g_worldDeformActive = false;
+	for (const VRHI_WorldBatch &batch : g_worldBatches) {
 		if (batch.stageCount > 1) ++multiStageBatches;
+		if (batch.deformKind != VRHI_SHADER_DEFORM_NONE) {
+			++deformBatches;
+			g_worldDeformActive = true;
+		}
+	}
 	g_worldLoaded = !g_worldVertices.empty() && !g_worldIndexes.empty();
 	// Per-batch visibility stamps are rebuilt whenever the batch list changes.
 	g_worldBatchMarked.assign(g_worldBatches.size(), 0);
 	g_worldVisEpoch = 0;
 	VRHI_Printf(PRINT_ALL,
-		"renderer_vrhi: BSP world '%s': models=%d inlineAccepted=%d inlineSkipped=%d surfaces=%d accepted=%d skipped=%d vertices=%zu indexes=%zu lightmaps=%d diffuse=%zu batches=%zu multistage=%d cull=%s planes=%d nodes=%d leafs=%d leafsurfaces=%d clusters=%d vis=%s\n",
+		"renderer_vrhi: BSP world '%s': models=%d inlineAccepted=%d inlineSkipped=%d surfaces=%d accepted=%d skipped=%d vertices=%zu indexes=%zu lightmaps=%d diffuse=%zu batches=%zu multistage=%d deform=%d cull=%s planes=%d nodes=%d leafs=%d leafsurfaces=%d clusters=%d vis=%s\n",
 		name, modelCount, inlineAccepted, inlineSkipped, model.numSurfaces, accepted, skipped, g_worldVertices.size(), g_worldIndexes.size(),
-		g_worldLightmapLayers, g_worldDiffuseImages.size(), g_worldBatches.size(), multiStageBatches,
+		g_worldLightmapLayers, g_worldDiffuseImages.size(), g_worldBatches.size(), multiStageBatches, deformBatches,
 		cullLumpsValid ? (g_worldVisAvailable ? "pvs" : "fallback-novis") : "fallback-lumps",
 		planeCount, nodeCount, leafCount, leafSurfaceCount, g_worldNumClusters,
 		g_worldVisAvailable ? "yes" : "no");
@@ -5670,7 +5731,15 @@ static bool VRHI_AppendMD3Model(const refEntity_t &entity, const glm::vec4 &colo
 	return true;
 }
 
-static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4 &color) {
+// Defined with the world vertex refresh below: displaces one base vertex by
+// its batch's deformVertexes metadata. Declared here so the inline-model
+// scene build (which runs before it in the file) can share it.
+static glm::vec3 VRHI_DeformDisplace(const VRHI_WorldBatch &batch,
+	const glm::vec3 &basePos, const glm::vec3 &normal, float diffuseS,
+	float timeSeconds);
+
+static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4 &color,
+	float deformTimeSeconds) {
 	const auto found = g_inlineBSPModelByHandle.find(entity.hModel);
 	if (found == g_inlineBSPModelByHandle.end() || found->second >= g_inlineBSPModels.size()) return false;
 	const VRHI_InlineBSPModel &model = g_inlineBSPModels[found->second];
@@ -5695,11 +5764,17 @@ static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4
 				uint32_t sceneIndex = 0;
 				if (mapped == vertexMap.end()) {
 					const VRHI_WorldVertex &localVertex = model.vertices[index];
-					const glm::vec3 &p = localVertex.position;
+					// Shader-level deformVertexes displacement in model-local
+					// space (GL1 deforms entity geometry before the entity
+					// transform), evaluated at the current frame time. The
+					// normal stays undeformed exactly like GL1; static
+					// batches return the base position unchanged.
+					const glm::vec3 q = VRHI_DeformDisplace(batch, localVertex.position,
+						localVertex.normal, localVertex.diffuse.x, deformTimeSeconds);
 					const glm::vec3 position = origin + glm::vec3(
-						entity.axis[0][0] * p.x + entity.axis[1][0] * p.y + entity.axis[2][0] * p.z,
-						entity.axis[0][1] * p.x + entity.axis[1][1] * p.y + entity.axis[2][1] * p.z,
-						entity.axis[0][2] * p.x + entity.axis[1][2] * p.y + entity.axis[2][2] * p.z);
+						entity.axis[0][0] * q.x + entity.axis[1][0] * q.y + entity.axis[2][0] * q.z,
+						entity.axis[0][1] * q.x + entity.axis[1][1] * q.y + entity.axis[2][1] * q.z,
+						entity.axis[0][2] * q.x + entity.axis[1][2] * q.y + entity.axis[2][2] * q.z);
 					if (!std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z)) {
 						scratchIndexes.clear();
 						break;
@@ -5788,7 +5863,8 @@ static bool VRHI_BuildSceneGeometry(const refdef_t *fd) {
 			if (g_md3ModelByHandle.find(entity.hModel) != g_md3ModelByHandle.end())
 				VRHI_AppendMD3Model(entity, color);
 			else
-				VRHI_AppendInlineBSPModel(entity, color);
+				VRHI_AppendInlineBSPModel(entity, color,
+					static_cast<float>(fd->time) * 0.001f);
 		} else if (entity.reType == RT_SPRITE) {
 			if (!(entity.radius > 0.0f) || !std::isfinite(entity.radius)) continue;
 			const float angle = entity.rotation * 3.14159265358979323846f / 180.0f;
@@ -6051,21 +6127,116 @@ static int VRHI_CullDebugEnabled(void) {
 
 // Recomputes the static world vertex color attribute from the submitted
 // per-scene dynamic lights. Only the color field changes; positions, UVs,
-// lightmap layer, and the index buffer are never touched. The persistent
-// bounded scratch is sized to the world vertex count once per map, and the
-// update is enqueued before the world draws so command ordering makes it
-// visible to the same frame. Callers skip this entirely when no lights were
-// submitted, keeping the no-light path a strict no-op with zero VRHI work.
-static void VRHI_UpdateWorldVertexLighting(void) {
+// Displaces one base vertex by its batch's shader-level deformVertexes
+// metadata at the given frame time (seconds), matching the GL1
+// RB_CalcDeformVertexes/RB_CalcBulgeVertexes/RB_CalcMoveVertexes evaluation:
+// wave displaces along the vertex normal (uniform when frequency is 0,
+// per-vertex with a (x+y+z)*spread phase offset otherwise), bulge displaces
+// along the normal by the diffuse-s sine waveform, move translates every
+// vertex by its vector. Unclamped waveform values are used exactly like
+// GL1. Returns basePos for NONE or non-finite scales, so undeforming
+// batches render statically.
+static glm::vec3 VRHI_DeformDisplace(const VRHI_WorldBatch &batch,
+	const glm::vec3 &basePos, const glm::vec3 &normal, float diffuseS,
+	float timeSeconds) {
+	const int func = batch.deformWaveFunc;
+	const float base = batch.deformWaveValue[0];
+	const float amplitude = batch.deformWaveValue[1];
+	const float phase = batch.deformWaveValue[2];
+	const float frequency = batch.deformWaveValue[3];
+	switch (batch.deformKind) {
+	case VRHI_SHADER_DEFORM_WAVE: {
+		float scale;
+		if (frequency == 0.0f) {
+			scale = VRHI_EvalWaveFormUnclamped(func, base, amplitude,
+				phase, frequency, timeSeconds);
+		} else {
+			const float vertexPhase = phase +
+				(basePos.x + basePos.y + basePos.z) * batch.deformWaveSpread;
+			scale = VRHI_EvalWaveFormUnclamped(func, base, amplitude,
+				vertexPhase, frequency, timeSeconds);
+		}
+		if (!std::isfinite(scale)) return basePos;
+		return basePos + normal * scale;
+	}
+	case VRHI_SHADER_DEFORM_MOVE: {
+		const float scale = VRHI_EvalWaveFormUnclamped(func, base, amplitude,
+			phase, frequency, timeSeconds);
+		if (!std::isfinite(scale)) return basePos;
+		return basePos + glm::vec3(batch.deformMoveValue[0],
+			batch.deformMoveValue[1], batch.deformMoveValue[2]) * scale;
+	}
+	case VRHI_SHADER_DEFORM_BULGE: {
+		// GL1: off = (1024/2PI) * (s * width + time * speed);
+		// scale = sinTable[off & mask] * height.
+		const float cycles = (diffuseS * batch.deformBulgeValue[0] +
+			timeSeconds * batch.deformBulgeValue[2]) * (1.0f / 6.283185307179586f);
+		const float scale = VRHI_WaveTableValue(VRHI_SHADER_WAVE_SIN, cycles) *
+			batch.deformBulgeValue[1];
+		if (!std::isfinite(scale)) return basePos;
+		return basePos + normal * scale;
+	}
+	default:
+		return basePos;
+	}
+}
+
+// Applies every deforming batch to the refreshed scratch positions. Each
+// index-shared vertex is displaced exactly once per frame (epoch stamps)
+// from its pristine base values; the scratch holds a base copy on entry.
+static void VRHI_ApplyWorldDeform(float timeSeconds) {
+	if (g_worldDeformStamps.size() != g_worldVertices.size()) {
+		g_worldDeformStamps.assign(g_worldVertices.size(), 0);
+		g_worldDeformEpoch = 0;
+	}
+	if (g_worldDeformEpoch <= 0 ||
+		g_worldDeformEpoch == std::numeric_limits<int32_t>::max()) {
+		g_worldDeformEpoch = 1;
+		std::fill(g_worldDeformStamps.begin(), g_worldDeformStamps.end(), 0);
+	} else {
+		++g_worldDeformEpoch;
+	}
+	const int32_t epoch = g_worldDeformEpoch;
+	for (const VRHI_WorldBatch &batch : g_worldBatches) {
+		if (batch.deformKind == VRHI_SHADER_DEFORM_NONE || batch.indexCount == 0 ||
+			batch.firstIndex > g_worldIndexes.size() ||
+			batch.indexCount > g_worldIndexes.size() - batch.firstIndex) continue;
+		for (size_t n = 0; n < batch.indexCount; ++n) {
+			const uint32_t vertexIndex = g_worldIndexes[batch.firstIndex + n];
+			if (vertexIndex >= g_worldVertices.size() ||
+				vertexIndex >= g_worldDeformStamps.size() ||
+				g_worldDeformStamps[vertexIndex] == epoch) continue;
+			g_worldDeformStamps[vertexIndex] = epoch;
+			VRHI_WorldVertex &vertex = g_worldLightedVertices[vertexIndex];
+			vertex.position = VRHI_DeformDisplace(batch, vertex.position,
+				vertex.normal, vertex.diffuse.x, timeSeconds);
+		}
+	}
+}
+
+// Per-frame world vertex refresh: copies the pristine base positions, applies
+// shader deformVertexes displacement, modulates colors by dynamic lights,
+// and uploads once. The lightmap layer, UVs, normals, and the index buffer
+// are never touched. The persistent bounded scratch is sized to the world
+// vertex count once per map, and the update is enqueued before the world
+// draws so command ordering makes it visible to the same frame. Callers skip
+// this entirely when no deforms and no lights were submitted, keeping the
+// idle path a strict no-op with zero VRHI work; with lights only it matches
+// the previous copy-modulate-upload behavior exactly.
+static void VRHI_RefreshWorldVertices(float timeSeconds) {
 	if (!g_worldLoaded || g_worldVertices.empty() ||
 		g_worldVertexBuffer == VRHI_INVALID_HANDLE) return;
 	if (g_worldLightedVertices.size() != g_worldVertices.size()) {
 		g_worldLightedVertices.resize(g_worldVertices.size());
 	}
-	for (size_t i = 0; i < g_worldVertices.size(); ++i) {
-		g_worldLightedVertices[i] = g_worldVertices[i];
-		g_worldLightedVertices[i].color =
-			glm::vec4(VRHI_DLightModulation(g_worldVertices[i].position), 1.0f);
+	std::memcpy(g_worldLightedVertices.data(), g_worldVertices.data(),
+		g_worldVertices.size() * sizeof(VRHI_WorldVertex));
+	if (g_worldDeformActive) VRHI_ApplyWorldDeform(timeSeconds);
+	if (!g_sceneLights.empty()) {
+		for (size_t i = 0; i < g_worldLightedVertices.size(); ++i) {
+			g_worldLightedVertices[i].color =
+				glm::vec4(VRHI_DLightModulation(g_worldLightedVertices[i].position), 1.0f);
+		}
 	}
 	vhMem *vertices = new vhMem(g_worldLightedVertices.size() * sizeof(VRHI_WorldVertex));
 	std::memcpy(vertices->data(), g_worldLightedVertices.data(), vertices->size());
@@ -6178,12 +6349,14 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 	}
 	const vhState worldBaseState = g_worldState;
 	g_worldDrawErrorBaseline = g_vhErrorCounter.load(std::memory_order_relaxed);
-	// Per-scene dynamic lights modulate the static world vertex color
-	// attribute in place before the static world draws. With no lights this
-	// is a strict no-op; with lights, the enqueued update shares the world
-	// draw error accounting below so failures surface in EndFrame's report.
-	if (!g_sceneLights.empty() && g_worldVertexBuffer != VRHI_INVALID_HANDLE) {
-		VRHI_UpdateWorldVertexLighting();
+	// Per-frame world vertex refresh (deformVertexes displacement plus
+	// dynamic-light color modulation) before the static world draws. With no
+	// deforms and no lights this is a strict no-op; otherwise the enqueued
+	// update shares the world draw error accounting below so failures surface
+	// in EndFrame's report.
+	if ((!g_sceneLights.empty() || g_worldDeformActive) &&
+		g_worldVertexBuffer != VRHI_INVALID_HANDLE) {
+		VRHI_RefreshWorldVertices(frameTimeSeconds);
 	}
 	std::vector<size_t> opaqueBatches;
 	std::vector<VRHI_TranslucentDrawOrder> translucentDraws;

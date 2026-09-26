@@ -195,6 +195,19 @@ input buffer, so no FS storage can be referenced after FS_FreeFile.
 // tokens past the stage end. The conservative first-stage helper still
 // treats `tcMod` as unsupported and rejects such shaders.
 //
+// The bounded `deformVertexes` slice extends the same simple multi-stage
+// parser with shader-level vertex deformation shared by every stage: `wave`
+// (divisor plus a five-form waveform, spread = 1/divisor), `move` (a
+// translation vector plus a waveform), and `bulge` (width/height/speed),
+// all finite and inside conservative bounds. The adapter displaces vertices
+// along their normals (move along its vector) every frame using the
+// unclamped GL1 waveform evaluation. Only the first valid statement is
+// kept; `autosprite`, `normal`, `projectionShadow`, text, unknown,
+// truncated, non-finite, or out-of-range statements keep the existing
+// static ignore with the stage still accepted and never borrow past the
+// shader block. The conservative first-stage helper is unaffected (it never
+// accepted deforming shaders as opaque candidates).
+//
 // The bounded `tcGen environment` slice extends the same simple multi-stage
 // parser with exactly the Quake3 reflection-coordinate generator: the stage
 // samples its image with per-pixel view-dependent coordinates matching GL1's
@@ -282,6 +295,31 @@ enum VRHI_ShaderWaveFunc {
 	VRHI_SHADER_WAVE_TRIANGLE = 3,
 	VRHI_SHADER_WAVE_SAWTOOTH = 4,
 	VRHI_SHADER_WAVE_INVERSE_SAWTOOTH = 5
+};
+// Bounded shader-level `deformVertexes` kinds. NONE renders statically (also
+// the fallback for unknown/malformed statements); WAVE/MOVE/BULGE displace
+// vertices along their normals (MOVE along its vector) every frame.
+// `autosprite`, `normal`, `projectionShadow`, and text deforms keep the
+// existing static ignore with this kind clear.
+enum VRHI_ShaderDeformKind {
+	VRHI_SHADER_DEFORM_NONE = 0,
+	VRHI_SHADER_DEFORM_WAVE = 1,
+	VRHI_SHADER_DEFORM_MOVE = 2,
+	VRHI_SHADER_DEFORM_BULGE = 3
+};
+// Bounded shader-level `deformVertexes` metadata shared by every stage of
+// the material. Only the first valid wave/move/bulge statement is kept
+// (GL1 supports several; multi-deform shaders are rare and keep their first
+// valid deformation). wave holds base/amplitude/phase/frequency in script
+// order with spread = 1/divisor; move holds the translation vector plus the
+// same wave layout; bulge holds width/height/speed.
+struct VRHI_ShaderDeform {
+	int kind = VRHI_SHADER_DEFORM_NONE;
+	int waveFunc = VRHI_SHADER_WAVE_NONE;
+	float spread = 0.0f;
+	float wave[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	float move[3] = { 0.0f, 0.0f, 0.0f };
+	float bulge[3] = { 0.0f, 0.0f, 0.0f };
 };
 // Bounded Quake3 stage alpha-test (`alphaFunc`) comparisons accepted by the
 // simple multi-stage parser. Exactly GE128, GT0, and LT128 are supported
@@ -475,6 +513,17 @@ static const float VRHI_SCRIPT_TCMOD_ROTATE_MAX = 3600.0f;
 // (zero is the static-first-frame identity; common rates are 1..15).
 static const std::size_t VRHI_SHADER_MAX_ANIM_FRAMES = 8;
 static const float VRHI_SCRIPT_ANIMFPS_MAX = 32.0f;
+// Bounded `deformVertexes` ranges. The wave divisor must be finite, nonzero,
+// and |divisor| inside [MIN, MAX] (spread = 1/divisor stays numerically safe
+// for the per-frame vertex math); wave parameters reuse the finite wave
+// bound. Move components are world units (maps span thousands). Bulge
+// width/height/speed match the GL1 atof path with finite, sane magnitudes.
+static const float VRHI_SCRIPT_DEFORM_DIV_MIN = 1.0f / 1024.0f;
+static const float VRHI_SCRIPT_DEFORM_DIV_MAX = 1024.0f;
+static const float VRHI_SCRIPT_DEFORM_MOVE_MAX = 4096.0f;
+static const float VRHI_SCRIPT_DEFORM_BULGE_WIDTH_MAX = 1024.0f;
+static const float VRHI_SCRIPT_DEFORM_BULGE_HEIGHT_MAX = 64.0f;
+static const float VRHI_SCRIPT_DEFORM_BULGE_SPEED_MAX = 64.0f;
 // Bounded tcMod turb/stretches reuse the finite wave parameter domain.
 static const float VRHI_SCRIPT_TCMOD_TURB_MAX = 16.0f;
 static const float VRHI_SCRIPT_TCMOD_STRETCH_MAX = 16.0f;
@@ -927,10 +976,18 @@ inline bool VRHI_ParseShaderScript(const unsigned char *data, std::size_t size,
 // later stages without an explicit blendFunc become static source-alpha
 // overlays. This remains separate from the conservative first-stage helper
 // above.
+// Defined below (after the waveform helpers): parses one shader-level
+// `deformVertexes` statement. Declared here so the block parser can call it.
+inline std::size_t VRHI_ParseShaderDeform(
+	const std::vector<VRHI_ShaderScriptToken> &tokens,
+	std::size_t pos, std::size_t end, VRHI_ShaderDeform *deform);
+
 inline bool VRHI_ParseSimpleShaderBlock(
 	const std::vector<VRHI_ShaderScriptToken> &tokens, std::size_t begin,
-	std::size_t end, std::vector<VRHI_ShaderStage> *stages) {
+	std::size_t end, std::vector<VRHI_ShaderStage> *stages,
+	VRHI_ShaderDeform *deform = nullptr) {
 	if (stages != nullptr) stages->clear();
+	if (deform != nullptr) *deform = VRHI_ShaderDeform();
 	if (stages == nullptr || begin >= end || end > tokens.size()) return false;
 	bool surfaceTranslucent = false;
 	for (std::size_t i = begin; i < end;) {
@@ -944,6 +1001,14 @@ inline bool VRHI_ParseSimpleShaderBlock(
 				if (VRHI_ShaderTokenIs(tokens[i + 1], "trans"))
 					surfaceTranslucent = true;
 				i += 2;
+				continue;
+			}
+			if (deform != nullptr && VRHI_ShaderTokenIs(tokens[i], "deformvertexes")) {
+				// Shader-level vertex deformation shared by every stage of
+				// this material. The parser records the first valid
+				// wave/move/bulge statement and consumes it; anything else
+				// falls through to the existing per-token ignore below.
+				i = VRHI_ParseShaderDeform(tokens, i, end, deform);
 				continue;
 			}
 			++i;
@@ -1413,7 +1478,8 @@ inline bool VRHI_ParseSimpleShaderBlock(
 inline bool VRHI_ParseShaderScriptStages(
 	const unsigned char *data, std::size_t size,
 	const std::unordered_map<std::string, bool> &wanted,
-	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > *results) {
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > *results,
+	std::unordered_map<std::string, VRHI_ShaderDeform> *deforms = nullptr) {
 	std::vector<VRHI_ShaderScriptToken> tokens;
 	if (results == nullptr || !VRHI_TokenizeShaderScript(data, size, &tokens)) return false;
 	for (std::size_t i = 0; i < tokens.size();) {
@@ -1430,8 +1496,12 @@ inline bool VRHI_ParseShaderScriptStages(
 		const std::size_t bodyEnd = i - 1;
 		if (wanted.find(shaderName) == wanted.end()) continue;
 		std::vector<VRHI_ShaderStage> stages;
-		if (VRHI_ParseSimpleShaderBlock(tokens, bodyBegin, bodyEnd, &stages))
+		VRHI_ShaderDeform deform;
+		if (VRHI_ParseSimpleShaderBlock(tokens, bodyBegin, bodyEnd, &stages, &deform)) {
 			results->emplace(shaderName, std::move(stages));
+			if (deforms != nullptr && deform.kind != VRHI_SHADER_DEFORM_NONE)
+				deforms->emplace(shaderName, deform);
+		}
 	}
 	return true;
 }
@@ -1449,6 +1519,142 @@ inline const std::vector<VRHI_ShaderStage> *VRHI_FindShaderScriptStages(
 	if (length == 0 || length >= VRHI_SCRIPT_MAX_QPATH) return nullptr;
 	const auto found = parsed.find(VRHI_ShaderLowerASCII(std::string(shaderName, length)));
 	return found != parsed.end() && !found->second.empty() ? &found->second : nullptr;
+}
+
+// GL1 waveform table value (tr_init.c) at a fractional cycle count, WITHOUT
+// the [0,1] clamp: matches EvalWaveForm/WAVEVALUE for vertex-deformation and
+// motion use. The truncation-toward-zero index wrap matches the C (int64)
+// cast for both signs. func NONE returns 0 (the additive identity: no
+// displacement), so unset generators are always safe to evaluate.
+inline float VRHI_WaveTableValue(int func, float cycles) {
+	const float scaled = cycles * 1024.0f;
+	const float truncated = scaled >= 0.0f ? std::floor(scaled) : std::ceil(scaled);
+	const float wrapped = truncated - 1024.0f * std::floor(truncated / 1024.0f);
+	const float fraction = wrapped / 1024.0f;
+	switch (func) {
+	case VRHI_SHADER_WAVE_SIN:
+		return static_cast<float>(std::sin(6.283185307179586 *
+			static_cast<double>(fraction) * (1024.0 / 1023.0)));
+	case VRHI_SHADER_WAVE_SQUARE:
+		return fraction < 0.5f ? 1.0f : -1.0f;
+	case VRHI_SHADER_WAVE_TRIANGLE: {
+		float triangle = fraction + 0.75f;
+		triangle -= std::floor(triangle);
+		return 4.0f * std::fabs(triangle - 0.5f) - 1.0f;
+	}
+	case VRHI_SHADER_WAVE_SAWTOOTH:
+		return fraction;
+	case VRHI_SHADER_WAVE_INVERSE_SAWTOOTH:
+		return 1.0f - fraction;
+	default:
+		return 0.0f;
+	}
+}
+
+// Unclamped GL1 EvalWaveForm: base + table(phase + time * frequency) *
+// amplitude. Deformation and motion scale by this signed value directly.
+inline float VRHI_EvalWaveFormUnclamped(int func, float base, float amplitude,
+	float phase, float frequency, float timeSeconds) {
+	return base + VRHI_WaveTableValue(func, phase + timeSeconds * frequency) * amplitude;
+}
+
+// Shared bounded lookup for shader-level deform metadata: same safe qpath
+// key discipline as the stage-table lookup above.
+inline const VRHI_ShaderDeform *VRHI_FindShaderDeform(const char *shaderName,
+	const std::unordered_map<std::string, VRHI_ShaderDeform> &parsed) {
+	if (shaderName == nullptr) return nullptr;
+	std::size_t length = 0;
+	while (length < VRHI_SCRIPT_MAX_QPATH && shaderName[length] != '\0') ++length;
+	if (length == 0 || length >= VRHI_SCRIPT_MAX_QPATH) return nullptr;
+	const auto found = parsed.find(VRHI_ShaderLowerASCII(std::string(shaderName, length)));
+	return found != parsed.end() && found->second.kind != VRHI_SHADER_DEFORM_NONE
+		? &found->second : nullptr;
+}
+
+// Parses one shader-level `deformVertexes ...` statement at tokens[pos]
+// (which reads "deformvertexes" case-insensitively). Records the first
+// valid wave/move/bulge deformation into *deform and returns the index past
+// the consumed statement. Anything unrecognized, truncated, non-finite, or
+// out-of-range leaves *deform untouched and returns pos + 1, so the generic
+// loop skips the arguments exactly as before this slice. Never reads past
+// end. `autosprite`, `normal`, `projectionShadow`, and text deforms keep
+// their existing static ignore (keyword consumed, no metadata).
+inline std::size_t VRHI_ParseShaderDeform(
+	const std::vector<VRHI_ShaderScriptToken> &tokens,
+	std::size_t pos, std::size_t end, VRHI_ShaderDeform *deform) {
+	if (deform == nullptr || pos + 1 >= end) return pos + 1;
+	const std::string sub = VRHI_ShaderLowerASCII(tokens[pos + 1].text);
+	if (sub == "wave") {
+		// deformVertexes wave divisor func base amplitude phase frequency.
+		// GL1 stores spread = 1/divisor (divisor 0 warns and uses 100);
+		// this slice ignores a zero/tiny/huge divisor instead.
+		if (pos + 6 >= end) return pos + 1;
+		float divisor = 0.0f;
+		if (!VRHI_ShaderParseFiniteConstant(tokens[pos + 2].text,
+			-VRHI_SCRIPT_DEFORM_DIV_MAX, VRHI_SCRIPT_DEFORM_DIV_MAX, &divisor) ||
+			divisor == 0.0f || std::fabs(divisor) < VRHI_SCRIPT_DEFORM_DIV_MIN)
+			return pos + 1;
+		const int func = VRHI_ShaderWaveFuncFromName(tokens[pos + 3].text);
+		if (func == VRHI_SHADER_WAVE_NONE) return pos + 1;
+		float wave[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+		for (std::size_t k = 0; k < 4; ++k) {
+			if (!VRHI_ShaderParseFiniteConstant(tokens[pos + 4 + k].text,
+				-VRHI_SCRIPT_WAVE_PARAM_MAX, VRHI_SCRIPT_WAVE_PARAM_MAX, &wave[k]))
+				return pos + 1;
+		}
+		if (deform->kind == VRHI_SHADER_DEFORM_NONE) {
+			deform->kind = VRHI_SHADER_DEFORM_WAVE;
+			deform->waveFunc = func;
+			deform->spread = 1.0f / divisor;
+			for (std::size_t k = 0; k < 4; ++k) deform->wave[k] = wave[k];
+		}
+		return pos + 7;
+	}
+	if (sub == "move") {
+		// deformVertexes move x y z func base amplitude phase frequency.
+		if (pos + 9 >= end) return pos + 1;
+		float move[3] = { 0.0f, 0.0f, 0.0f };
+		for (std::size_t k = 0; k < 3; ++k) {
+			if (!VRHI_ShaderParseFiniteConstant(tokens[pos + 2 + k].text,
+				-VRHI_SCRIPT_DEFORM_MOVE_MAX, VRHI_SCRIPT_DEFORM_MOVE_MAX, &move[k]))
+				return pos + 1;
+		}
+		const int func = VRHI_ShaderWaveFuncFromName(tokens[pos + 5].text);
+		if (func == VRHI_SHADER_WAVE_NONE) return pos + 1;
+		float wave[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+		for (std::size_t k = 0; k < 4; ++k) {
+			if (!VRHI_ShaderParseFiniteConstant(tokens[pos + 6 + k].text,
+				-VRHI_SCRIPT_WAVE_PARAM_MAX, VRHI_SCRIPT_WAVE_PARAM_MAX, &wave[k]))
+				return pos + 1;
+		}
+		if (deform->kind == VRHI_SHADER_DEFORM_NONE) {
+			deform->kind = VRHI_SHADER_DEFORM_MOVE;
+			deform->waveFunc = func;
+			for (std::size_t k = 0; k < 3; ++k) deform->move[k] = move[k];
+			for (std::size_t k = 0; k < 4; ++k) deform->wave[k] = wave[k];
+		}
+		return pos + 10;
+	}
+	if (sub == "bulge") {
+		// deformVertexes bulge width height speed.
+		if (pos + 3 >= end) return pos + 1;
+		float bulge[3] = { 0.0f, 0.0f, 0.0f };
+		if (!VRHI_ShaderParseFiniteConstant(tokens[pos + 2].text,
+			-VRHI_SCRIPT_DEFORM_BULGE_WIDTH_MAX, VRHI_SCRIPT_DEFORM_BULGE_WIDTH_MAX,
+			&bulge[0])) return pos + 1;
+		if (!VRHI_ShaderParseFiniteConstant(tokens[pos + 3].text,
+			-VRHI_SCRIPT_DEFORM_BULGE_HEIGHT_MAX, VRHI_SCRIPT_DEFORM_BULGE_HEIGHT_MAX,
+			&bulge[1])) return pos + 1;
+		if (!VRHI_ShaderParseFiniteConstant(tokens[pos + 4].text,
+			-VRHI_SCRIPT_DEFORM_BULGE_SPEED_MAX, VRHI_SCRIPT_DEFORM_BULGE_SPEED_MAX,
+			&bulge[2])) return pos + 1;
+		if (deform->kind == VRHI_SHADER_DEFORM_NONE) {
+			deform->kind = VRHI_SHADER_DEFORM_BULGE;
+			for (std::size_t k = 0; k < 3; ++k) deform->bulge[k] = bulge[k];
+		}
+		return pos + 5;
+	}
+	return pos + 1;
 }
 
 #endif // __VRHI_SHADER_SCRIPT_H
