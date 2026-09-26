@@ -2386,6 +2386,63 @@ void testConstParens() {
 	}
 }
 
+void testStageSkyParms() {
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	std::unordered_map<std::string, VRHI_ShaderSky> skies;
+	// Outerbox prefix plus cloud height record together; stages parse around
+	// them in any order.
+	const std::string boxed = script(
+		"skyParms env/earthsky/earthsky 1024 - { map textures/base.tga }");
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(boxed), boxed.size(), wanted, &results, nullptr, &skies));
+	CHECK_EQ_INT(results.size(), 1u);
+	CHECK_EQ_INT(skies.size(), 1u);
+	if (skies.size() == 1) {
+		const VRHI_ShaderSky &sky = skies["textures/foo/bar"];
+		CHECK_EQ_STR(sky.outerBox, "env/earthsky/earthsky");
+		CHECK(sky.cloudHeight > 1023.0f && sky.cloudHeight < 1025.0f);
+	}
+	// Matching is case-insensitive; "-" records no box but keeps stages.
+	const std::string dash = script(
+		"{ map textures/base.tga } SKYPARMS - 756 -");
+	results.clear();
+	skies.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(dash), dash.size(), wanted, &results, nullptr, &skies));
+	CHECK_EQ_INT(results.size(), 1u);
+	CHECK(skies.empty());
+	// Truncated, bad-height, and unsafe forms keep the stages with no box.
+	const std::string badHeight = script(
+		"skyParms full abc - { map textures/base.tga }");
+	results.clear();
+	skies.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(badHeight), badHeight.size(), wanted, &results, nullptr, &skies));
+	CHECK_EQ_INT(results.size(), 1u);
+	CHECK(skies.empty());
+	const std::string truncated = script(
+		"skyParms full 512 { map textures/base.tga }");
+	results.clear();
+	skies.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncated), truncated.size(), wanted, &results, nullptr, &skies));
+	CHECK_EQ_INT(results.size(), 1u);
+	CHECK(skies.empty());
+	const std::string unsafe = script(
+		"skyParms ../evil 512 - { map textures/base.tga }");
+	results.clear();
+	skies.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(unsafe), unsafe.size(), wanted, &results, nullptr, &skies));
+	CHECK_EQ_INT(results.size(), 1u);
+	CHECK(skies.empty());
+	// A later statement overwrites, matching GL1.
+	const std::string overwrite = script(
+		"skyParms full 512 - skyParms env/space1 1024 - { map textures/base.tga }");
+	results.clear();
+	skies.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(overwrite), overwrite.size(), wanted, &results, nullptr, &skies));
+	if (skies.size() == 1)
+		CHECK_EQ_STR(skies["textures/foo/bar"].outerBox, "env/space1");
+}
+
 void testStageWaveGenerators() {
 	// Direct parser-helper bounds/token safety: VRHI_ShaderParseWaveConstant
 	// accepts finite in-range parameters (zero and the inclusive |16| bound
@@ -2793,6 +2850,7 @@ int main() {
 	testStageAnimMap();
 	testStageTcGenEnvironment();
 	testConstParens();
+	testStageSkyParms();
 	testDeformWaveMath();
 	testStageDeform();
 	testStageSkyBackdrop();

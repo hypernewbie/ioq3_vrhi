@@ -376,8 +376,13 @@ struct VRHI_WorldBatch {
 	float deformBulgeValue[3] = { 0.0f, 0.0f, 0.0f };
 	// Sky surfaces (SURF_SKY) render first with direction-projected box UVs
 	// instead of authored diffuse UVs. The script stages resolve normally;
-	// a sky material without accepted stages stays skipped (black, as before).
+	// a sky material without accepted stages uses the packed outerbox atlas
+	// when one resolves, and stays skipped (black) otherwise.
 	bool sky = false;
+	// Packed outerbox atlas backdrop (box-only skies): the single stage
+	// image is a 3x2 atlas of the six GL1-ordered faces, sampled with the
+	// face-cell UV transform and the CLAMP sampler below.
+	bool skyBox = false;
 	// Shader surfaceparm trans is a sort hint, separate from blend mode. The
 	// world renderer sorts these and blended bases/overlays after opaque draws.
 	bool surfaceTranslucent = false;
@@ -509,6 +514,9 @@ static std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > g_worldSh
 // (lowercased shader name, first file wins). Only shaders with a valid
 // wave/move/bulge statement are present.
 static std::unordered_map<std::string, VRHI_ShaderDeform> g_worldShaderDeforms;
+// Shader-level skyParms metadata, keyed exactly like the stage table (first
+// file wins). Only shaders with a well-formed outerbox prefix are present.
+static std::unordered_map<std::string, VRHI_ShaderSky> g_worldShaderSkies;
 static std::vector<std::string> g_worldShaderNames;
 static std::unordered_set<std::string> g_unresolvedMaterialReports;
 static bool g_worldShaderScriptsScanned = false;
@@ -1576,7 +1584,8 @@ float4 main(PSInput input) : SV_Target
     // signed ratios over the dominant component, mapped to [0,1] with
     // GL1's t flip. Cloud density follows the absolute box mapping (an
     // approximation of GL1's clipped-region mapping) composed with the
-    // stage's own tcMod scroll/scale below.
+    // stage's own tcMod scroll/scale below. Packed outerbox atlases
+    // (box-only skies) remap through the GL1-ordered 3x2 face grid.
     if (u_sky.x > 0.5) {
         const float3 skyDir = input.worldPos - u_viewOrigin.xyz;
         const float skyAx = abs(skyDir.x);
@@ -1584,30 +1593,41 @@ float4 main(PSInput input) : SV_Target
         const float skyAz = abs(skyDir.z);
         float skyS;
         float skyT;
+        int skyCell;
         if (skyAx > skyAy && skyAx > skyAz) {
             if (skyDir.x < 0.0) {
                 skyS = skyDir.y / -skyDir.x;
                 skyT = skyDir.z / -skyDir.x;
+                skyCell = 2;
             } else {
                 skyS = -skyDir.y / skyDir.x;
                 skyT = skyDir.z / skyDir.x;
+                skyCell = 0;
             }
         } else if (skyAy > skyAz && skyAy > skyAx) {
             if (skyDir.y < 0.0) {
                 skyS = -skyDir.x / -skyDir.y;
                 skyT = skyDir.z / -skyDir.y;
+                skyCell = 3;
             } else {
                 skyS = skyDir.x / skyDir.y;
                 skyT = skyDir.z / skyDir.y;
+                skyCell = 1;
             }
         } else if (skyDir.z < 0.0) {
             skyS = -skyDir.y / -skyDir.z;
             skyT = skyDir.x / -skyDir.z;
+            skyCell = 5;
         } else {
             skyS = -skyDir.y / skyDir.z;
             skyT = -skyDir.x / skyDir.z;
+            skyCell = 4;
         }
         uv = float2(skyS * 0.5 + 0.5, (1.0 - skyT) * 0.5);
+        if (u_sky.y > 0.5) {
+            const float2 cellOrigin = float2(float(skyCell % 3), float(skyCell / 3));
+            uv = (cellOrigin + uv) / float2(3.0, 2.0);
+        }
     }
     // Bounded `tcGen environment`: per-pixel reflection coordinates matching
     // GL1's RB_CalcEnvironmentTexCoords (reflection of the view vector about
@@ -1813,7 +1833,8 @@ float4 main(PSInput input) : SV_Target
     // signed ratios over the dominant component, mapped to [0,1] with
     // GL1's t flip. Cloud density follows the absolute box mapping (an
     // approximation of GL1's clipped-region mapping) composed with the
-    // stage's own tcMod scroll/scale below.
+    // stage's own tcMod scroll/scale below. Packed outerbox atlases
+    // (box-only skies) remap through the GL1-ordered 3x2 face grid.
     if (u_sky.x > 0.5) {
         const float3 skyDir = input.worldPos - u_viewOrigin.xyz;
         const float skyAx = abs(skyDir.x);
@@ -1821,30 +1842,41 @@ float4 main(PSInput input) : SV_Target
         const float skyAz = abs(skyDir.z);
         float skyS;
         float skyT;
+        int skyCell;
         if (skyAx > skyAy && skyAx > skyAz) {
             if (skyDir.x < 0.0) {
                 skyS = skyDir.y / -skyDir.x;
                 skyT = skyDir.z / -skyDir.x;
+                skyCell = 2;
             } else {
                 skyS = -skyDir.y / skyDir.x;
                 skyT = skyDir.z / skyDir.x;
+                skyCell = 0;
             }
         } else if (skyAy > skyAz && skyAy > skyAx) {
             if (skyDir.y < 0.0) {
                 skyS = -skyDir.x / -skyDir.y;
                 skyT = skyDir.z / -skyDir.y;
+                skyCell = 3;
             } else {
                 skyS = skyDir.x / skyDir.y;
                 skyT = skyDir.z / skyDir.y;
+                skyCell = 1;
             }
         } else if (skyDir.z < 0.0) {
             skyS = -skyDir.y / -skyDir.z;
             skyT = skyDir.x / -skyDir.z;
+            skyCell = 5;
         } else {
             skyS = -skyDir.y / skyDir.z;
             skyT = -skyDir.x / skyDir.z;
+            skyCell = 4;
         }
         uv = float2(skyS * 0.5 + 0.5, (1.0 - skyT) * 0.5);
+        if (u_sky.y > 0.5) {
+            const float2 cellOrigin = float2(float(skyCell % 3), float(skyCell / 3));
+            uv = (cellOrigin + uv) / float2(3.0, 2.0);
+        }
     }
     // Bounded `tcGen environment`: per-pixel reflection coordinates matching
     // GL1's RB_CalcEnvironmentTexCoords (reflection of the view vector about
@@ -2061,6 +2093,7 @@ static void VRHI_DestroyWorldResources(bool clearGeometry) {
 	g_worldDeformStamps.clear();
 	g_worldDeformEpoch = 0;
 	g_worldShaderDeforms.clear();
+	g_worldShaderSkies.clear();
 	g_worldNumClusters = 0;
 	g_worldClusterBytes = 0;
 	g_worldVisAvailable = false;
@@ -3488,6 +3521,7 @@ static void VRHI_ScanShaderScripts(const std::vector<std::string> &shaderNames) 
 	g_worldShaderNames = shaderNames;
 	g_worldShaderScriptStages.clear();
 	g_worldShaderDeforms.clear();
+	g_worldShaderSkies.clear();
 	g_worldShaderScriptsScanned = true;
 	std::unordered_map<std::string, bool> wanted;
 	char **fileList = nullptr;
@@ -3528,7 +3562,8 @@ static void VRHI_ScanShaderScripts(const std::vector<std::string> &shaderNames) 
 					totalText += fileSize;
 					std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > parsedResults;
 					std::unordered_map<std::string, VRHI_ShaderDeform> parsedDeforms;
-					if (VRHI_ParseShaderScriptStages(static_cast<const byte *>(activeFileData), fileSize, wanted, &parsedResults, &parsedDeforms)) {
+					std::unordered_map<std::string, VRHI_ShaderSky> parsedSkies;
+					if (VRHI_ParseShaderScriptStages(static_cast<const byte *>(activeFileData), fileSize, wanted, &parsedResults, &parsedDeforms, &parsedSkies)) {
 						for (auto &result : parsedResults) {
 							if (g_worldShaderScriptStages.find(result.first) == g_worldShaderScriptStages.end()) {
 								g_worldShaderScriptStages.emplace(result.first, std::move(result.second));
@@ -3541,6 +3576,11 @@ static void VRHI_ScanShaderScripts(const std::vector<std::string> &shaderNames) 
 									g_worldShaderDeforms.emplace(deformFound->first, deformFound->second);
 							}
 						}
+						// Sky metadata merges independently (first file wins)
+						// so box-only skies without any stages still resolve.
+						for (auto &skyResult : parsedSkies)
+							if (g_worldShaderSkies.find(skyResult.first) == g_worldShaderSkies.end())
+								g_worldShaderSkies.emplace(skyResult.first, std::move(skyResult.second));
 					}
 				} else {
 					VRHI_Printf(PRINT_WARNING, "renderer_vrhi: shader script scan text cap reached at '%s'\n", qpath.c_str());
@@ -3702,6 +3742,74 @@ static void VRHI_ReportUnresolvedMaterial(const char *shaderName, const char *re
 	VRHI_Printf(PRINT_DEVELOPER,
 		"renderer_vrhi: unresolved material '%s' (%s); solid fallback\n",
 		shaderName, reason != nullptr ? reason : "unknown");
+}
+
+// Packs a skyParms outerbox six-face set (GL1 rt/bk/lf/ft/up/dn order) into
+// one 3x2 atlas image for box-only skies, cells ordered by face index.
+// Every face must decode under the existing caps with identical dimensions;
+// anything else skips the box (no default-image invention, unlike GL1).
+// Row 0 is the top row throughout, matching the decoder layout.
+static bool VRHI_BuildSkyBoxAtlas(const char *shaderName, const char *outerBox,
+	int *imageIndex) {
+	if (imageIndex != nullptr) *imageIndex = -1;
+	if (shaderName == nullptr || outerBox == nullptr || outerBox[0] == '\0') return false;
+	static const char *faces[6] = { "rt", "bk", "lf", "ft", "up", "dn" };
+	vrhi_image::DecodeResult decoded[6];
+	for (int f = 0; f < 6; ++f) {
+		const std::string faceName = std::string(outerBox) + "_" + faces[f];
+		std::string facePath;
+		if (!VRHI_DecodeDirectImage(faceName.c_str(), VRHI_MAX_WORLD_DIFFUSE_DIMENSION,
+			VRHI_MAX_WORLD_DIFFUSE_BYTES, &facePath, &decoded[f]) ||
+			!decoded[f].ok || decoded[f].width <= 0 || decoded[f].height <= 0 ||
+			decoded[f].width != decoded[0].width || decoded[f].height != decoded[0].height ||
+			decoded[f].rgba.size() != static_cast<size_t>(decoded[f].width) *
+				static_cast<size_t>(decoded[f].height) * 4) {
+			VRHI_ReportUnresolvedMaterial(shaderName, "sky outerbox face decode failed");
+			return false;
+		}
+	}
+	const int faceWidth = decoded[0].width;
+	const int faceHeight = decoded[0].height;
+	vrhi_image::DecodeResult atlas;
+	atlas.ok = true;
+	atlas.width = faceWidth * 3;
+	atlas.height = faceHeight * 2;
+	atlas.rgba.assign(static_cast<size_t>(atlas.width) * static_cast<size_t>(atlas.height) * 4, 0);
+	for (int f = 0; f < 6; ++f) {
+		const int cellX = (f % 3) * faceWidth;
+		const int cellY = (f / 3) * faceHeight;
+		for (int y = 0; y < faceHeight; ++y) {
+			const size_t srcRow = static_cast<size_t>(y) * static_cast<size_t>(faceWidth) * 4;
+			const size_t dstRow = (static_cast<size_t>(cellY + y) *
+				static_cast<size_t>(atlas.width) + static_cast<size_t>(cellX)) * 4;
+			std::memcpy(atlas.rgba.data() + dstRow, decoded[f].rgba.data() + srcRow,
+				static_cast<size_t>(faceWidth) * 4);
+		}
+	}
+	const std::string atlasPath = std::string(outerBox) + "/*skybox";
+	if (!VRHI_StoreDiffuseImage(atlasPath, atlas, true, imageIndex)) {
+		VRHI_ReportUnresolvedMaterial(shaderName, "sky atlas storage cap/failure");
+		return false;
+	}
+	return true;
+}
+
+// Resolves a box-only sky (no accepted stages) to its packed outerbox atlas
+// as an opaque base stage. Staged skies and missing/incomplete boxes keep
+// stageCount at zero (skipped black downstream).
+static void VRHI_ResolveSkyBox(const char *shaderName, int *stageImages,
+	uint8_t *blends, int *stageCount, bool *skyBox) {
+	if (skyBox != nullptr) *skyBox = false;
+	if (shaderName == nullptr || stageImages == nullptr || blends == nullptr ||
+		stageCount == nullptr || *stageCount != 0) return;
+	const VRHI_ShaderSky *sky = VRHI_FindShaderSky(shaderName, g_worldShaderSkies);
+	if (sky == nullptr || sky->outerBox.empty()) return;
+	int atlas = -1;
+	if (!VRHI_BuildSkyBoxAtlas(shaderName, sky->outerBox.c_str(), &atlas)) return;
+	stageImages[0] = atlas;
+	blends[0] = VRHI_SHADER_BLEND_OPAQUE;
+	*stageCount = 1;
+	if (skyBox != nullptr) *skyBox = true;
 }
 
 // Resolves shader-level deformVertexes metadata for one batch. Batches
@@ -4539,6 +4647,7 @@ static void VRHI_LoadWorld(const char *name) {
 			surface.lightmapNum >= 0 && surface.lightmapNum < g_worldLightmapLayers
 			? surface.lightmapNum : -1;
 		int diffuseImage = -1;
+		bool skyBox = false;
 		uint8_t stageTcGenEnv[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		float stageAnimFps[VRHI_SHADER_MAX_STAGES] = { 0.0f, 0.0f, 0.0f, 0.0f };
 		uint8_t stageAnimFrames[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
@@ -4599,6 +4708,10 @@ static void VRHI_LoadWorld(const char *name) {
 			stageAnimFps, stageAnimFrames, stageAnimImage,
 			stageTcGenEnv,
 			(shader.surfaceFlags & SURF_SKY) == 0);
+		// Box-only skies (no accepted stages) resolve their packed outerbox
+		// atlas here so the batch below carries it as an opaque base stage.
+		if (stageCount == 0 && (shader.surfaceFlags & SURF_SKY) != 0)
+			VRHI_ResolveSkyBox(shader.shader, stageImages, stageBlend, &stageCount, &skyBox);
 		diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 		if (surface.surfaceType == MST_PATCH) {
 			VRHI_PatchMesh patch;
@@ -4627,6 +4740,7 @@ static void VRHI_LoadWorld(const char *name) {
 			VRHI_WorldBatch batch;
 			VRHI_ResolveBatchDeform(shader, &batch);
 			batch.sky = (shader.surfaceFlags & SURF_SKY) != 0;
+			batch.skyBox = batch.sky && skyBox;
 			batch.firstIndex = firstIndex;
 			batch.indexCount = static_cast<uint32_t>(patch.indexes.size());
 			batch.diffuseImage = diffuseImage;
@@ -4765,6 +4879,7 @@ static void VRHI_LoadWorld(const char *name) {
 			VRHI_WorldBatch batch;
 			VRHI_ResolveBatchDeform(shader, &batch);
 			batch.sky = (shader.surfaceFlags & SURF_SKY) != 0;
+			batch.skyBox = batch.sky && skyBox;
 			batch.firstIndex = surfaceFirstIndex;
 			batch.indexCount = static_cast<uint32_t>(g_worldIndexes.size()) - surfaceFirstIndex;
 			batch.diffuseImage = diffuseImage;
@@ -6596,7 +6711,9 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 				// the Quake3 `clampMap` keyword sample the diffuse image with
 				// CLAMP UVW; every default `map` stage keeps the existing WRAP UVW
 				// sampler, so a shader without the keyword draws exactly as before.
-				const uint64_t diffuseSampler = batch.stageClampMap[stage] != 0
+				// Packed skybox atlases always clamp (GL1 loads outerbox faces
+				// clamp-to-edge); every other stage keeps its own rule.
+				const uint64_t diffuseSampler = (batch.skyBox || batch.stageClampMap[stage] != 0)
 					? (VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
 						VRHI_SAMPLER_MIP_NONE | VRHI_SAMPLER_UVW_CLAMP)
 					: (VRHI_SAMPLER_MIN_LINEAR | VRHI_SAMPLER_MAG_LINEAR |
@@ -6718,7 +6835,7 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 				// material pixel shaders replace the diffuse UVs with
 				// direction-projected box coordinates when set. Always
 				// written so no stale sky state persists.
-				const glm::vec4 skyFlag(batch.sky ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+				const glm::vec4 skyFlag(batch.sky ? 1.0f : 0.0f, batch.skyBox ? 1.0f : 0.0f, 0.0f, 0.0f);
 				g_worldState.SetUniform(15, { "u_sky", { skyFlag } });
 				// Bounded stage-local rgbGen wave generator for this stage plus
 				// the shared per-frame render time in seconds: the textured

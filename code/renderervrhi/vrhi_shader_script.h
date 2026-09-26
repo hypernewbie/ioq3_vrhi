@@ -195,6 +195,14 @@ input buffer, so no FS storage can be referenced after FS_FreeFile.
 // tokens past the stage end. The conservative first-stage helper still
 // treats `tcMod` as unsupported and rejects such shaders.
 //
+// The bounded `skyParms` slice extends the same simple multi-stage parser
+// with shader-level skybox metadata: the outerbox image prefix (GL1
+// rt/bk/lf/ft/up/dn faces) and the cloud height, both validated. The adapter
+// packs a same-dimensioned six-face set into one atlas image for skies
+// without accepted stages; staged skies ignore the box. Truncated,
+// non-finite, out-of-range, or unsafe statements keep the existing ignore
+// with the stage still accepted and never borrow past the shader block.
+//
 // The bounded `deformVertexes` slice extends the same simple multi-stage
 // parser with shader-level vertex deformation shared by every stage: `wave`
 // (divisor plus a five-form waveform, spread = 1/divisor), `move` (a
@@ -325,6 +333,15 @@ enum VRHI_ShaderDeformKind {
 // valid deformation). wave holds base/amplitude/phase/frequency in script
 // order with spread = 1/divisor; move holds the translation vector plus the
 // same wave layout; bulge holds width/height/speed.
+// Bounded shader-level `skyParms` metadata: the outerbox image prefix (empty
+// for "-"/absent) and the cloud height in world units. Only the outerbox
+// feeds rendering (box-only skies); the height is validated and retained
+// for documentation. innerbox is always "-" in the corpus and is parsed
+// for shape only, never stored.
+struct VRHI_ShaderSky {
+	std::string outerBox;
+	float cloudHeight = 0.0f;
+};
 struct VRHI_ShaderDeform {
 	int kind = VRHI_SHADER_DEFORM_NONE;
 	int waveFunc = VRHI_SHADER_WAVE_NONE;
@@ -536,6 +553,13 @@ static const float VRHI_SCRIPT_DEFORM_MOVE_MAX = 4096.0f;
 static const float VRHI_SCRIPT_DEFORM_BULGE_WIDTH_MAX = 1024.0f;
 static const float VRHI_SCRIPT_DEFORM_BULGE_HEIGHT_MAX = 64.0f;
 static const float VRHI_SCRIPT_DEFORM_BULGE_SPEED_MAX = 64.0f;
+// Bounded `skyParms` ranges: the cloud height must be finite and inside
+// [MIN, MAX] world units (typical skies use 512..2048); zero, negative,
+// non-finite, or huge heights ignore the statement. Box face suffixes follow
+// GL1 (rt/bk/lf/ft/up/dn); all six faces must decode to identical dimensions
+// or the box is skipped.
+static const float VRHI_SCRIPT_SKY_CLOUD_MIN = 1.0f;
+static const float VRHI_SCRIPT_SKY_CLOUD_MAX = 100000.0f;
 // Bounded tcMod turb/stretches reuse the finite wave parameter domain.
 static const float VRHI_SCRIPT_TCMOD_TURB_MAX = 16.0f;
 static const float VRHI_SCRIPT_TCMOD_STRETCH_MAX = 16.0f;
@@ -994,10 +1018,16 @@ inline std::size_t VRHI_ParseShaderDeform(
 	const std::vector<VRHI_ShaderScriptToken> &tokens,
 	std::size_t pos, std::size_t end, VRHI_ShaderDeform *deform);
 
+// Defined below (after the sky bounds): parses one shader-level `skyParms`
+// statement. Declared here so the block parser can call it.
+inline std::size_t VRHI_ParseShaderSkyParms(
+	const std::vector<VRHI_ShaderScriptToken> &tokens,
+	std::size_t pos, std::size_t end, VRHI_ShaderSky *sky);
+
 inline bool VRHI_ParseSimpleShaderBlock(
 	const std::vector<VRHI_ShaderScriptToken> &tokens, std::size_t begin,
 	std::size_t end, std::vector<VRHI_ShaderStage> *stages,
-	VRHI_ShaderDeform *deform = nullptr) {
+	VRHI_ShaderDeform *deform = nullptr, VRHI_ShaderSky *sky = nullptr) {
 	if (stages != nullptr) stages->clear();
 	if (deform != nullptr) *deform = VRHI_ShaderDeform();
 	if (stages == nullptr || begin >= end || end > tokens.size()) return false;
@@ -1013,6 +1043,14 @@ inline bool VRHI_ParseSimpleShaderBlock(
 				if (VRHI_ShaderTokenIs(tokens[i + 1], "trans"))
 					surfaceTranslucent = true;
 				i += 2;
+				continue;
+			}
+			if (sky != nullptr && VRHI_ShaderTokenIs(tokens[i], "skyparms")) {
+				// Shader-level skybox metadata for box-only skies. The
+				// parser records the outerbox prefix and cloud height;
+				// anything else falls through to the existing per-token
+				// ignore below.
+				i = VRHI_ParseShaderSkyParms(tokens, i, end, sky);
 				continue;
 			}
 			if (deform != nullptr && VRHI_ShaderTokenIs(tokens[i], "deformvertexes")) {
@@ -1526,7 +1564,8 @@ inline bool VRHI_ParseShaderScriptStages(
 	const unsigned char *data, std::size_t size,
 	const std::unordered_map<std::string, bool> &wanted,
 	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > *results,
-	std::unordered_map<std::string, VRHI_ShaderDeform> *deforms = nullptr) {
+	std::unordered_map<std::string, VRHI_ShaderDeform> *deforms = nullptr,
+	std::unordered_map<std::string, VRHI_ShaderSky> *skyMetas = nullptr) {
 	std::vector<VRHI_ShaderScriptToken> tokens;
 	if (results == nullptr || !VRHI_TokenizeShaderScript(data, size, &tokens)) return false;
 	for (std::size_t i = 0; i < tokens.size();) {
@@ -1544,11 +1583,15 @@ inline bool VRHI_ParseShaderScriptStages(
 		if (wanted.find(shaderName) == wanted.end()) continue;
 		std::vector<VRHI_ShaderStage> stages;
 		VRHI_ShaderDeform deform;
-		if (VRHI_ParseSimpleShaderBlock(tokens, bodyBegin, bodyEnd, &stages, &deform)) {
+		VRHI_ShaderSky sky;
+		if (VRHI_ParseSimpleShaderBlock(tokens, bodyBegin, bodyEnd, &stages, &deform, &sky))
 			results->emplace(shaderName, std::move(stages));
-			if (deforms != nullptr && deform.kind != VRHI_SHADER_DEFORM_NONE)
-				deforms->emplace(shaderName, deform);
-		}
+		// Shader-level metadata records independently of stage success so
+		// box-only skies (no stages at all) still resolve their outerbox.
+		if (deforms != nullptr && deform.kind != VRHI_SHADER_DEFORM_NONE)
+			deforms->emplace(shaderName, deform);
+		if (skyMetas != nullptr && !sky.outerBox.empty())
+			skyMetas->emplace(shaderName, sky);
 	}
 	return true;
 }
@@ -1603,6 +1646,20 @@ inline float VRHI_WaveTableValue(int func, float cycles) {
 inline float VRHI_EvalWaveFormUnclamped(int func, float base, float amplitude,
 	float phase, float frequency, float timeSeconds) {
 	return base + VRHI_WaveTableValue(func, phase + timeSeconds * frequency) * amplitude;
+}
+
+// Shared bounded lookup for shader-level sky metadata: same safe qpath
+// key discipline as the lookups above. Returns null for missing names and
+// for entries without an outerbox.
+inline const VRHI_ShaderSky *VRHI_FindShaderSky(const char *shaderName,
+	const std::unordered_map<std::string, VRHI_ShaderSky> &parsed) {
+	if (shaderName == nullptr) return nullptr;
+	std::size_t length = 0;
+	while (length < VRHI_SCRIPT_MAX_QPATH && shaderName[length] != '\0') ++length;
+	if (length == 0 || length >= VRHI_SCRIPT_MAX_QPATH) return nullptr;
+	const auto found = parsed.find(VRHI_ShaderLowerASCII(std::string(shaderName, length)));
+	return found != parsed.end() && !found->second.outerBox.empty()
+		? &found->second : nullptr;
 }
 
 // Shared bounded lookup for shader-level deform metadata: same safe qpath
@@ -1702,6 +1759,41 @@ inline std::size_t VRHI_ParseShaderDeform(
 		return pos + 5;
 	}
 	return pos + 1;
+}
+
+// Parses one shader-level `skyParms outer cloudheight inner` statement at
+// tokens[pos]. Records the outerbox prefix (lowercased) and cloud height
+// when all three arguments are well-formed and the height is in range;
+// "-" means no box and records nothing. Anything truncated, non-finite,
+// out-of-range, or unsafe leaves *sky untouched and returns pos + 1, so the
+// generic loop skips the arguments exactly as before this slice. Never reads
+// past end. Later statements overwrite earlier ones, matching GL1.
+inline std::size_t VRHI_ParseShaderSkyParms(
+	const std::vector<VRHI_ShaderScriptToken> &tokens,
+	std::size_t pos, std::size_t end, VRHI_ShaderSky *sky) {
+	if (sky == nullptr || pos + 3 >= end) return pos + 1;
+	// Braces are never skyParms values; consuming one would eat a stage
+	// boundary, so they fall through to the generic loop untouched.
+	for (std::size_t k = 1; k <= 3; ++k) {
+		if (tokens[pos + k].text == "{" || tokens[pos + k].text == "}")
+			return pos + 1;
+	}
+	const std::string &outer = tokens[pos + 1].text;
+	float cloud = 0.0f;
+	if (!VRHI_ShaderParseFiniteConstant(tokens[pos + 2].text,
+		VRHI_SCRIPT_SKY_CLOUD_MIN, VRHI_SCRIPT_SKY_CLOUD_MAX, &cloud))
+		return pos + 1;
+	const std::string &inner = tokens[pos + 3].text;
+	if (inner != "-" && !VRHI_ShaderPathIsSafe(inner)) return pos + 1;
+	if (outer != "-") {
+		if (!VRHI_ShaderPathIsSafe(outer)) return pos + 1;
+		sky->outerBox = VRHI_ShaderLowerASCII(outer);
+		sky->cloudHeight = cloud;
+	} else {
+		sky->outerBox.clear();
+		sky->cloudHeight = 0.0f;
+	}
+	return pos + 4;
 }
 
 #endif // __VRHI_SHADER_SCRIPT_H
