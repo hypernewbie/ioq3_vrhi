@@ -202,6 +202,13 @@ struct VRHI_SceneDraw {
 	float rgbWaveValue[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 	uint8_t alphaGenWave = VRHI_SHADER_WAVE_NONE;
 	float alphaWaveValue[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	// Bounded per-draw `animMap` frames carried from the base stage. fps 0 or
+	// a single frame renders the static first frame; animImage holds decoded
+	// diffuse-image indices in script order. Only the diffuse material sample
+	// is affected.
+	float animFps = 0.0f;
+	uint8_t animFrames = 0;
+	int animImage[VRHI_SHADER_MAX_ANIM_FRAMES] = { -1, -1, -1, -1, -1, -1, -1, -1 };
 };
 static std::vector<VRHI_SceneEntity> g_sceneEntities;
 static std::vector<VRHI_ScenePoly> g_scenePolys;
@@ -328,6 +335,16 @@ struct VRHI_WorldBatch {
 	float stageAlphaWaveValue[VRHI_SHADER_MAX_STAGES][4] = {
 		{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
 		{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
+	// Per-stage bounded `animMap` frames carried from the parsed stage data
+	// to the per-draw frame selection. fps 0 or a single frame renders the
+	// static first frame, preserving the existing sampling; only the diffuse
+	// material sample is affected, never lightmaps, vertex colour, or UI.
+	// stageAnimImage holds decoded diffuse-image indices in script order.
+	float stageAnimFps[VRHI_SHADER_MAX_STAGES] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	uint8_t stageAnimFrames[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+	int stageAnimImage[VRHI_SHADER_MAX_STAGES][VRHI_SHADER_MAX_ANIM_FRAMES] = {
+		{ -1, -1, -1, -1, -1, -1, -1, -1 }, { -1, -1, -1, -1, -1, -1, -1, -1 },
+		{ -1, -1, -1, -1, -1, -1, -1, -1 }, { -1, -1, -1, -1, -1, -1, -1, -1 } };
 	// Shader surfaceparm trans is a sort hint, separate from blend mode. The
 	// world renderer sorts these and blended bases/overlays after opaque draws.
 	bool surfaceTranslucent = false;
@@ -410,6 +427,11 @@ struct VRHI_SceneShaderMaterial {
 	float rgbWaveValue[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 	uint8_t alphaGenWave = VRHI_SHADER_WAVE_NONE;
 	float alphaWaveValue[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	// Base-stage bounded `animMap` frames (script order), fps, and frame
+	// count. fps 0 or a single frame renders the static first frame.
+	float animFps = 0.0f;
+	uint8_t animFrames = 0;
+	int animImage[VRHI_SHADER_MAX_ANIM_FRAMES] = { -1, -1, -1, -1, -1, -1, -1, -1 };
 };
 // Minimal, decoded copies of the BSP PVS traversal state. Values are
 // byte-swapped out of the on-disk little-endian form at load time and copied
@@ -3495,7 +3517,10 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 	uint8_t *tcModTurbFlags = nullptr,
 	float (*tcModTurbValues)[4] = nullptr,
 	uint8_t *tcModStretchFuncs = nullptr,
-	float (*tcModStretchValues)[4] = nullptr) {
+	float (*tcModStretchValues)[4] = nullptr,
+	float *animFpsValues = nullptr,
+	uint8_t *animFrameCounts = nullptr,
+	int (*animImageIndices)[VRHI_SHADER_MAX_ANIM_FRAMES] = nullptr) {
 	if (images == nullptr || blends == nullptr || stageCount == nullptr) return false;
 	*stageCount = 0;
 	for (size_t i = 0; i < VRHI_SHADER_MAX_STAGES; ++i) {
@@ -3538,6 +3563,12 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 			tcModStretchValues[i][2] = 0.0f;
 			tcModStretchValues[i][3] = 0.0f;
 		}
+		if (animFpsValues != nullptr) animFpsValues[i] = 0.0f;
+		if (animFrameCounts != nullptr) animFrameCounts[i] = 0;
+		if (animImageIndices != nullptr) {
+			for (size_t f = 0; f < VRHI_SHADER_MAX_ANIM_FRAMES; ++f)
+				animImageIndices[i][f] = -1;
+		}
 		if (rgbGenWaveFuncs != nullptr) rgbGenWaveFuncs[i] = VRHI_SHADER_WAVE_NONE;
 		if (rgbWaveValues != nullptr) {
 			rgbWaveValues[i][0] = 0.0f;
@@ -3576,17 +3607,54 @@ static bool VRHI_LoadDiffuseStages(const char *shaderName, int *images,
 		return false;
 	}
 	for (size_t i = 0; i < stages.size() && i < VRHI_SHADER_MAX_STAGES; ++i) {
-		vrhi_image::DecodeResult decoded;
-		std::string path;
-		if (i == 0 && !scriptResolved) { path = directPath; decoded = std::move(directDecoded); }
-		else if (!VRHI_DecodeDirectImage(stages[i].path.c_str(), VRHI_MAX_WORLD_DIFFUSE_DIMENSION,
-			VRHI_MAX_WORLD_DIFFUSE_BYTES, &path, &decoded)) {
-			VRHI_ReportUnresolvedMaterial(shaderName, "accepted stage image decode failed");
-			return false;
-		}
-		if (!VRHI_StoreDiffuseImage(path, decoded, scriptResolved, &images[i])) {
-			VRHI_ReportUnresolvedMaterial(shaderName, "diffuse image storage cap/failure");
-			return false;
+		const bool animated = scriptResolved && !stages[i].animPaths.empty();
+		if (animated) {
+			// Bounded time-varying `animMap` frames: decode every frame
+			// under the existing image caps. Any frame failure rejects the
+			// material (GL1 fails the shader when a frame is missing);
+			// the caller keeps its existing solid fallback.
+			size_t frameCount = stages[i].animPaths.size();
+			if (frameCount > VRHI_SHADER_MAX_ANIM_FRAMES)
+				frameCount = VRHI_SHADER_MAX_ANIM_FRAMES;
+			if (frameCount == 0) {
+				VRHI_ReportUnresolvedMaterial(shaderName, "animMap stage has no frames");
+				return false;
+			}
+			for (size_t f = 0; f < frameCount; ++f) {
+				vrhi_image::DecodeResult frameDecoded;
+				std::string framePath;
+				if (!VRHI_DecodeDirectImage(stages[i].animPaths[f].c_str(),
+					VRHI_MAX_WORLD_DIFFUSE_DIMENSION, VRHI_MAX_WORLD_DIFFUSE_BYTES,
+					&framePath, &frameDecoded)) {
+					VRHI_ReportUnresolvedMaterial(shaderName, "animMap frame decode failed");
+					return false;
+				}
+				int frameImage = -1;
+				if (!VRHI_StoreDiffuseImage(framePath, frameDecoded, scriptResolved, &frameImage)) {
+					VRHI_ReportUnresolvedMaterial(shaderName, "diffuse image storage cap/failure");
+					return false;
+				}
+				if (f == 0) images[i] = frameImage;
+				if (animImageIndices != nullptr) animImageIndices[i][f] = frameImage;
+			}
+			if (animFpsValues != nullptr) animFpsValues[i] = stages[i].animFps;
+			if (animFrameCounts != nullptr)
+				animFrameCounts[i] = static_cast<uint8_t>(frameCount);
+		} else {
+			vrhi_image::DecodeResult decoded;
+			std::string path;
+			if (i == 0 && !scriptResolved) { path = directPath; decoded = std::move(directDecoded); }
+			else if (!VRHI_DecodeDirectImage(stages[i].path.c_str(), VRHI_MAX_WORLD_DIFFUSE_DIMENSION,
+				VRHI_MAX_WORLD_DIFFUSE_BYTES, &path, &decoded)) {
+				VRHI_ReportUnresolvedMaterial(shaderName, "accepted stage image decode failed");
+				return false;
+			}
+			if (!VRHI_StoreDiffuseImage(path, decoded, scriptResolved, &images[i])) {
+				VRHI_ReportUnresolvedMaterial(shaderName, "diffuse image storage cap/failure");
+				return false;
+			}
+			if (animFrameCounts != nullptr) animFrameCounts[i] = 1;
+			if (animImageIndices != nullptr) animImageIndices[i][0] = images[i];
 		}
 		blends[i] = static_cast<uint8_t>(stages[i].blendMode);
 		if (rgbConstFlags != nullptr) rgbConstFlags[i] = stages[i].rgbGenConst ? 1 : 0;
@@ -4229,6 +4297,11 @@ static void VRHI_LoadWorld(const char *name) {
 			surface.lightmapNum >= 0 && surface.lightmapNum < g_worldLightmapLayers
 			? surface.lightmapNum : -1;
 		int diffuseImage = -1;
+		float stageAnimFps[VRHI_SHADER_MAX_STAGES] = { 0.0f, 0.0f, 0.0f, 0.0f };
+		uint8_t stageAnimFrames[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		int stageAnimImage[VRHI_SHADER_MAX_STAGES][VRHI_SHADER_MAX_ANIM_FRAMES] = {
+			{ -1, -1, -1, -1, -1, -1, -1, -1 }, { -1, -1, -1, -1, -1, -1, -1, -1 },
+			{ -1, -1, -1, -1, -1, -1, -1, -1 }, { -1, -1, -1, -1, -1, -1, -1, -1 } };
 		int stageImages[VRHI_SHADER_MAX_STAGES] = { -1, -1, -1, -1 };
 		uint8_t stageBlend[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		uint8_t stageTcModTurb[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
@@ -4279,7 +4352,8 @@ static void VRHI_LoadWorld(const char *name) {
 			stageRgbGenWave, stageRgbWaveValue,
 			stageAlphaGenWave, stageAlphaWaveValue,
 			stageTcModTurb, stageTcModTurbValue,
-			stageTcModStretchFunc, stageTcModStretchValue);
+			stageTcModStretchFunc, stageTcModStretchValue,
+			stageAnimFps, stageAnimFrames, stageAnimImage);
 		diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 		if (surface.surfaceType == MST_PATCH) {
 			VRHI_PatchMesh patch;
@@ -4343,6 +4417,10 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageTcModStretchValue[stage][1] = stageTcModStretchValue[stage][1];
 				batch.stageTcModStretchValue[stage][2] = stageTcModStretchValue[stage][2];
 				batch.stageTcModStretchValue[stage][3] = stageTcModStretchValue[stage][3];
+				batch.stageAnimFps[stage] = stageAnimFps[stage];
+				batch.stageAnimFrames[stage] = stageAnimFrames[stage];
+				for (size_t animFrame = 0; animFrame < VRHI_SHADER_MAX_ANIM_FRAMES; ++animFrame)
+					batch.stageAnimImage[stage][animFrame] = stageAnimImage[stage][animFrame];
 				batch.stageRgbGenWave[stage] = stageRgbGenWave[stage];
 				batch.stageRgbWaveValue[stage][0] = stageRgbWaveValue[stage][0];
 				batch.stageRgbWaveValue[stage][1] = stageRgbWaveValue[stage][1];
@@ -4473,6 +4551,10 @@ static void VRHI_LoadWorld(const char *name) {
 				batch.stageTcModStretchValue[stage][1] = stageTcModStretchValue[stage][1];
 				batch.stageTcModStretchValue[stage][2] = stageTcModStretchValue[stage][2];
 				batch.stageTcModStretchValue[stage][3] = stageTcModStretchValue[stage][3];
+				batch.stageAnimFps[stage] = stageAnimFps[stage];
+				batch.stageAnimFrames[stage] = stageAnimFrames[stage];
+				for (size_t animFrame = 0; animFrame < VRHI_SHADER_MAX_ANIM_FRAMES; ++animFrame)
+					batch.stageAnimImage[stage][animFrame] = stageAnimImage[stage][animFrame];
 				batch.stageRgbGenWave[stage] = stageRgbGenWave[stage];
 				batch.stageRgbWaveValue[stage][0] = stageRgbWaveValue[stage][0];
 				batch.stageRgbWaveValue[stage][1] = stageRgbWaveValue[stage][1];
@@ -4544,6 +4626,11 @@ static void VRHI_LoadWorld(const char *name) {
 			// return reads this pre-resolved draw state, so the metadata must live
 			// on the batch rather than being re-derived from the script table.
 			int stageImages[VRHI_SHADER_MAX_STAGES] = { -1, -1, -1, -1 };
+			float stageAnimFps[VRHI_SHADER_MAX_STAGES] = { 0.0f, 0.0f, 0.0f, 0.0f };
+			uint8_t stageAnimFrames[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+			int stageAnimImage[VRHI_SHADER_MAX_STAGES][VRHI_SHADER_MAX_ANIM_FRAMES] = {
+				{ -1, -1, -1, -1, -1, -1, -1, -1 }, { -1, -1, -1, -1, -1, -1, -1, -1 },
+				{ -1, -1, -1, -1, -1, -1, -1, -1 }, { -1, -1, -1, -1, -1, -1, -1, -1 } };
 			uint8_t stageBlend[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 			uint8_t stageTcModTurb[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 			float stageTcModTurbValue[VRHI_SHADER_MAX_STAGES][4] = {
@@ -4593,7 +4680,8 @@ static void VRHI_LoadWorld(const char *name) {
 				stageRgbGenWave, stageRgbWaveValue,
 				stageAlphaGenWave, stageAlphaWaveValue,
 				stageTcModTurb, stageTcModTurbValue,
-				stageTcModStretchFunc, stageTcModStretchValue);
+				stageTcModStretchFunc, stageTcModStretchValue,
+				stageAnimFps, stageAnimFrames, stageAnimImage);
 			const int diffuseImage = stageCount > 0 ? stageImages[0] : -1;
 			VRHI_InlineBSPModel surfaceModel;
 			if (!VRHI_BuildInlineSurface(vertsData, vertCount, indexesData, indexCount,
@@ -4640,6 +4728,10 @@ static void VRHI_LoadWorld(const char *name) {
 					batch.stageTcModStretchValue[stage][1] = stageTcModStretchValue[stage][1];
 					batch.stageTcModStretchValue[stage][2] = stageTcModStretchValue[stage][2];
 					batch.stageTcModStretchValue[stage][3] = stageTcModStretchValue[stage][3];
+					batch.stageAnimFps[stage] = stageAnimFps[stage];
+					batch.stageAnimFrames[stage] = stageAnimFrames[stage];
+					for (size_t animFrame = 0; animFrame < VRHI_SHADER_MAX_ANIM_FRAMES; ++animFrame)
+						batch.stageAnimImage[stage][animFrame] = stageAnimImage[stage][animFrame];
 					batch.stageRgbGenWave[stage] = stageRgbGenWave[stage];
 					batch.stageRgbWaveValue[stage][0] = stageRgbWaveValue[stage][0];
 					batch.stageRgbWaveValue[stage][1] = stageRgbWaveValue[stage][1];
@@ -4993,7 +5085,9 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 	const float *alphaWaveValue = nullptr, bool sortOnlyTranslucent = false,
 	bool tcModTurb = false, const float *tcModTurbValue = nullptr,
 	uint8_t tcModStretchFunc = VRHI_SHADER_WAVE_NONE,
-	const float *tcModStretchValue = nullptr) {
+	const float *tcModStretchValue = nullptr,
+	float animFps = 0.0f, uint8_t animFrames = 0,
+	const int *animImages = nullptr) {
 	if (indexCount == 0 || firstIndex > UINT32_MAX || indexCount > UINT32_MAX ||
 		g_sceneDraws.size() >= VRHI_MAX_SCENE_DRAWS) return false;
 	VRHI_SceneDraw draw;
@@ -5042,6 +5136,12 @@ static bool VRHI_AppendSceneDraw(qhandle_t shader, size_t firstIndex,
 		draw.tcModStretchValue[1] = tcModStretchValue[1];
 		draw.tcModStretchValue[2] = tcModStretchValue[2];
 		draw.tcModStretchValue[3] = tcModStretchValue[3];
+	}
+	draw.animFps = animFps;
+	draw.animFrames = animFrames;
+	if (animImages != nullptr) {
+		for (size_t animFrame = 0; animFrame < VRHI_SHADER_MAX_ANIM_FRAMES; ++animFrame)
+			draw.animImage[animFrame] = animImages[animFrame];
 	}
 	draw.rgbGenWave = rgbGenWave;
 	if (rgbWaveValue != nullptr) {
@@ -5152,6 +5252,11 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 			!shaderStages->empty() && shaderStages->front().surfaceTranslucent;
 		int images[VRHI_SHADER_MAX_STAGES];
 		uint8_t blends[VRHI_SHADER_MAX_STAGES];
+		float stageAnimFps[VRHI_SHADER_MAX_STAGES] = { 0.0f, 0.0f, 0.0f, 0.0f };
+		uint8_t stageAnimFrames[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
+		int stageAnimImage[VRHI_SHADER_MAX_STAGES][VRHI_SHADER_MAX_ANIM_FRAMES] = {
+			{ -1, -1, -1, -1, -1, -1, -1, -1 }, { -1, -1, -1, -1, -1, -1, -1, -1 },
+			{ -1, -1, -1, -1, -1, -1, -1, -1 }, { -1, -1, -1, -1, -1, -1, -1, -1 } };
 		uint8_t stageTcModTurb[VRHI_SHADER_MAX_STAGES] = { 0, 0, 0, 0 };
 		float stageTcModTurbValue[VRHI_SHADER_MAX_STAGES][4] = {
 			{ 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f },
@@ -5201,7 +5306,8 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 				stageRgbGenWave, stageRgbWaveValue,
 				stageAlphaGenWave, stageAlphaWaveValue,
 				stageTcModTurb, stageTcModTurbValue,
-				stageTcModStretchFunc, stageTcModStretchValue);
+				stageTcModStretchFunc, stageTcModStretchValue,
+				stageAnimFps, stageAnimFrames, stageAnimImage);
 		if (stageCount > 0) {
 			material.diffuseImage = images[0];
 			material.blendMode = blends[0];
@@ -5232,6 +5338,10 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 			material.tcModStretchValue[1] = stageTcModStretchValue[0][1];
 			material.tcModStretchValue[2] = stageTcModStretchValue[0][2];
 			material.tcModStretchValue[3] = stageTcModStretchValue[0][3];
+			material.animFps = stageAnimFps[0];
+			material.animFrames = stageAnimFrames[0];
+			for (size_t animFrame = 0; animFrame < VRHI_SHADER_MAX_ANIM_FRAMES; ++animFrame)
+				material.animImage[animFrame] = stageAnimImage[0][animFrame];
 			material.rgbGenWave = static_cast<uint8_t>(stageRgbGenWave[0]);
 			material.rgbWaveValue[0] = stageRgbWaveValue[0][0];
 			material.rgbWaveValue[1] = stageRgbWaveValue[0][1];
@@ -5297,6 +5407,10 @@ static vhTexture VRHI_SceneTexture(VRHI_SceneDraw *draw) {
 	draw->tcModStretchValue[1] = material.tcModStretchValue[1];
 	draw->tcModStretchValue[2] = material.tcModStretchValue[2];
 	draw->tcModStretchValue[3] = material.tcModStretchValue[3];
+	draw->animFps = material.animFps;
+	draw->animFrames = material.animFrames;
+	for (size_t animFrame = 0; animFrame < VRHI_SHADER_MAX_ANIM_FRAMES; ++animFrame)
+		draw->animImage[animFrame] = material.animImage[animFrame];
 	draw->rgbGenWave = material.rgbGenWave;
 	draw->rgbWaveValue[0] = material.rgbWaveValue[0];
 	draw->rgbWaveValue[1] = material.rgbWaveValue[1];
@@ -5497,7 +5611,8 @@ static bool VRHI_AppendInlineBSPModel(const refEntity_t &entity, const glm::vec4
 				batch.surfaceTranslucent && blendMode == VRHI_SHADER_BLEND_OPAQUE &&
 					color.a >= 0.999f,
 				batch.stageTcModTurb[0] != 0, batch.stageTcModTurbValue[0],
-				batch.stageTcModStretchFunc[0], batch.stageTcModStretchValue[0])) {
+				batch.stageTcModStretchFunc[0], batch.stageTcModStretchValue[0],
+				batch.stageAnimFps[0], batch.stageAnimFrames[0], batch.stageAnimImage[0])) {
 				g_sceneVertices.resize(g_sceneVertices.size() - scratchVertices.size());
 				g_sceneIndexes.resize(g_sceneIndexes.size() - scratchIndexes.size());
 				continue;
@@ -5976,7 +6091,20 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		const int stage = static_cast<int>(drawStage);
 		{
 			const bool materialStage = count > 0;
-			const int imageIndex = materialStage ? batch.stageImages[stage] : -1;
+			// Bounded `animMap` frame selection: floor(time * fps) % frames
+			// (GL1's exact formula, negatives clamped to 0); a single frame
+			// or fps 0 renders the static first frame. The frame index stays
+			// in [0, frames), so no out-of-bounds access is possible.
+			const int animCount = materialStage && batch.stageAnimFrames[stage] > 1
+				? batch.stageAnimFrames[stage] : 1;
+			int animFrame = 0;
+			if (animCount > 1 && batch.stageAnimFps[stage] > 0.0f) {
+				animFrame = static_cast<int>(std::floor(frameTimeSeconds * batch.stageAnimFps[stage]));
+				if (animFrame < 0) animFrame = 0;
+				animFrame %= animCount;
+			}
+			const int imageIndex = materialStage
+				? (animCount > 1 ? batch.stageAnimImage[stage][animFrame] : batch.stageImages[stage]) : -1;
 			const bool textured = materialStage && imageIndex >= 0 &&
 				static_cast<size_t>(imageIndex) < g_worldDiffuseImages.size() &&
 				g_worldDiffuseImages[imageIndex].texture != VRHI_INVALID_HANDLE;
@@ -6219,7 +6347,21 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		};
 		const auto drawScene = [&](size_t drawIndex) {
 			VRHI_SceneDraw &draw = g_sceneDraws[drawIndex];
-			const vhTexture texture = VRHI_SceneTexture(&draw);
+			vhTexture texture = VRHI_SceneTexture(&draw);
+			// Bounded `animMap` frame selection for scene draws (same GL1
+			// formula as the world batches). The material/draw carries the
+			// decoded frame images; an unloadable frame keeps the base
+			// texture instead of dropping the draw.
+			if (draw.animFrames > 1 && draw.animFps > 0.0f) {
+				int animFrame = static_cast<int>(std::floor(frameTimeSeconds * draw.animFps));
+				if (animFrame < 0) animFrame = 0;
+				animFrame %= draw.animFrames;
+				const int animImage = draw.animImage[animFrame];
+				if (animImage >= 0 &&
+					static_cast<size_t>(animImage) < g_worldDiffuseImages.size() &&
+					g_worldDiffuseImages[static_cast<size_t>(animImage)].texture != VRHI_INVALID_HANDLE)
+					texture = g_worldDiffuseImages[static_cast<size_t>(animImage)].texture;
+			}
 			const bool textured = texture != VRHI_INVALID_HANDLE &&
 				g_worldDiffusePixelShader != VRHI_INVALID_HANDLE;
 			const bool lightmapped = draw.lightmapped && g_worldLightmapTexture != VRHI_INVALID_HANDLE &&

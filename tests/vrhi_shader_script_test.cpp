@@ -5,7 +5,7 @@
 // allowlist (blendFunc GL_ONE GL_ZERO, rgbGen/alphaGen identity, depthWrite,
 // depthFunc lequal/less), malformed statements, and multi-map shaders, plus
 // the bounded multi-stage slice (VRHI_ParseShaderScriptStages: at most four
-// direct-image/static-first-frame stages, common transparent blend modes,
+// direct-image/animated stages, common transparent blend modes,
 // ignored-but-bounded UV/time modifiers, the bounded static const
 // generators rgbGen const / alphaGen const, and the stage-local depthWrite
 // flag that the adapter applies as WRITE_Z only for explicitly requesting
@@ -2020,6 +2020,106 @@ void testStageTcModTurbStretch() {
 		"{ map textures/foo/bar.tga tcMod stretch sin 0 1 0 1 }", nullptr), "");
 }
 
+void testStageAnimMap() {
+	std::unordered_map<std::string, bool> wanted;
+	wanted.emplace("textures/foo/bar", true);
+	std::unordered_map<std::string, std::vector<VRHI_ShaderStage> > results;
+	// Flame-style multi-frame animation: rate plus every frame in order.
+	const std::string accepted = script(
+		"{ animMap 8 textures/sfx/flame1.tga textures/sfx/flame2.tga textures/sfx/flame3.tga blendFunc GL_SRC_ALPHA GL_ONE }");
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(accepted), accepted.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 1u);
+		if (stages.size() == 1) {
+			CHECK(stages[0].animFps > 7.99f && stages[0].animFps < 8.01f);
+			CHECK_EQ_INT(stages[0].animPaths.size(), 3u);
+			CHECK_EQ_INT(stages[0].blendMode, VRHI_SHADER_BLEND_ALPHA_ADDITIVE);
+			if (stages[0].animPaths.size() == 3) {
+				CHECK_EQ_STR(stages[0].animPaths[0], "textures/sfx/flame1.tga");
+				CHECK_EQ_STR(stages[0].animPaths[2], "textures/sfx/flame3.tga");
+				CHECK_EQ_STR(stages[0].path, "textures/sfx/flame1.tga");
+			}
+		}
+	}
+	// Keyword matching is case-insensitive; collection stops before a
+	// following directive instead of swallowing it as a frame.
+	const std::string upper = script(
+		"{ ANIMMAP 2 textures/a.tga textures/b.tga BLENDFUNC BLEND RGBGEN WAVE SIN 0.5 0.5 0 1 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(upper), upper.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		if (stages.size() == 1) {
+			CHECK_EQ_INT(stages[0].animPaths.size(), 2u);
+			CHECK_EQ_INT(stages[0].blendMode, VRHI_SHADER_BLEND_ALPHA);
+			CHECK_EQ_INT(stages[0].rgbGenWaveFunc, VRHI_SHADER_WAVE_SIN);
+		}
+	}
+	// Invalid rates fall back to the static first frame with all frames kept.
+	const std::string badFps = script(
+		"{ map textures/base.tga }\n"
+		"{ animMap abc textures/a.tga textures/b.tga blendFunc blend }\n"
+		"{ animMap -1 textures/c.tga blendFunc blend }\n"
+		"{ animMap 100 textures/d.tga blendFunc blend }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(badFps), badFps.size(), wanted, &results));
+	CHECK_EQ_INT(results.size(), 1u);
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		CHECK_EQ_INT(stages.size(), 4u);
+		if (stages.size() == 4) {
+			CHECK(stages[0].animPaths.empty());
+			for (std::size_t i = 1; i < 4; ++i) {
+				CHECK(stages[i].animFps == 0.0f);
+				CHECK(!stages[i].animPaths.empty());
+			}
+			CHECK_EQ_INT(stages[1].animPaths.size(), 2u);
+		}
+	}
+	// Excess frames keep the first eight; the rest are ignored like GL1.
+	const std::string excess = script(
+		"{ animMap 5 textures/0.tga textures/1.tga textures/2.tga textures/3.tga textures/4.tga textures/5.tga textures/6.tga textures/7.tga textures/8.tga }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(excess), excess.size(), wanted, &results));
+	if (results.size() == 1) {
+		const std::vector<VRHI_ShaderStage> &stages = results["textures/foo/bar"];
+		if (stages.size() == 1) CHECK_EQ_INT(stages[0].animPaths.size(), 8u);
+	}
+	// Special, unsafe, missing, and truncated frame lists reject the shader.
+	const std::string special = script("{ animMap 8 $lightmap blendFunc blend }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(special), special.size(), wanted, &results));
+	CHECK(results.empty());
+	const std::string unsafe = script("{ animMap 8 textures/ok.tga ../evil.tga }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(unsafe), unsafe.size(), wanted, &results));
+	CHECK(results.empty());
+	const std::string noFrames = script("{ animMap 8 blendFunc blend }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(noFrames), noFrames.size(), wanted, &results));
+	CHECK(results.empty());
+	const std::string truncatedRate = script("{ animMap }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncatedRate), truncatedRate.size(), wanted, &results));
+	CHECK(results.empty());
+	const std::string truncatedFrames = script("{ animMap 8 }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(truncatedFrames), truncatedFrames.size(), wanted, &results));
+	CHECK(results.empty());
+	// A second image statement in the same stage still rejects the shader.
+	const std::string doubleAnim = script(
+		"{ animMap 8 textures/a.tga animMap 8 textures/b.tga }");
+	results.clear();
+	CHECK(VRHI_ParseShaderScriptStages(asBytes(doubleAnim), doubleAnim.size(), wanted, &results));
+	CHECK(results.empty());
+	// The conservative first-stage opaque helper still rejects animMap.
+	CHECK_EQ_STR(candidateBody(
+		"{ animMap 8 textures/foo/bar.tga textures/baz.tga }", nullptr), "");
+}
+
 void testStageWaveGenerators() {
 	// Direct parser-helper bounds/token safety: VRHI_ShaderParseWaveConstant
 	// accepts finite in-range parameters (zero and the inclusive |16| bound
@@ -2424,6 +2524,7 @@ int main() {
 	testStageTcModScroll();
 	testStageTcModRotate();
 	testStageTcModTurbStretch();
+	testStageAnimMap();
 	testStageWaveGenerators();
 	testConsoleScriptResolution();
 	testPathSafetyHelpers();

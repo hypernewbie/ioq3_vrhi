@@ -91,8 +91,22 @@ input buffer, so no FS storage can be referenced after FS_FreeFile.
 // sampler, so both retain their current behavior. The conservative first-stage
 // helper continues to accept `clampmap` as a candidate with the same safe
 // qpath validation (it returns only a path string and carries no sampler
-// flag). `animMap` has no clamp variant and keeps its existing first-frame
-// static fallback with the default wrap sampler.
+// flag). `animMap` has no clamp variant; its frames use the default wrap
+// sampler, and the conservative first-stage helper still accepts only the
+// first frame as a static candidate.
+//
+// The bounded `animMap frequency f1 ... fN` slice extends the same simple
+// multi-stage parser with time-varying animated stages: up to
+// VRHI_SHADER_MAX_ANIM_FRAMES path-safe frames (first wins on excess, like
+// GL1's ignore-excess warning) with a frame rate in [0,
+// VRHI_SCRIPT_ANIMFPS_MAX] frames per second (invalid rates fall back to 0,
+// the static first frame). Frame collection stops before any known
+// directive keyword (the line-blind equivalent of GL1's end-of-line) and
+// never reads past the stage end; a `$`-special or unsafe frame, or zero
+// frames, rejects the shader. The adapter decodes every frame under the
+// existing image caps and selects floor(time * fps) % frames per draw.
+// Malformed or truncated statements keep the prior behavior (reject, never
+// borrowing past the stage).
 //
 // The bounded stage-local `tcMod scale` slice extends the same simple
 // multi-stage parser with exactly the Quake3 static `tcMod scale s t`
@@ -273,6 +287,14 @@ enum VRHI_ShaderAlphaFunc {
 };
 struct VRHI_ShaderStage {
 	std::string path;
+	// Bounded `animMap` frames (all stage frames, path strings in script
+	// order) with their animation speed in frames per second. Empty for
+	// plain `map`/`clampMap` stages. At most VRHI_SHADER_MAX_ANIM_FRAMES
+	// frames are kept (first wins on excess, like GL1's ignore-excess
+	// warning); fps 0 means the static first frame (also the fallback for
+	// invalid speeds, matching GL1's atof-garbage speed of 0).
+	std::vector<std::string> animPaths;
+	float animFps = 0.0f;
 	int blendMode = VRHI_SHADER_BLEND_OPAQUE;
 	// Shader-level `surfaceparm trans` sorts the material with translucent
 	// geometry without necessarily enabling a blend function (e.g. a two-stage
@@ -431,6 +453,11 @@ static const float VRHI_SCRIPT_TCMOD_SCROLL_MAX = 16.0f;
 // (the angle is wrapped into [0,360) degrees like the GL1 sine-table mask,
 // so extreme magnitudes can never erode the sin/cos precision).
 static const float VRHI_SCRIPT_TCMOD_ROTATE_MAX = 3600.0f;
+// Bounded `animMap` slice: at most 8 frames per stage (GL1's
+// MAX_IMAGE_ANIMATIONS) and a frame rate in [0, 32] frames per second
+// (zero is the static-first-frame identity; common rates are 1..15).
+static const std::size_t VRHI_SHADER_MAX_ANIM_FRAMES = 8;
+static const float VRHI_SCRIPT_ANIMFPS_MAX = 32.0f;
 // Bounded tcMod turb/stretches reuse the finite wave parameter domain.
 static const float VRHI_SCRIPT_TCMOD_TURB_MAX = 16.0f;
 static const float VRHI_SCRIPT_TCMOD_STRETCH_MAX = 16.0f;
@@ -567,6 +594,44 @@ inline bool VRHI_ShaderParseWaveConstant(const std::string &text, float *value) 
 // inversesawtooth are accepted, matched case-insensitively like every
 // directive (the GL1 NameToGenFunc uses Q_stricmp). Every other name (noise
 // included) maps to NONE so the stage keeps the existing dynamic fallback.
+// Parses one token as a bounded `animMap` frame rate in frames per second:
+// finite and inside [0, VRHI_SCRIPT_ANIMFPS_MAX] (zero is accepted: a zero
+// rate renders the static first frame). Returns false for empty,
+// non-numeric, partially consumed, non-finite, negative, or out-of-range
+// tokens; the caller keeps the stage accepted with fps 0 (static), matching
+// GL1's atof-garbage speed. Locale behaviour mirrors the atof-based path.
+inline bool VRHI_ShaderParseAnimFps(const std::string &text, float *value) {
+	if (value == nullptr || text.empty()) return false;
+	char *end = nullptr;
+	errno = 0;
+	const float parsed = std::strtof(text.c_str(), &end);
+	if (end == text.c_str() || *end != '\0' || errno == ERANGE ||
+		!std::isfinite(parsed)) return false;
+	if (parsed < 0.0f || parsed > VRHI_SCRIPT_ANIMFPS_MAX) return false;
+	*value = parsed;
+	return true;
+}
+
+// Stage/shader directive keywords that terminate an `animMap` frame list.
+// GL1 ends the list at the line break (COM_ParseExt with no line breaks);
+// this line-blind parser ends it before any known directive instead, so a
+// following statement (blendFunc, rgbGen, ...) is never swallowed as a
+// frame. Matching is exact after ASCII lowercasing; frame paths containing
+// '/' or an extension can never equal these bare words.
+inline bool VRHI_ShaderTokenEndsAnimFrames(const VRHI_ShaderScriptToken &token) {
+	const std::string lower = VRHI_ShaderLowerASCII(token.text);
+	static const char *stops[] = {
+		"map", "clampmap", "animmap", "videomap", "blendfunc",
+		"rgbgen", "alphagen", "alphafunc", "tcmod", "tcgen",
+		"depthwrite", "depthfunc", "deformvertexes", "surfaceparm",
+		"detail"
+	};
+	for (const char *stop : stops) {
+		if (lower == stop) return true;
+	}
+	return false;
+}
+
 inline int VRHI_ShaderWaveFuncFromName(const std::string &name) {
 	const std::string lower = VRHI_ShaderLowerASCII(name);
 	if (lower == "sin") return VRHI_SHADER_WAVE_SIN;
@@ -911,17 +976,42 @@ inline bool VRHI_ParseSimpleShaderBlock(
 				continue;
 			}
 			if (keyword == "animmap") {
-				// Bounded static fallback: use the first frame and ignore the
-				// animation rate/remaining frame paths. Full time-varying animMap
-				// remains outside this renderer slice.
+				// Bounded animated frames: `animMap frequency f1 ... fN`.
+				// The rate is frames per second; an invalid or out-of-range
+				// rate falls back to 0 (static first frame). Frames are the
+				// consecutive path-safe image tokens (at most
+				// VRHI_SHADER_MAX_ANIM_FRAMES; excess stays for the generic
+				// loop to ignore, like GL1's ignore-excess warning).
+				// Collection stops before any known directive keyword (this
+				// line-blind parser's equivalent of GL1's end-of-line) and
+				// never reads past stageEnd. A `$`-special or unsafe frame,
+				// or zero frames, rejects the shader exactly as before.
 				if (foundMap || j + 2 >= stageEnd) return false;
-				const std::string &texture = tokens[j + 2].text;
-				if (texture.empty() || texture[0] == '$' ||
-					!VRHI_ShaderPathIsSafe(texture) ||
-					texture.find('\\') != std::string::npos ||
-					!VRHI_ResolveDirectImagePath(texture.c_str(), &stage.path)) return false;
+				float fps = 0.0f;
+				VRHI_ShaderParseAnimFps(tokens[j + 1].text, &fps);
+				std::vector<std::string> frames;
+				std::size_t k = j + 2;
+				bool invalid = false;
+				while (k < stageEnd && frames.size() < VRHI_SHADER_MAX_ANIM_FRAMES) {
+					if (VRHI_ShaderTokenEndsAnimFrames(tokens[k])) break;
+					const std::string &texture = tokens[k].text;
+					std::string resolved;
+					if (texture.empty() || texture[0] == '$' ||
+						!VRHI_ShaderPathIsSafe(texture) ||
+						texture.find('\\') != std::string::npos ||
+						!VRHI_ResolveDirectImagePath(texture.c_str(), &resolved)) {
+						invalid = true;
+						break;
+					}
+					frames.push_back(std::move(resolved));
+					++k;
+				}
+				if (invalid || frames.empty()) return false;
+				stage.path = frames[0];
+				stage.animPaths = std::move(frames);
+				stage.animFps = fps;
 				foundMap = true;
-				j += 3;
+				j = k;
 				continue;
 			}
 			if (keyword == "rgbgen" || keyword == "alphagen") {
