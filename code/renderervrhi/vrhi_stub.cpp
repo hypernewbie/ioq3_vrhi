@@ -6502,21 +6502,31 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 	// converted seconds are always finite; world and scene textured material
 	// sampling therefore scroll with exactly the same clock.
 	const float frameTimeSeconds = static_cast<float>(fd->time) * 0.001f;
+	// GL1 skips every world surface for RDF_NOWORLDMODEL scenes
+	// (R_AddWorldSurfaces returns early): those refdefs exist for menu/model
+	// previews and for HUD sub-scenes that only draw submitted entities. The
+	// client submits such scenes in addition to the world view every frame,
+	// so drawing the BSP for them would submit all world geometry two extra
+	// times per frame for output that is then overwritten by the world view.
+	const bool worldScene = (fd->rdflags & RDF_NOWORLDMODEL) == 0;
 	// Resolve the camera leaf/cluster and stamp the visible surface batches,
 	// honoring the per-frame refdef.areamask for closed-door areas. A failure
 	// to cull (no/malformed visibility, camera outside the tree) falls back
 	// to drawing every batch, preserving the previous output.
 	const glm::vec3 vieworg(fd->vieworg[0], fd->vieworg[1], fd->vieworg[2]);
-	const bool cullActive = g_worldLoaded && g_worldVertexBuffer != VRHI_INVALID_HANDLE &&
+	const bool cullActive = worldScene && g_worldLoaded &&
+		g_worldVertexBuffer != VRHI_INVALID_HANDLE &&
 		g_worldIndexBuffer != VRHI_INVALID_HANDLE &&
 		VRHI_MarkVisibleWorldBatches(vieworg, fd->areamask);
-	if (cullActive != g_worldCullActive) {
+	// World-less scenes never touch the world cull state, so the transition
+	// diagnostics keep describing real world frames only.
+	if (worldScene && cullActive != g_worldCullActive) {
 		VRHI_Printf(PRINT_ALL,
 			"renderer_vrhi: world cull %s (leaf=%d cluster=%d)\n",
 			cullActive ? "active" : "fallback all-visible",
 			g_worldCameraLeaf, g_worldCameraCluster);
 	}
-	g_worldCullActive = cullActive;
+	if (worldScene) g_worldCullActive = cullActive;
 	if (cullActive && !g_worldCullReported) {
 		g_worldCullReported = true;
 		VRHI_Printf(PRINT_ALL,
@@ -6528,7 +6538,9 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 	if (VRHI_CullDebugEnabled()) {
 		VRHI_Printf(PRINT_ALL,
 			"renderer_vrhi: cull frame: %s leaf=%d cluster=%d visibleClusters=%d visibleBatches=%d visibleIndexes=%u/%zu batches=%zu\n",
-			cullActive ? "active" : "fallback", g_worldCameraLeaf, g_worldCameraCluster,
+			!worldScene ? "skipped noworldmodel"
+				: (cullActive ? "active" : "fallback"),
+			g_worldCameraLeaf, g_worldCameraCluster,
 			g_worldVisibleClusters, g_worldVisibleBatches, g_worldVisibleIndexes,
 			g_worldIndexes.size(), g_worldBatches.size());
 	} else if (cullActive) {
@@ -6581,7 +6593,7 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 	// deforms and no lights this is a strict no-op; otherwise the enqueued
 	// update shares the world draw error accounting below so failures surface
 	// in EndFrame's report.
-	if ((!g_sceneLights.empty() || g_worldDeformActive) &&
+	if (worldScene && (!g_sceneLights.empty() || g_worldDeformActive) &&
 		g_worldVertexBuffer != VRHI_INVALID_HANDLE) {
 		VRHI_RefreshWorldVertices(frameTimeSeconds);
 	}
@@ -6608,6 +6620,9 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 		const glm::vec3 delta = center - vieworg;
 		return glm::dot(delta, delta);
 	};
+	// World-less scenes submit no world batches at all; their output is the
+	// scene entities collected between ClearScene and RenderScene.
+	if (worldScene)
 	for (size_t batchIndex = 0; batchIndex < g_worldBatches.size(); ++batchIndex) {
 		const VRHI_WorldBatch &batch = g_worldBatches[batchIndex];
 		if (batch.indexCount == 0 ||
@@ -7181,7 +7196,7 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 	g_worldDrawSubmitted = submitted;
 	// RenderScene is also used for world-less scene frames (menu/model previews),
 	// so only report a skipped draw when a loaded world produced no output.
-	if (!submitted && g_worldLoaded) {
+	if (!submitted && worldScene && g_worldLoaded) {
 		VRHI_Printf(PRINT_WARNING,
 			"renderer_vrhi: world/scene draw skipped (world vertices=%zu indexes=%zu scene submissions=%zu)\n",
 			g_worldVertices.size(), g_worldIndexes.size(), g_sceneDraws.size());
