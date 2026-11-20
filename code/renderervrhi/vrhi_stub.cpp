@@ -645,6 +645,18 @@ static bool g_worldVisAvailable = false;
 static bool g_worldCullActive = false;
 static int g_worldCameraLeaf = -1;
 static int g_worldCameraCluster = -1;
+// Transition-diagnostic bookkeeping. The client submits more than one scene
+// per frame (world view plus UI/menu scenes), so the cull result can differ
+// between submissions. Reporting every transition would therefore print
+// several lines per frame and flood the console buffer, which is expensive
+// to append and to draw. Only report when the state differs from the last
+// reported state, at most once per VRHI_CULL_REPORT_INTERVAL_MS of refdef
+// time, and only with developer enabled.
+static const int VRHI_CULL_REPORT_INTERVAL_MS = 2000;
+static int g_worldCullReportTime = -VRHI_CULL_REPORT_INTERVAL_MS;
+static int g_worldCullReportLeaf = -1;
+static int g_worldCullReportCluster = -1;
+static bool g_worldCullReportActive = false;
 static int g_worldVisibleClusters = 0;
 static int g_worldVisibleBatches = 0;
 static uint32_t g_worldVisibleIndexes = 0;
@@ -2098,6 +2110,10 @@ static void VRHI_DestroyWorldResources(bool clearGeometry) {
 	g_worldClusterBytes = 0;
 	g_worldVisAvailable = false;
 	g_worldCullActive = false;
+	g_worldCullReportTime = -VRHI_CULL_REPORT_INTERVAL_MS;
+	g_worldCullReportLeaf = -1;
+	g_worldCullReportCluster = -1;
+	g_worldCullReportActive = false;
 	g_worldCameraLeaf = -1;
 	g_worldCameraCluster = -1;
 	g_worldVisibleClusters = 0;
@@ -6521,10 +6537,25 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 	// World-less scenes never touch the world cull state, so the transition
 	// diagnostics keep describing real world frames only.
 	if (worldScene && cullActive != g_worldCullActive) {
-		VRHI_Printf(PRINT_ALL,
-			"renderer_vrhi: world cull %s (leaf=%d cluster=%d)\n",
-			cullActive ? "active" : "fallback all-visible",
-			g_worldCameraLeaf, g_worldCameraCluster);
+		// Developer-only and rate limited: a differing leaf/cluster with the
+		// same cull result is not interesting, and the client submits
+		// multiple scenes per frame. Never print in normal play.
+		const bool changed = cullActive != g_worldCullReportActive ||
+			g_worldCameraLeaf != g_worldCullReportLeaf ||
+			g_worldCameraCluster != g_worldCullReportCluster;
+		if (changed && VRHI_CullDebugEnabled() &&
+			fd->time - g_worldCullReportTime >= VRHI_CULL_REPORT_INTERVAL_MS) {
+			g_worldCullReportTime = fd->time;
+			g_worldCullReportActive = cullActive;
+			g_worldCullReportLeaf = g_worldCameraLeaf;
+			g_worldCullReportCluster = g_worldCameraCluster;
+			VRHI_Printf(PRINT_DEVELOPER,
+				"renderer_vrhi: world cull %s (leaf=%d cluster=%d view=%.0f %.0f %.0f rdflags=0x%x)\n",
+				cullActive ? "active" : "fallback all-visible",
+				g_worldCameraLeaf, g_worldCameraCluster,
+				static_cast<double>(vieworg.x), static_cast<double>(vieworg.y),
+				static_cast<double>(vieworg.z), static_cast<unsigned>(fd->rdflags));
+		}
 	}
 	if (worldScene) g_worldCullActive = cullActive;
 	if (cullActive && !g_worldCullReported) {
@@ -6537,12 +6568,14 @@ static void VRHI_RenderScene(const refdef_t *fd) {
 	}
 	if (VRHI_CullDebugEnabled()) {
 		VRHI_Printf(PRINT_ALL,
-			"renderer_vrhi: cull frame: %s leaf=%d cluster=%d visibleClusters=%d visibleBatches=%d visibleIndexes=%u/%zu batches=%zu\n",
+			"renderer_vrhi: cull frame: %s leaf=%d cluster=%d visibleClusters=%d visibleBatches=%d visibleIndexes=%u/%zu batches=%zu view=%.0f %.0f %.0f rdflags=0x%x\n",
 			!worldScene ? "skipped noworldmodel"
 				: (cullActive ? "active" : "fallback"),
 			g_worldCameraLeaf, g_worldCameraCluster,
 			g_worldVisibleClusters, g_worldVisibleBatches, g_worldVisibleIndexes,
-			g_worldIndexes.size(), g_worldBatches.size());
+			g_worldIndexes.size(), g_worldBatches.size(),
+			static_cast<double>(vieworg.x), static_cast<double>(vieworg.y),
+			static_cast<double>(vieworg.z), static_cast<unsigned>(fd->rdflags));
 	} else if (cullActive) {
 		VRHI_Printf(PRINT_DEVELOPER,
 			"renderer_vrhi: cull frame: leaf=%d cluster=%d visibleClusters=%d visibleBatches=%d visibleIndexes=%u/%zu\n",
